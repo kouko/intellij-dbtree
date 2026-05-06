@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  applyNodeChanges,
   Background,
   Controls,
   MiniMap,
   ReactFlow,
   type Edge,
   type Node,
+  type NodeChange,
   type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -13,24 +15,40 @@ import "@xyflow/react/dist/style.css";
 import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnEdge, LineagePayload } from "./types";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
+import { HopStepper, isUnlimited } from "./components/HopStepper";
 import { layoutModelGraph } from "./lib/layout";
+import { THEMES, detectInitialTheme, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
-
-const NODE_WIDTH = 240;
-const HEADER_HEIGHT = 38;
+const NODE_WIDTH = 280;
+// Empirical char-per-line estimate at NODE_WIDTH=280, font-weight 600 / 12px,
+// after subtracting padding + layer chip + chevron button width. Used only
+// to feed dagre an approximate per-node height; actual rendering is done
+// by the browser's wordBreak.
+const CHARS_PER_NAME_LINE = 18;
+const NAME_LINE_HEIGHT = 16;
+const HEADER_BASE_HEIGHT = 32; // padding + first name line
 const ROW_HEIGHT = 22;
+const COLS_VERTICAL_PADDING = 12;
 
-// Synthetic host the JetBrains plugin uses when serving via JCEF.
-// Outside that host (Vite dev server / file://) we fall back to the demo fixture
-// so the standalone app still has something to render.
 const PLUGIN_HOST = "intellij-dbtree.local";
-const isInsidePlugin = typeof window !== "undefined" && window.location.hostname === PLUGIN_HOST;
+const isInsidePlugin =
+  typeof window !== "undefined" && window.location.hostname === PLUGIN_HOST;
+
+interface HostState {
+  up_hops: number;
+  down_hops: number;
+}
 
 declare global {
   interface Window {
     setLineageInfo?: (payload: LineagePayload) => void;
+    setSelectedModel?: (uniqueId: string) => void;
+    setIdeTheme?: (theme: ThemeName) => void;
+    applyHostState?: (state: HostState) => void;
     kotlinCallback?: (payload: string) => void;
+    __DBTREE_THEME__?: ThemeName;
+    __DBTREE_HOST_STATE__?: HostState;
   }
 }
 
@@ -40,28 +58,97 @@ const EMPTY_PAYLOAD: LineagePayload = {
   column_edges: [],
 };
 
+const DEFAULT_HOPS = 3;
+
 function App() {
-  // Inside the plugin we wait for Kotlin to push a payload. Standalone
-  // (vite dev / static preview) we render the demo fixture so the page
-  // is not empty.
+  // ---- Theme ---------------------------------------------------------------
+  const [themeName, setThemeName] = useState<ThemeName>(() => detectInitialTheme());
+  const theme = THEMES[themeName];
+
+  useEffect(() => {
+    window.setIdeTheme = (next) => setThemeName(next);
+    return () => {
+      delete window.setIdeTheme;
+    };
+  }, []);
+
+  // ---- Hops ----------------------------------------------------------------
+  const [upHops, setUpHops] = useState<number>(
+    () => window.__DBTREE_HOST_STATE__?.up_hops ?? DEFAULT_HOPS,
+  );
+  const [downHops, setDownHops] = useState<number>(
+    () => window.__DBTREE_HOST_STATE__?.down_hops ?? DEFAULT_HOPS,
+  );
+
+  useEffect(() => {
+    window.applyHostState = (s) => {
+      setUpHops(s.up_hops);
+      setDownHops(s.down_hops);
+    };
+    return () => {
+      delete window.applyHostState;
+    };
+  }, []);
+
+  const sendHopChange = useCallback((up: number, down: number) => {
+    if (!window.kotlinCallback) return;
+    window.kotlinCallback(
+      JSON.stringify({ event: "HOP_CHANGE", up_hops: up, down_hops: down }),
+    );
+  }, []);
+
+  const onUpHops = useCallback(
+    (next: number) => {
+      setUpHops(next);
+      sendHopChange(next, downHops);
+    },
+    [downHops, sendHopChange],
+  );
+  const onDownHops = useCallback(
+    (next: number) => {
+      setDownHops(next);
+      sendHopChange(upHops, next);
+    },
+    [upHops, sendHopChange],
+  );
+
+  const onRefresh = useCallback(() => {
+    if (!window.kotlinCallback) return;
+    window.kotlinCallback(JSON.stringify({ event: "REFRESH" }));
+  }, []);
+
+  // ---- Payload -------------------------------------------------------------
   const [payload, setPayload] = useState<LineagePayload>(() =>
     isInsidePlugin ? EMPTY_PAYLOAD : (demoFixture as LineagePayload),
   );
 
-  // Expose `window.setLineageInfo` so the plugin's executeJavaScript push works.
+  /**
+   * The model currently focused (orange border). Decoupled from the payload
+   * so editor selection changes within the existing DAG can update the
+   * highlight without re-rendering. Initialized from payload.selected when a
+   * fresh payload arrives.
+   */
+  const [selectedModelUid, setSelectedModelUid] = useState<string | null>(
+    () => payload.selected?.unique_id ?? null,
+  );
+
   useEffect(() => {
-    window.setLineageInfo = (next) => setPayload(next);
+    window.setLineageInfo = (next) => {
+      setPayload(next);
+      setSelectedModelUid(next.selected?.unique_id ?? null);
+    };
+    window.setSelectedModel = (uid) => setSelectedModelUid(uid);
     return () => {
       delete window.setLineageInfo;
+      delete window.setSelectedModel;
     };
   }, []);
 
-  // Which models have their column lists expanded.
+  // ---- Expanded models -----------------------------------------------------
   const [expanded, setExpanded] = useState<Set<string>>(() => {
     return new Set(payload.selected ? [payload.selected.unique_id] : []);
   });
 
-  // Selected (model, column) — drives column-edge highlighting.
   const [selectedColumn, setSelectedColumn] = useState<{
     unique_id: string;
     column: string;
@@ -71,16 +158,9 @@ function App() {
       : null,
   );
 
-  // When the plugin pushes a new payload, default-expand the selected model
-  // and clear any column highlight that no longer applies.
+  // When a new full payload arrives, drop column selection if the column
+  // no longer exists, and ensure the selected model is expanded.
   useEffect(() => {
-    setExpanded((prev) => {
-      if (!payload.selected) return prev;
-      if (prev.has(payload.selected.unique_id)) return prev;
-      const next = new Set(prev);
-      next.add(payload.selected.unique_id);
-      return next;
-    });
     setSelectedColumn((prev) => {
       if (!prev) return prev;
       const stillExists = payload.models.some(
@@ -89,6 +169,18 @@ function App() {
       return stillExists ? prev : null;
     });
   }, [payload]);
+
+  // When the selected model changes (full or selection-only), expand it so
+  // the user can see the column list of the file they just navigated to.
+  useEffect(() => {
+    if (!selectedModelUid) return;
+    setExpanded((prev) => {
+      if (prev.has(selectedModelUid)) return prev;
+      const next = new Set(prev);
+      next.add(selectedModelUid);
+      return next;
+    });
+  }, [selectedModelUid]);
 
   const toggleExpanded = useCallback((uniqueId: string) => {
     setExpanded((prev) => {
@@ -111,6 +203,12 @@ function App() {
       next.add(uniqueId);
       return next;
     });
+    // Clicking a column commits to that model: orange border + open the
+    // model's .sql in the IDE editor (same as clicking the model card).
+    setSelectedModelUid(uniqueId);
+    if (window.kotlinCallback) {
+      window.kotlinCallback(JSON.stringify({ event: "NODE_CLICK", unique_id: uniqueId }));
+    }
   }, []);
 
   const onOpenFile = useCallback((uniqueId: string) => {
@@ -118,7 +216,36 @@ function App() {
     window.kotlinCallback(JSON.stringify({ event: "NODE_CLICK", unique_id: uniqueId }));
   }, []);
 
-  // Trace the upstream column lineage from a (model, column) seed.
+  const allExpanded =
+    payload.models.length > 0 && payload.models.every((m) => expanded.has(m.unique_id));
+
+  const onToggleAllExpanded = useCallback(() => {
+    setExpanded(() => {
+      if (allExpanded) return new Set();
+      return new Set(payload.models.map((m) => m.unique_id));
+    });
+  }, [allExpanded, payload.models]);
+
+  // ---- Manual node positions (drag override) -------------------------------
+  // Dagre re-runs every render, but if the user has dragged a node we want
+  // to honor that position instead. Cleared whenever DAG topology changes
+  // (new payload) — those drags would no longer be meaningful anyway.
+  const [manualPositions, setManualPositions] = useState<Record<string, { x: number; y: number }>>({});
+
+  const onNodeDragStop = useCallback(
+    (_e: React.MouseEvent | unknown, node: Node) => {
+      setManualPositions((prev) => ({
+        ...prev,
+        [node.id]: { x: node.position.x, y: node.position.y },
+      }));
+    },
+    [],
+  );
+
+  const onResetLayout = useCallback(() => setManualPositions({}), []);
+  const hasManualPositions = Object.keys(manualPositions).length > 0;
+
+  // ---- Column lineage trace ------------------------------------------------
   const lineageTrace = useMemo(() => {
     const trace = {
       columns: new Map<string, Set<string>>(),
@@ -168,11 +295,23 @@ function App() {
     });
   }, [selectedColumn, lineageTrace.models]);
 
-  const nodes: Node[] = useMemo(() => {
+  // ---- xyflow nodes/edges --------------------------------------------------
+  // `derivedNodes` is rebuilt whenever data changes. `liveNodes` is what
+  // ReactFlow actually renders — it's seeded from derivedNodes but accepts
+  // mid-drag position updates from onNodesChange so the card follows the
+  // cursor in real time. After drop, `onNodeDragStop` writes the final
+  // position into `manualPositions`, which feeds back into derivedNodes —
+  // so the position survives across re-renders without snapping back.
+  const derivedNodes: Node[] = useMemo(() => {
     const isExpanded = (uid: string) => expanded.has(uid);
-    const expandedColumnCount: Record<string, number> = {};
+    const heights: Record<string, number> = {};
     for (const m of payload.models) {
-      expandedColumnCount[m.unique_id] = isExpanded(m.unique_id) ? m.columns.length : 0;
+      const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
+      const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
+      const colsH = isExpanded(m.unique_id)
+        ? m.columns.length * ROW_HEIGHT + COLS_VERTICAL_PADDING
+        : 0;
+      heights[m.unique_id] = headerH + colsH;
     }
 
     const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = payload.models.map((m) => ({
@@ -188,23 +327,47 @@ function App() {
         expanded: isExpanded(m.unique_id),
         highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
         onLineagePath: lineageTrace.models.has(m.unique_id),
-        isSelectedModel: m.unique_id === payload.selected?.unique_id,
+        isSelectedModel: m.unique_id === selectedModelUid,
+        theme,
+        cardWidth: NODE_WIDTH,
         onToggleExpanded: toggleExpanded,
         onColumnClick,
         onOpenFile,
       },
     }));
 
-    return layoutModelGraph(rawNodes, modelLevelEdges(payload), {
+    const positioned = layoutModelGraph(rawNodes, modelLevelEdges(payload), {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
-      headerHeight: HEADER_HEIGHT,
-      rowHeight: ROW_HEIGHT,
       nodesepX: 60,
       ranksepY: 100,
-      expandedColumnCount,
+      heights,
     });
-  }, [payload, expanded, lineageTrace, toggleExpanded, onColumnClick, onOpenFile]);
+    return positioned.map((n) => {
+      const manual = manualPositions[n.id];
+      return manual ? { ...n, position: manual } : n;
+    });
+  }, [
+    payload,
+    expanded,
+    lineageTrace,
+    theme,
+    selectedModelUid,
+    manualPositions,
+    toggleExpanded,
+    onColumnClick,
+    onOpenFile,
+  ]);
+
+  const [liveNodes, setLiveNodes] = useState<Node[]>(derivedNodes);
+
+  useEffect(() => {
+    setLiveNodes(derivedNodes);
+  }, [derivedNodes]);
+
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
+    setLiveNodes((current) => applyNodeChanges(changes, current));
+  }, []);
 
   const edges: Edge[] = useMemo(() => {
     const onPath = (a: string, b: string) =>
@@ -215,7 +378,7 @@ function App() {
       source: me.source_unique_id,
       target: me.target_unique_id,
       style: {
-        stroke: onPath(me.source_unique_id, me.target_unique_id) ? "#f59e0b" : "#cbd5e1",
+        stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
         strokeWidth: 1.5,
       },
     }));
@@ -228,45 +391,92 @@ function App() {
             source: ce.source_unique_id,
             target: ce.target_unique_id,
             label: ce.expression ? "ƒ" : undefined,
-            labelStyle: { fontSize: 10, fill: "#92400e" },
-            labelBgStyle: { fill: "#fef3c7", fillOpacity: 0.9 },
-            style: { stroke: "#f59e0b", strokeWidth: 2, strokeDasharray: "6 3" },
+            labelStyle: { fontSize: 10, fill: theme.highlightText },
+            labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },
+            style: { stroke: theme.edgeHighlight, strokeWidth: 2, strokeDasharray: "6 3" },
             animated: true,
           }))
       : [];
 
     return [...modelEdges, ...columnEdges];
-  }, [payload.model_edges, payload.column_edges, lineageTrace, selectedColumn]);
+  }, [payload, lineageTrace, selectedColumn, theme]);
+
+  // Re-fit only on topology change (model set / edge set), not on selection
+  // changes. Without this, every editor selection inside the same DAG would
+  // jolt the layout — the dbt Power User UX explicitly avoids that.
+  const topologyKey = useMemo(() => {
+    const uids = payload.models.map((m) => m.unique_id).sort().join("|");
+    const edges = payload.model_edges
+      .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
+      .sort()
+      .join("|");
+    return `${uids};${edges}`;
+  }, [payload.models, payload.model_edges]);
 
   const [fitKey, setFitKey] = useState(0);
   useEffect(() => {
     setFitKey((k) => k + 1);
-  }, [payload, expanded.size, selectedColumn?.unique_id, selectedColumn?.column]);
+    // New topology = previous drag positions are not meaningful for the
+    // new node set; reset so dagre can lay out cleanly.
+    setManualPositions({});
+  }, [topologyKey]);
 
   const isEmpty = payload.models.length === 0;
 
   return (
-    <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column" }}>
+    <div
+      style={{
+        width: "100vw",
+        height: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        background: theme.background,
+        color: theme.toolbarText,
+      }}
+    >
       <Toolbar
+        theme={theme}
+        upHops={upHops}
+        downHops={downHops}
+        onUpHops={onUpHops}
+        onDownHops={onDownHops}
+        onRefresh={onRefresh}
+        allExpanded={allExpanded}
+        onToggleAllExpanded={onToggleAllExpanded}
+        hasManualPositions={hasManualPositions}
+        onResetLayout={onResetLayout}
         selected={selectedColumn}
         onClear={() => setSelectedColumn(null)}
         traceCount={lineageTrace.edges.size}
       />
       <div style={{ flex: 1, position: "relative" }}>
         {isEmpty ? (
-          <EmptyState insidePlugin={isInsidePlugin} />
+          <EmptyState theme={theme} insidePlugin={isInsidePlugin} />
         ) : (
           <ReactFlow
             key={fitKey}
-            nodes={nodes}
+            nodes={liveNodes}
             edges={edges}
+            onNodesChange={onNodesChange}
             nodeTypes={NODE_TYPES}
+            onNodeDragStop={onNodeDragStop}
             fitView
             minZoom={0.2}
+            colorMode={theme.name}
             proOptions={{ hideAttribution: true }}
           >
-            <Background gap={16} color="#e2e8f0" />
-            <MiniMap pannable zoomable />
+            <Background gap={16} color={theme.panelBorder} />
+            <MiniMap
+              pannable
+              zoomable
+              style={{ background: theme.miniMapBg, width: 140, height: 90 }}
+              maskColor={theme.miniMapMask}
+              nodeColor={(n) => {
+                const data = n.data as DbtModelNodeData | undefined;
+                const layer = data?.layer ?? "staging";
+                return theme.layers[layer].chip;
+              }}
+            />
             <Controls position="bottom-right" />
           </ReactFlow>
         )}
@@ -275,7 +485,7 @@ function App() {
   );
 }
 
-function EmptyState({ insidePlugin }: { insidePlugin: boolean }) {
+function EmptyState({ theme, insidePlugin }: { theme: Theme; insidePlugin: boolean }) {
   return (
     <div
       style={{
@@ -284,7 +494,7 @@ function EmptyState({ insidePlugin }: { insidePlugin: boolean }) {
         alignItems: "center",
         justifyContent: "center",
         textAlign: "center",
-        color: "#64748b",
+        color: theme.toolbarTextMuted,
         padding: 32,
         fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
         fontSize: 13,
@@ -293,7 +503,7 @@ function EmptyState({ insidePlugin }: { insidePlugin: boolean }) {
     >
       {insidePlugin ? (
         <div style={{ maxWidth: 380 }}>
-          <div style={{ fontSize: 14, fontWeight: 600, color: "#0f172a", marginBottom: 6 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: theme.toolbarText, marginBottom: 6 }}>
             No lineage to display
           </div>
           Open a model <code>.sql</code> file under your dbt project's <code>models/</code> folder
@@ -308,56 +518,130 @@ function EmptyState({ insidePlugin }: { insidePlugin: boolean }) {
 }
 
 function Toolbar({
+  theme,
+  upHops,
+  downHops,
+  onUpHops,
+  onDownHops,
+  onRefresh,
+  allExpanded,
+  onToggleAllExpanded,
+  hasManualPositions,
+  onResetLayout,
   selected,
   onClear,
   traceCount,
 }: {
+  theme: Theme;
+  upHops: number;
+  downHops: number;
+  onUpHops: (n: number) => void;
+  onDownHops: (n: number) => void;
+  onRefresh: () => void;
+  allExpanded: boolean;
+  onToggleAllExpanded: () => void;
+  hasManualPositions: boolean;
+  onResetLayout: () => void;
   selected: { unique_id: string; column: string } | null;
   onClear: () => void;
   traceCount: number;
 }) {
+  const t = theme;
+  const buttonStyle: React.CSSProperties = {
+    border: `1px solid ${t.buttonBorder}`,
+    background: t.buttonBg,
+    color: t.toolbarText,
+    padding: "3px 10px",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 12,
+  };
+  const iconButtonStyle: React.CSSProperties = {
+    ...buttonStyle,
+    width: 28,
+    height: 26,
+    padding: 0,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontSize: 14,
+  };
   return (
     <div
       style={{
-        padding: "8px 16px",
-        background: "white",
-        borderBottom: "1px solid #e2e8f0",
+        padding: "6px 12px",
+        background: t.toolbarBg,
+        borderBottom: `1px solid ${t.panelBorder}`,
         display: "flex",
         alignItems: "center",
-        gap: 12,
+        gap: 14,
         fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
         fontSize: 13,
+        color: t.toolbarText,
       }}
     >
-      <strong style={{ color: "#0f172a" }}>intellij-dbtree</strong>
+      <strong style={{ color: t.toolbarText }}>intellij-dbtree</strong>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <HopStepper label="↑" value={upHops} onChange={onUpHops} theme={t} />
+        <HopStepper label="↓" value={downHops} onChange={onDownHops} theme={t} />
+        <button
+          type="button"
+          onClick={onToggleAllExpanded}
+          title={allExpanded ? "Collapse all column lists" : "Expand all column lists"}
+          style={iconButtonStyle}
+        >
+          {allExpanded ? "▴" : "▾"}
+        </button>
+        <button
+          type="button"
+          onClick={onRefresh}
+          title="Re-read manifest.json"
+          style={iconButtonStyle}
+        >
+          ↻
+        </button>
+        {hasManualPositions && (
+          <button
+            type="button"
+            onClick={onResetLayout}
+            title="Reset manually-dragged positions to auto-layout"
+            style={{
+              ...buttonStyle,
+              fontSize: 11,
+              padding: "3px 8px",
+            }}
+          >
+            ↺ reset layout
+          </button>
+        )}
+      </div>
       <span style={{ flex: 1 }} />
       {selected ? (
         <>
-          <span style={{ color: "#64748b" }}>
+          <span style={{ color: t.toolbarTextMuted }}>
             tracing{" "}
-            <code style={{ background: "#fef3c7", padding: "1px 6px", borderRadius: 4 }}>
+            <code
+              style={{
+                background: t.codeBg,
+                color: t.highlightText,
+                padding: "1px 6px",
+                borderRadius: 4,
+                fontFamily: "ui-monospace, SFMono-Regular, monospace",
+              }}
+            >
               {selected.unique_id.split(".").pop()}.{selected.column}
             </code>
             {" — "}
             {traceCount} column edge{traceCount === 1 ? "" : "s"}
           </span>
-          <button
-            type="button"
-            onClick={onClear}
-            style={{
-              border: "1px solid #cbd5e1",
-              background: "white",
-              padding: "3px 10px",
-              borderRadius: 6,
-              cursor: "pointer",
-              fontSize: 12,
-            }}
-          >
+          <button type="button" onClick={onClear} style={buttonStyle}>
             clear
           </button>
         </>
       ) : (
-        <span style={{ color: "#94a3b8" }}>click a column to trace · double-click model header to open file</span>
+        <span style={{ color: t.toolbarTextSubtle }}>
+          {(isUnlimited(upHops) ? "∞" : upHops)} up · {(isUnlimited(downHops) ? "∞" : downHops)} down · click model name to open
+        </span>
       )}
     </div>
   );
