@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# uv
+.python-version
+
+# Node (Phase B / A)
+node_modules/
+.vite/
+
+# JetBrains plugin (Phase A)
+.gradle/
+.idea/
+out/
+*.iml
+
+# OS
+.DS_Store
+
+# Secrets / local
+.env
+.env.local
