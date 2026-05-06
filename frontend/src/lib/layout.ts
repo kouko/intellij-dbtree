@@ -4,20 +4,18 @@ import type { Edge, Node } from "@xyflow/react";
 /**
  * Run dagre on the model-level DAG and return positioned nodes.
  *
- * Dagre measures in pixels, so we feed it the actual rendered size of each
- * node (computed from the columns count when expanded). xyflow doesn't know
- * the size until after first render, so we estimate here based on `expanded`
- * state and let xyflow auto-fit.
+ * Nodes have a fixed width but a per-node height — the caller pre-computes
+ * heights since they depend on (a) how many name lines wrap inside the
+ * card header at the chosen width and (b) whether the card is expanded
+ * with its column list.
  */
 export interface LayoutOptions {
   rankdir?: "LR" | "TB";
   nodeWidth: number;
-  rowHeight: number;
-  headerHeight: number;
   nodesepX: number;
   ranksepY: number;
-  /** Mapping unique_id -> column count when expanded (0 if collapsed). */
-  expandedColumnCount: Record<string, number>;
+  /** Total rendered height per node uniqueId. */
+  heights: Record<string, number>;
 }
 
 export function layoutModelGraph(
@@ -36,8 +34,7 @@ export function layoutModelGraph(
   g.setDefaultEdgeLabel(() => ({}));
 
   for (const n of nodes) {
-    const cols = opts.expandedColumnCount[n.id] ?? 0;
-    const height = opts.headerHeight + cols * opts.rowHeight + 12;
+    const height = opts.heights[n.id] ?? 60;
     g.setNode(n.id, { width: opts.nodeWidth, height });
   }
 

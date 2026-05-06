@@ -1,5 +1,6 @@
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
+import type { Theme } from "../lib/theme";
 
 export interface DbtModelNodeData extends Record<string, unknown> {
   unique_id: string;
@@ -8,12 +9,11 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   layer?: ModelLayer;
   columns: ColumnSpec[];
   expanded: boolean;
-  /** Set of column names currently highlighted (downstream lineage match). */
   highlightedColumns: Set<string>;
-  /** Whether this whole node is on the active lineage path. */
   onLineagePath: boolean;
-  /** Whether this is the model the user originally selected. */
   isSelectedModel: boolean;
+  theme: Theme;
+  cardWidth: number;
   onToggleExpanded: (uniqueId: string) => void;
   onColumnClick: (uniqueId: string, column: string) => void;
   onOpenFile?: (uniqueId: string) => void;
@@ -21,54 +21,61 @@ export interface DbtModelNodeData extends Record<string, unknown> {
 
 export type DbtModelNodeType = Node<DbtModelNodeData, "dbtModel">;
 
-const layerColor: Record<ModelLayer, { border: string; bg: string; chip: string }> = {
-  source:       { border: "#94a3b8", bg: "#f1f5f9", chip: "#64748b" },
-  staging:      { border: "#60a5fa", bg: "#eff6ff", chip: "#2563eb" },
-  intermediate: { border: "#a78bfa", bg: "#f5f3ff", chip: "#7c3aed" },
-  marts:        { border: "#34d399", bg: "#ecfdf5", chip: "#059669" },
-};
-
 export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   const layer = data.layer ?? "staging";
-  const colors = layerColor[layer];
+  const colors = data.theme.layers[layer];
+  const t = data.theme;
+  const openable = !!data.onOpenFile;
 
+  // Fixed card width — long names wrap to multiple header lines instead of
+  // being truncated. Matches the user's rule: a model name must always be
+  // fully visible.
   const cardStyle: React.CSSProperties = {
     borderRadius: 10,
-    border: `2px solid ${data.isSelectedModel ? "#f59e0b" : colors.border}`,
+    border: `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.border}`,
     background: colors.bg,
-    minWidth: 220,
+    width: data.cardWidth,
     fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
     fontSize: 12,
     boxShadow: data.onLineagePath
-      ? "0 0 0 3px rgba(245, 158, 11, 0.25), 0 4px 12px rgba(0,0,0,0.08)"
+      ? `0 0 0 3px ${t.highlightBg}, 0 4px 12px rgba(0,0,0,0.08)`
       : "0 1px 3px rgba(0,0,0,0.06)",
-    opacity: 1,
     transition: "box-shadow 120ms",
+    cursor: openable ? "pointer" : "default",
   };
 
+  const tooltip = openable
+    ? `${data.name}\n${data.unique_id}\n\nClick to open file · click ▸/▾ to expand columns`
+    : `${data.name}\n${data.unique_id}`;
+
   return (
-    <div style={cardStyle}>
+    <div
+      style={cardStyle}
+      title={tooltip}
+      onClick={() => data.onOpenFile?.(data.unique_id)}
+    >
       <Handle type="target" position={Position.Left} style={{ background: colors.chip }} />
       <Handle type="source" position={Position.Right} style={{ background: colors.chip }} />
 
       <header
         style={{
           padding: "8px 12px",
-          cursor: "pointer",
           borderBottom: data.expanded ? `1px solid ${colors.border}` : "none",
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
           gap: 8,
         }}
-        title={data.onOpenFile ? "click to expand · double-click to open file" : undefined}
-        onClick={() => data.onToggleExpanded(data.unique_id)}
-        onDoubleClick={(e) => {
-          e.stopPropagation();
-          data.onOpenFile?.(data.unique_id);
-        }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            minWidth: 0,
+            flex: 1,
+          }}
+        >
           <span
             style={{
               fontSize: 10,
@@ -79,17 +86,46 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
               borderRadius: 4,
               textTransform: "uppercase",
               letterSpacing: 0.4,
+              flexShrink: 0,
             }}
           >
             {layer}
           </span>
-          <span style={{ fontWeight: 600, color: "#0f172a", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span
+            style={{
+              fontWeight: 600,
+              color: colors.text,
+              wordBreak: "break-word",
+              lineHeight: 1.3,
+              minWidth: 0,
+            }}
+          >
             {data.name}
           </span>
         </div>
-        <span style={{ color: "#64748b", fontSize: 11 }}>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            data.onToggleExpanded(data.unique_id);
+          }}
+          title={data.expanded ? "Collapse columns" : "Expand columns"}
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: "2px 6px",
+            color: t.toolbarTextMuted,
+            cursor: "pointer",
+            fontSize: 11,
+            borderRadius: 3,
+            display: "flex",
+            alignItems: "center",
+            gap: 2,
+            flexShrink: 0,
+          }}
+        >
           {data.expanded ? "▾" : "▸"} {data.columns.length}
-        </span>
+        </button>
       </header>
 
       {data.expanded && (
@@ -110,11 +146,11 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
                   justifyContent: "space-between",
                   gap: 8,
                   cursor: "pointer",
-                  background: highlighted ? "rgba(245, 158, 11, 0.18)" : "transparent",
-                  borderLeft: highlighted ? "3px solid #f59e0b" : "3px solid transparent",
+                  background: highlighted ? t.highlightBg : "transparent",
+                  borderLeft: highlighted ? `3px solid ${t.edgeHighlight}` : "3px solid transparent",
                   fontFamily: "ui-monospace, SFMono-Regular, monospace",
                   fontSize: 11,
-                  color: highlighted ? "#92400e" : "#0f172a",
+                  color: highlighted ? t.highlightText : colors.text,
                   fontWeight: highlighted ? 600 : 400,
                 }}
               >
@@ -122,7 +158,7 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
                   {col.name}
                 </span>
                 {col.type && (
-                  <span style={{ color: "#94a3b8", fontSize: 10 }}>{col.type}</span>
+                  <span style={{ color: t.toolbarTextSubtle, fontSize: 10 }}>{col.type}</span>
                 )}
               </li>
             );

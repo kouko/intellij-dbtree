@@ -1,5 +1,7 @@
 package dev.kouko.intellijdbtree.toolwindow
 
+import com.intellij.ide.ui.LafManager
+import com.intellij.ide.ui.LafManagerListener
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
@@ -9,6 +11,7 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
 import com.intellij.ui.jcef.JBCefBrowserBase
@@ -40,15 +43,11 @@ import javax.swing.SwingUtilities
 /**
  * Tool-window content for intellij-dbtree.
  *
- * Phase A1 wiring:
- *   ManifestService (reads target/manifest.json)
- *     -> LineageInfoService publisher
- *     -> this panel (subscriber)
- *     -> JBCefBrowser.executeJavaScript("window.setLineageInfo(...)")
- *     -> React app re-renders.
- *
- * Reverse direction (NODE_CLICK / REFRESH_CLICK from React) goes through
- * a JBCefJSQuery bridge installed at `window.kotlinCallback`.
+ * Owns the Kotlin <-> JS bridge:
+ *   - Pushes lineage payloads (and IDE theme) to the React UI via
+ *     `executeJavaScript("window.setLineageInfo(...)")` / theme setter.
+ *   - Receives NODE_CLICK / HOP_CHANGE / REFRESH events from the React UI
+ *     through a `JBCefJSQuery` exposed at `window.kotlinCallback`.
  */
 class LineagePanel(private val project: Project) : Disposable {
 
@@ -67,10 +66,7 @@ class LineagePanel(private val project: Project) : Disposable {
     private val jsQuery: JBCefJSQuery? =
         browser?.let { JBCefJSQuery.create(it as JBCefBrowserBase) }
 
-    /** True once index.html finished loading and `window.kotlinCallback` is wired up. */
     private val pageReady = AtomicBoolean(false)
-
-    /** Most-recent payload, kept so we can re-push on reload / late readiness. */
     private val pending = AtomicReference<LineagePayload?>(null)
 
     init {
@@ -82,6 +78,7 @@ class LineagePanel(private val project: Project) : Disposable {
             initBrowser()
             installJsToKotlinBridge()
             subscribeToLineageEvents()
+            subscribeToThemeChanges()
             triggerInitialLineage()
         }
     }
@@ -123,6 +120,8 @@ class LineagePanel(private val project: Project) : Disposable {
                             b.url, 0,
                         )
                     }
+                    pushTheme(currentTheme())
+                    pushHostState()
                     pageReady.set(true)
                     pending.get()?.let { pushPayload(it) }
                 }
@@ -164,15 +163,29 @@ class LineagePanel(private val project: Project) : Disposable {
     private fun subscribeToLineageEvents() {
         project.messageBus.connect(this).subscribe(
             LineageInfoService.TOPIC,
-            LineageInfoListener { payload ->
-                pending.set(payload)
-                if (pageReady.get()) pushPayload(payload)
+            object : LineageInfoListener {
+                override fun lineagePayloadChanged(payload: LineagePayload) {
+                    pending.set(payload)
+                    if (pageReady.get()) pushPayload(payload)
+                }
+
+                override fun selectedModelChanged(uniqueId: String) {
+                    if (pageReady.get()) pushSelected(uniqueId)
+                }
+            },
+        )
+    }
+
+    private fun subscribeToThemeChanges() {
+        ApplicationManager.getApplication().messageBus.connect(this).subscribe(
+            LafManagerListener.TOPIC,
+            LafManagerListener {
+                if (pageReady.get()) pushTheme(currentTheme())
             },
         )
     }
 
     private fun triggerInitialLineage() {
-        // Show whatever file is already selected when the tool window opens.
         ApplicationManager.getApplication().executeOnPooledThread {
             val openFile = ApplicationManager.getApplication().runReadAction<com.intellij.openapi.vfs.VirtualFile?> {
                 FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
@@ -180,8 +193,6 @@ class LineagePanel(private val project: Project) : Disposable {
             if (openFile != null) {
                 project.service<LineageInfoService>().onActiveFileChanged(openFile)
             } else {
-                // Refresh manifest cache without selecting a model — keeps the
-                // panel empty (the React app shows a hint instead).
                 project.service<ManifestService>().refresh()
             }
         }
@@ -190,12 +201,46 @@ class LineagePanel(private val project: Project) : Disposable {
     private fun pushPayload(payload: LineagePayload) {
         val browser = this.browser ?: return
         val json = LineageJson.encodeToString(LineagePayload.serializer(), payload)
-        val safe = jsStringLiteral(json)
-        val script = "window.setLineageInfo && window.setLineageInfo(JSON.parse($safe));"
+        val script = "window.setLineageInfo && window.setLineageInfo(JSON.parse(${jsStringLiteral(json)}));"
         SwingUtilities.invokeLater {
             browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
         }
     }
+
+    private fun pushSelected(uniqueId: String) {
+        val browser = this.browser ?: return
+        val script = "window.setSelectedModel && window.setSelectedModel(${jsStringLiteral(uniqueId)});"
+        SwingUtilities.invokeLater {
+            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+        }
+    }
+
+    /** Inject the current host state (default hops + theme) into a fresh page. */
+    private fun pushHostState() {
+        val browser = this.browser ?: return
+        val s = project.service<LineageInfoService>().snapshot()
+        val state = HostState(
+            upHops = s.upHops,
+            downHops = s.downHops,
+        )
+        val json = LineageJson.encodeToString(HostState.serializer(), state)
+        val script = "window.__DBTREE_HOST_STATE__ = JSON.parse(${jsStringLiteral(json)}); " +
+            "window.applyHostState && window.applyHostState(window.__DBTREE_HOST_STATE__);"
+        SwingUtilities.invokeLater {
+            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+        }
+    }
+
+    private fun pushTheme(theme: String) {
+        val browser = this.browser ?: return
+        val script = "window.__DBTREE_THEME__ = ${jsStringLiteral(theme)}; " +
+            "window.setIdeTheme && window.setIdeTheme(${jsStringLiteral(theme)});"
+        SwingUtilities.invokeLater {
+            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+        }
+    }
+
+    private fun currentTheme(): String = if (JBColor.isBright()) "light" else "dark"
 
     private fun jsStringLiteral(s: String): String {
         val escaped = s
@@ -203,8 +248,6 @@ class LineagePanel(private val project: Project) : Disposable {
             .replace("\"", "\\\"")
             .replace("\n", "\\n")
             .replace("\r", "\\r")
-            .replace(" ", "\\u2028")
-            .replace(" ", "\\u2029")
         return "\"$escaped\""
     }
 
@@ -224,6 +267,7 @@ class LineagePanel(private val project: Project) : Disposable {
         }
         when (event.event) {
             "NODE_CLICK" -> handleNodeClick(event.uniqueId)
+            "HOP_CHANGE" -> handleHopChange(event.upHops, event.downHops)
             "REFRESH" -> project.service<LineageInfoService>().refreshFromDisk()
             else -> log.info("Unhandled JS event: ${event.event}")
         }
@@ -233,21 +277,25 @@ class LineagePanel(private val project: Project) : Disposable {
         if (uniqueId.isNullOrBlank()) return
         ApplicationManager.getApplication().executeOnPooledThread {
             val manifest = project.service<ManifestService>().ensureLoaded() ?: return@executeOnPooledThread
-            val node = manifest.dbtProjectDir
-            // Resolve unique_id back to a file path. This is the inverse of
-            // ManifestService.resolveByOriginalPath; for now we re-walk the
-            // node entries. Could be cached in Phase A2 if it shows up hot.
-            val path: Path? = manifest.lookupOriginalPath(uniqueId)?.let { rel -> node.resolve(rel) }
+            val path: Path? = manifest.lookupOriginalPath(uniqueId)?.let { rel ->
+                manifest.dbtProjectDir.resolve(rel)
+            }
             if (path == null) {
                 log.info("NODE_CLICK: no file path for $uniqueId (likely a source)")
                 return@executeOnPooledThread
             }
-            val vf = LocalFileSystem.getInstance().refreshAndFindFileByPath(path.toString()) ?: return@executeOnPooledThread
+            val vf = LocalFileSystem.getInstance().refreshAndFindFileByPath(path.toString())
+                ?: return@executeOnPooledThread
             ApplicationManager.getApplication().invokeLater(
                 { FileEditorManager.getInstance(project).openFile(vf, true) },
                 ModalityState.defaultModalityState(),
             )
         }
+    }
+
+    private fun handleHopChange(upHops: Int?, downHops: Int?) {
+        if (upHops == null || downHops == null) return
+        project.service<LineageInfoService>().setHops(upHops, downHops)
     }
 
     // ---- Disposable ---------------------------------------------------------------
@@ -268,13 +316,19 @@ class LineagePanel(private val project: Project) : Disposable {
         mainPanel.removeAll()
     }
 
-    // ---- JS event payload ---------------------------------------------------------
-
     @Serializable
     private data class JsCallback(
         val event: String,
         @SerialName("unique_id") val uniqueId: String? = null,
         val column: String? = null,
+        @SerialName("up_hops") val upHops: Int? = null,
+        @SerialName("down_hops") val downHops: Int? = null,
+    )
+
+    @Serializable
+    private data class HostState(
+        @SerialName("up_hops") val upHops: Int,
+        @SerialName("down_hops") val downHops: Int,
     )
 
     companion object {
@@ -289,8 +343,6 @@ class LineagePanel(private val project: Project) : Disposable {
             "favicon.svg" to "image/svg+xml",
         )
 
-        private val jsCallbackJson = Json {
-            ignoreUnknownKeys = true
-        }
+        private val jsCallbackJson = Json { ignoreUnknownKeys = true }
     }
 }

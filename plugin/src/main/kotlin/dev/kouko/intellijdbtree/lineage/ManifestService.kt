@@ -36,8 +36,9 @@ class ManifestService(private val project: Project) {
     private val state = AtomicReference<ParsedManifest?>(null)
 
     /**
-     * Re-detect the dbt project and reload manifest.json. Safe to call
-     * from any thread; performs file I/O.
+     * Re-detect the dbt project, reload manifest.json, and (if present)
+     * load catalog.json to enrich model column lists with real warehouse
+     * types. Safe to call from any thread; performs file I/O.
      */
     fun refresh(): RefreshResult {
         val dbtProjectDir = DbtProjectDetector.findFirst(project)
@@ -45,19 +46,31 @@ class ManifestService(private val project: Project) {
                 state.set(null)
                 return RefreshResult.NoDbtProject
             }
-        val manifestPath = dbtProjectDir.resolve("target").resolve("manifest.json")
+        val targetDir = dbtProjectDir.resolve("target")
+        val manifestPath = targetDir.resolve("manifest.json")
         if (!Files.isRegularFile(manifestPath)) {
             state.set(null)
             return RefreshResult.NoManifest(manifestPath)
         }
         return try {
-            val raw = Files.readString(manifestPath)
-            val json = JsonParser.parseString(raw).asJsonObject
-            val parsed = ParsedManifest(json, dbtProjectDir)
+            val manifestJson = JsonParser.parseString(Files.readString(manifestPath)).asJsonObject
+            val catalogPath = targetDir.resolve("catalog.json")
+            val catalogJson = if (Files.isRegularFile(catalogPath)) {
+                try {
+                    JsonParser.parseString(Files.readString(catalogPath)).asJsonObject
+                } catch (e: Exception) {
+                    log.warn("ManifestService: failed to parse $catalogPath, ignoring", e)
+                    null
+                }
+            } else {
+                null
+            }
+            val parsed = ParsedManifest(manifestJson, catalogJson, dbtProjectDir)
             state.set(parsed)
             log.info(
                 "ManifestService: loaded ${parsed.modelCount()} models, " +
-                    "${parsed.sourceCount()} sources from $manifestPath",
+                    "${parsed.sourceCount()} sources from $manifestPath" +
+                    (if (catalogJson != null) " (+ catalog.json)" else " (no catalog.json)"),
             )
             RefreshResult.Ok(parsed)
         } catch (e: Exception) {
@@ -114,12 +127,15 @@ class ManifestService(private val project: Project) {
  */
 class ParsedManifest(
     private val raw: JsonObject,
+    private val catalog: JsonObject?,
     val dbtProjectDir: Path,
 ) {
     private val nodes: JsonObject = raw.getAsJsonObject("nodes") ?: JsonObject()
     private val sources: JsonObject = raw.getAsJsonObject("sources") ?: JsonObject()
     private val childMap: JsonObject = raw.getAsJsonObject("child_map") ?: JsonObject()
     private val parentMap: JsonObject = raw.getAsJsonObject("parent_map") ?: JsonObject()
+    private val catalogNodes: JsonObject = catalog?.getAsJsonObject("nodes") ?: JsonObject()
+    private val catalogSources: JsonObject = catalog?.getAsJsonObject("sources") ?: JsonObject()
 
     /** Map: absolute filesystem path of a model file → model unique_id. */
     private val pathToModelId: Map<String, String> = buildMap {
@@ -147,33 +163,61 @@ class ParsedManifest(
     }
 
     /**
-     * BFS upstream + downstream from [seed]. If [seed] is null, returns
-     * every model + source as one big graph (rare; mostly for debug).
+     * BFS upstream and/or downstream from [seed], bounded by hop counts.
+     *
+     * If [seed] is null, returns the full project graph (debug only —
+     * use bounded variants in normal flow).
+     *
+     * @param upHops   max hops to walk via parent_map (Int.MAX_VALUE for unlimited)
+     * @param downHops max hops to walk via child_map  (Int.MAX_VALUE for unlimited)
      */
-    fun buildLineage(seed: String?): LineagePayload {
+    fun buildLineage(seed: String?, upHops: Int = Int.MAX_VALUE, downHops: Int = Int.MAX_VALUE): LineagePayload {
         val visited = mutableSetOf<String>()
         val edges = LinkedHashSet<ModelEdge>()
 
-        fun walk(node: String) {
-            if (!visited.add(node)) return
-            childMap.getAsJsonArray(node)?.forEach { c ->
-                val child = c.asString
-                edges += ModelEdge(node, child)
-                walk(child)
+        fun walkUp(node: String, remaining: Int) {
+            if (!visited.add(node)) {
+                // Already visited; still record edges below if we re-encounter
+                // through a different branch (handled by edges set dedup).
             }
+            if (remaining <= 0) return
             parentMap.getAsJsonArray(node)?.forEach { p ->
                 val parent = p.asString
                 edges += ModelEdge(parent, node)
-                walk(parent)
+                if (parent !in visited || remaining > 0) {
+                    visited.add(parent)
+                    walkUp(parent, remaining - 1)
+                }
+            }
+        }
+
+        fun walkDown(node: String, remaining: Int) {
+            visited.add(node)
+            if (remaining <= 0) return
+            childMap.getAsJsonArray(node)?.forEach { c ->
+                val child = c.asString
+                edges += ModelEdge(node, child)
+                if (child !in visited || remaining > 0) {
+                    visited.add(child)
+                    walkDown(child, remaining - 1)
+                }
             }
         }
 
         if (seed != null) {
-            walk(seed)
+            visited.add(seed)
+            walkUp(seed, upHops)
+            walkDown(seed, downHops)
         } else {
-            // Whole project — iterate over every node.
-            for ((uid, _) in nodes.entrySet()) walk(uid)
-            for ((uid, _) in sources.entrySet()) walk(uid)
+            for ((uid, _) in nodes.entrySet()) {
+                visited.add(uid)
+                walkUp(uid, upHops)
+                walkDown(uid, downHops)
+            }
+            for ((uid, _) in sources.entrySet()) {
+                visited.add(uid)
+                walkDown(uid, downHops)
+            }
         }
 
         // Filter edges + visited down to "interesting" nodes only:
@@ -208,7 +252,7 @@ class ParsedManifest(
                 name = s.string("name") ?: uid.substringAfterLast('.'),
                 packageName = s.string("package_name") ?: "",
                 layer = "source",
-                columns = readColumns(s),
+                columns = mergedColumns(uid, s, fromSources = true),
             )
         }
         val n = nodes.getAsJsonObject(uid) ?: return null
@@ -218,7 +262,7 @@ class ParsedManifest(
             name = n.string("name") ?: uid.substringAfterLast('.'),
             packageName = n.string("package_name") ?: "",
             layer = inferLayer(n),
-            columns = readColumns(n),
+            columns = mergedColumns(uid, n, fromSources = false),
         )
     }
 
@@ -234,15 +278,47 @@ class ParsedManifest(
         }
     }
 
-    private fun readColumns(n: JsonObject): List<ColumnSpec> {
-        val cols = n.getAsJsonObject("columns") ?: return emptyList()
-        return cols.entrySet().mapNotNull { (name, v) ->
-            if (v == null || v.isJsonNull || !v.isJsonObject) return@mapNotNull ColumnSpec(name = name)
-            val obj = v.asJsonObject
+    /**
+     * Build the column list for a model/source. Sources of truth, in order:
+     *   1. catalog.json (real warehouse columns + types) — if present
+     *   2. manifest.json columns (from schema.yml) — descriptions + fallback
+     * The merge: take the union; type from catalog if available, else manifest;
+     * description from manifest (yml docs) regardless.
+     */
+    private fun mergedColumns(uid: String, manifestNode: JsonObject, fromSources: Boolean): List<ColumnSpec> {
+        val manifestCols: Map<String, JsonObject> = manifestNode.getAsJsonObject("columns")
+            ?.entrySet()
+            ?.filter { (_, v) -> v != null && !v.isJsonNull && v.isJsonObject }
+            ?.associate { (k, v) -> k to v.asJsonObject }
+            ?: emptyMap()
+
+        val catalogContainer = if (fromSources) catalogSources else catalogNodes
+        val catalogCols: Map<String, JsonObject> = catalogContainer.getAsJsonObject(uid)
+            ?.getAsJsonObject("columns")
+            ?.entrySet()
+            ?.filter { (_, v) -> v != null && !v.isJsonNull && v.isJsonObject }
+            ?.associate { (k, v) -> k to v.asJsonObject }
+            ?: emptyMap()
+
+        if (manifestCols.isEmpty() && catalogCols.isEmpty()) return emptyList()
+
+        // Preserve catalog's index ordering when available; otherwise use manifest order.
+        val ordered: List<String> = if (catalogCols.isNotEmpty()) {
+            catalogCols.entries
+                .sortedBy { it.value.get("index")?.let { idx -> if (idx.isJsonPrimitive) idx.asInt else 0 } ?: 0 }
+                .map { it.key } + manifestCols.keys.filter { it !in catalogCols }
+        } else {
+            manifestCols.keys.toList()
+        }
+
+        return ordered.map { name ->
+            val cat = catalogCols[name]
+            val man = manifestCols[name]
             ColumnSpec(
                 name = name,
-                type = obj.string("data_type"),
-                description = obj.string("description")?.takeIf { it.isNotBlank() },
+                type = cat?.string("type") ?: man?.string("data_type"),
+                description = man?.string("description")?.takeIf { it.isNotBlank() }
+                    ?: cat?.string("comment")?.takeIf { it.isNotBlank() },
             )
         }
     }
