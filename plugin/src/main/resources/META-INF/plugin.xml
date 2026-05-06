@@ -29,4 +29,10 @@
             anchor="right"
             factoryClass="dev.kouko.intellijdbtree.toolwindow.DbtreeToolWindowFactory"/>
     </extensions>
+
+    <projectListeners>
+        <listener
+            class="dev.kouko.intellijdbtree.lineage.DbtFileEditorListener"
+            topic="com.intellij.openapi.fileEditor.FileEditorManagerListener"/>
+    </projectListeners>
 </idea-plugin>

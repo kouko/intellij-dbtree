@@ -3,6 +3,7 @@ import org.jetbrains.intellij.platform.gradle.IntelliJPlatformType
 
 plugins {
     id("org.jetbrains.kotlin.jvm")
+    id("org.jetbrains.kotlin.plugin.serialization")
     id("org.jetbrains.intellij.platform")
     id("com.github.node-gradle.node")
 }
@@ -18,6 +19,8 @@ repositories {
 }
 
 dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+
     intellijPlatform {
         create(
             type = IntelliJPlatformType.fromCode(providers.gradleProperty("platformType").get()),
@@ -52,9 +55,13 @@ intellijPlatform {
     }
 }
 
-// Auto-open the repo root in the sandbox IDE so the tool window is reachable.
+// Auto-open a project in the sandbox IDE so the tool window is reachable.
+// Override with `-Pide.project=/path/to/dbt/project` to test against a real
+// dbt project (e.g. /tmp/dbt-test/jaffle-shop after `dbt parse`).
 tasks.named<JavaExec>("runIde") {
-    args = listOf(rootDir.parentFile.absolutePath)
+    val projectArg = providers.gradleProperty("ide.project")
+        .orElse(rootDir.parentFile.absolutePath)
+    args = listOf(projectArg.get())
     systemProperty("idea.plugin.in.sandbox.mode", "true")
 }
 

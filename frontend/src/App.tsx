@@ -21,8 +21,40 @@ const NODE_WIDTH = 240;
 const HEADER_HEIGHT = 38;
 const ROW_HEIGHT = 22;
 
+// Synthetic host the JetBrains plugin uses when serving via JCEF.
+// Outside that host (Vite dev server / file://) we fall back to the demo fixture
+// so the standalone app still has something to render.
+const PLUGIN_HOST = "intellij-dbtree.local";
+const isInsidePlugin = typeof window !== "undefined" && window.location.hostname === PLUGIN_HOST;
+
+declare global {
+  interface Window {
+    setLineageInfo?: (payload: LineagePayload) => void;
+    kotlinCallback?: (payload: string) => void;
+  }
+}
+
+const EMPTY_PAYLOAD: LineagePayload = {
+  models: [],
+  model_edges: [],
+  column_edges: [],
+};
+
 function App() {
-  const payload = demoFixture as LineagePayload;
+  // Inside the plugin we wait for Kotlin to push a payload. Standalone
+  // (vite dev / static preview) we render the demo fixture so the page
+  // is not empty.
+  const [payload, setPayload] = useState<LineagePayload>(() =>
+    isInsidePlugin ? EMPTY_PAYLOAD : (demoFixture as LineagePayload),
+  );
+
+  // Expose `window.setLineageInfo` so the plugin's executeJavaScript push works.
+  useEffect(() => {
+    window.setLineageInfo = (next) => setPayload(next);
+    return () => {
+      delete window.setLineageInfo;
+    };
+  }, []);
 
   // Which models have their column lists expanded.
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -39,6 +71,25 @@ function App() {
       : null,
   );
 
+  // When the plugin pushes a new payload, default-expand the selected model
+  // and clear any column highlight that no longer applies.
+  useEffect(() => {
+    setExpanded((prev) => {
+      if (!payload.selected) return prev;
+      if (prev.has(payload.selected.unique_id)) return prev;
+      const next = new Set(prev);
+      next.add(payload.selected.unique_id);
+      return next;
+    });
+    setSelectedColumn((prev) => {
+      if (!prev) return prev;
+      const stillExists = payload.models.some(
+        (m) => m.unique_id === prev.unique_id && m.columns.some((c) => c.name === prev.column),
+      );
+      return stillExists ? prev : null;
+    });
+  }, [payload]);
+
   const toggleExpanded = useCallback((uniqueId: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -54,7 +105,6 @@ function App() {
         ? null
         : { unique_id: uniqueId, column },
     );
-    // Auto-expand the clicked model so the user can see what they clicked stays visible.
     setExpanded((prev) => {
       if (prev.has(uniqueId)) return prev;
       const next = new Set(prev);
@@ -63,7 +113,12 @@ function App() {
     });
   }, []);
 
-  // Trace the upstream column lineage from a (model, column) seed via BFS over column_edges.
+  const onOpenFile = useCallback((uniqueId: string) => {
+    if (!window.kotlinCallback) return;
+    window.kotlinCallback(JSON.stringify({ event: "NODE_CLICK", unique_id: uniqueId }));
+  }, []);
+
+  // Trace the upstream column lineage from a (model, column) seed.
   const lineageTrace = useMemo(() => {
     const trace = {
       columns: new Map<string, Set<string>>(),
@@ -98,7 +153,6 @@ function App() {
     return trace;
   }, [selectedColumn, payload.column_edges]);
 
-  // Auto-expand all models on the lineage path so the user sees the highlighted columns.
   useEffect(() => {
     if (!selectedColumn) return;
     setExpanded((prev) => {
@@ -114,7 +168,6 @@ function App() {
     });
   }, [selectedColumn, lineageTrace.models]);
 
-  // Build xyflow nodes (with dagre layout).
   const nodes: Node[] = useMemo(() => {
     const isExpanded = (uid: string) => expanded.has(uid);
     const expandedColumnCount: Record<string, number> = {};
@@ -138,6 +191,7 @@ function App() {
         isSelectedModel: m.unique_id === payload.selected?.unique_id,
         onToggleExpanded: toggleExpanded,
         onColumnClick,
+        onOpenFile,
       },
     }));
 
@@ -150,9 +204,8 @@ function App() {
       ranksepY: 100,
       expandedColumnCount,
     });
-  }, [payload, expanded, lineageTrace, toggleExpanded, onColumnClick]);
+  }, [payload, expanded, lineageTrace, toggleExpanded, onColumnClick, onOpenFile]);
 
-  // Build xyflow edges: model-level always shown, column-level only when a column is selected.
   const edges: Edge[] = useMemo(() => {
     const onPath = (a: string, b: string) =>
       lineageTrace.models.has(a) && lineageTrace.models.has(b);
@@ -185,11 +238,12 @@ function App() {
     return [...modelEdges, ...columnEdges];
   }, [payload.model_edges, payload.column_edges, lineageTrace, selectedColumn]);
 
-  // Re-trigger fitView when layout-affecting state changes.
   const [fitKey, setFitKey] = useState(0);
   useEffect(() => {
     setFitKey((k) => k + 1);
-  }, [expanded.size, selectedColumn?.unique_id, selectedColumn?.column]);
+  }, [payload, expanded.size, selectedColumn?.unique_id, selectedColumn?.column]);
+
+  const isEmpty = payload.models.length === 0;
 
   return (
     <div style={{ width: "100vw", height: "100vh", display: "flex", flexDirection: "column" }}>
@@ -199,20 +253,56 @@ function App() {
         traceCount={lineageTrace.edges.size}
       />
       <div style={{ flex: 1, position: "relative" }}>
-        <ReactFlow
-          key={fitKey}
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={NODE_TYPES}
-          fitView
-          minZoom={0.2}
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background gap={16} color="#e2e8f0" />
-          <MiniMap pannable zoomable />
-          <Controls position="bottom-right" />
-        </ReactFlow>
+        {isEmpty ? (
+          <EmptyState insidePlugin={isInsidePlugin} />
+        ) : (
+          <ReactFlow
+            key={fitKey}
+            nodes={nodes}
+            edges={edges}
+            nodeTypes={NODE_TYPES}
+            fitView
+            minZoom={0.2}
+            proOptions={{ hideAttribution: true }}
+          >
+            <Background gap={16} color="#e2e8f0" />
+            <MiniMap pannable zoomable />
+            <Controls position="bottom-right" />
+          </ReactFlow>
+        )}
       </div>
+    </div>
+  );
+}
+
+function EmptyState({ insidePlugin }: { insidePlugin: boolean }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        height: "100%",
+        alignItems: "center",
+        justifyContent: "center",
+        textAlign: "center",
+        color: "#64748b",
+        padding: 32,
+        fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
+        fontSize: 13,
+        lineHeight: 1.6,
+      }}
+    >
+      {insidePlugin ? (
+        <div style={{ maxWidth: 380 }}>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#0f172a", marginBottom: 6 }}>
+            No lineage to display
+          </div>
+          Open a model <code>.sql</code> file under your dbt project's <code>models/</code> folder
+          to see its lineage. If nothing happens after opening one, run{" "}
+          <code>dbt parse</code> to generate <code>target/manifest.json</code>.
+        </div>
+      ) : (
+        <div>Loading demo fixture…</div>
+      )}
     </div>
   );
 }
@@ -240,7 +330,6 @@ function Toolbar({
       }}
     >
       <strong style={{ color: "#0f172a" }}>intellij-dbtree</strong>
-      <span style={{ color: "#94a3b8" }}>Phase B mockup</span>
       <span style={{ flex: 1 }} />
       {selected ? (
         <>
@@ -268,7 +357,7 @@ function Toolbar({
           </button>
         </>
       ) : (
-        <span style={{ color: "#94a3b8" }}>click a column to trace its lineage</span>
+        <span style={{ color: "#94a3b8" }}>click a column to trace · double-click model header to open file</span>
       )}
     </div>
   );
