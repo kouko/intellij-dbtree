@@ -21,12 +21,20 @@ repositories {
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    testImplementation(kotlin("test-junit5"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+
     intellijPlatform {
         create(
             type = IntelliJPlatformType.fromCode(providers.gradleProperty("platformType").get()),
             version = providers.gradleProperty("platformVersion").get(),
         )
     }
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 kotlin {
