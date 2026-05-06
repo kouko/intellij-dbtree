@@ -1,0 +1,60 @@
+/**
+ * Wire format between the JetBrains plugin (Phase A) and the JCEF UI (this app).
+ *
+ * Phase A will produce this payload by:
+ *  1. Reading dbt's manifest.json for models + parent_map (Kotlin)
+ *  2. Spawning the Python sidecar (Phase C) for column-level lineage
+ *  3. Stitching the column edges across models
+ *
+ * Phase B (now) hand-crafts a fixture in this exact shape so the UI is ready
+ * to plug into Phase A without contract changes.
+ */
+
+export interface ColumnSpec {
+  name: string;
+  /** Optional SQL type (e.g. "VARCHAR", "NUMERIC(18,2)"). May be absent in MVP. */
+  type?: string;
+  /** Optional column description from dbt schema.yml. */
+  description?: string;
+}
+
+export interface DbtModel {
+  /** dbt unique_id, e.g. "model.my_project.fct_orders". */
+  unique_id: string;
+  /** Short name, e.g. "fct_orders". */
+  name: string;
+  package_name: string;
+  /** Logical layer for color coding: "staging" | "intermediate" | "marts" | "source". */
+  layer?: ModelLayer;
+  columns: ColumnSpec[];
+}
+
+export type ModelLayer = "staging" | "intermediate" | "marts" | "source";
+
+export interface ModelEdge {
+  source_unique_id: string;
+  target_unique_id: string;
+}
+
+export interface ColumnEdge {
+  source_unique_id: string;
+  source_column: string;
+  target_unique_id: string;
+  target_column: string;
+  /**
+   * Optional SQL expression at the target side (e.g. "amount * 1.05"),
+   * lifted from sqlglot's lineage tree. Useful for hover tooltips.
+   */
+  expression?: string;
+}
+
+export interface LineagePayload {
+  models: DbtModel[];
+  model_edges: ModelEdge[];
+  column_edges: ColumnEdge[];
+  /** The model the user opened — UI focuses layout around it. */
+  selected?: {
+    unique_id: string;
+    column?: string;
+  };
+}

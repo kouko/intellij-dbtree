@@ -1,0 +1,107 @@
+{
+  "models": [
+    {
+      "unique_id": "source.demo.raw.orders",
+      "name": "orders",
+      "package_name": "demo",
+      "layer": "source",
+      "columns": [
+        { "name": "id", "type": "BIGINT" },
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "amount", "type": "NUMERIC(18,2)" },
+        { "name": "created_at", "type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "unique_id": "source.demo.raw.customers",
+      "name": "customers",
+      "package_name": "demo",
+      "layer": "source",
+      "columns": [
+        { "name": "id", "type": "BIGINT" },
+        { "name": "name", "type": "VARCHAR" },
+        { "name": "email", "type": "VARCHAR" },
+        { "name": "created_at", "type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.stg_orders",
+      "name": "stg_orders",
+      "package_name": "demo",
+      "layer": "staging",
+      "columns": [
+        { "name": "id", "type": "BIGINT" },
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "amount", "type": "NUMERIC(18,2)" },
+        { "name": "created_at", "type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.dim_customers",
+      "name": "dim_customers",
+      "package_name": "demo",
+      "layer": "marts",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "customer_name", "type": "VARCHAR" },
+        { "name": "first_seen_at", "type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.fct_orders",
+      "name": "fct_orders",
+      "package_name": "demo",
+      "layer": "marts",
+      "columns": [
+        { "name": "id", "type": "BIGINT" },
+        { "name": "customer_name", "type": "VARCHAR" },
+        { "name": "amount_with_tax", "type": "NUMERIC(18,2)" },
+        { "name": "created_at", "type": "TIMESTAMP" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.mart_customer_summary",
+      "name": "mart_customer_summary",
+      "package_name": "demo",
+      "layer": "marts",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "customer_name", "type": "VARCHAR" },
+        { "name": "total_revenue", "type": "NUMERIC(18,2)" },
+        { "name": "order_count", "type": "BIGINT" }
+      ]
+    }
+  ],
+  "model_edges": [
+    { "source_unique_id": "source.demo.raw.orders",     "target_unique_id": "model.demo.stg_orders" },
+    { "source_unique_id": "source.demo.raw.customers",  "target_unique_id": "model.demo.dim_customers" },
+    { "source_unique_id": "model.demo.stg_orders",      "target_unique_id": "model.demo.fct_orders" },
+    { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.fct_orders" },
+    { "source_unique_id": "model.demo.fct_orders",      "target_unique_id": "model.demo.mart_customer_summary" },
+    { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.mart_customer_summary" }
+  ],
+  "column_edges": [
+    { "source_unique_id": "source.demo.raw.orders",    "source_column": "id",          "target_unique_id": "model.demo.stg_orders", "target_column": "id" },
+    { "source_unique_id": "source.demo.raw.orders",    "source_column": "customer_id", "target_unique_id": "model.demo.stg_orders", "target_column": "customer_id" },
+    { "source_unique_id": "source.demo.raw.orders",    "source_column": "amount",      "target_unique_id": "model.demo.stg_orders", "target_column": "amount" },
+    { "source_unique_id": "source.demo.raw.orders",    "source_column": "created_at",  "target_unique_id": "model.demo.stg_orders", "target_column": "created_at" },
+
+    { "source_unique_id": "source.demo.raw.customers", "source_column": "id",          "target_unique_id": "model.demo.dim_customers", "target_column": "customer_id" },
+    { "source_unique_id": "source.demo.raw.customers", "source_column": "name",        "target_unique_id": "model.demo.dim_customers", "target_column": "customer_name" },
+    { "source_unique_id": "source.demo.raw.customers", "source_column": "created_at",  "target_unique_id": "model.demo.dim_customers", "target_column": "first_seen_at" },
+
+    { "source_unique_id": "model.demo.stg_orders",     "source_column": "id",          "target_unique_id": "model.demo.fct_orders", "target_column": "id" },
+    { "source_unique_id": "model.demo.dim_customers",  "source_column": "customer_name","target_unique_id": "model.demo.fct_orders", "target_column": "customer_name" },
+    { "source_unique_id": "model.demo.stg_orders",     "source_column": "amount",      "target_unique_id": "model.demo.fct_orders", "target_column": "amount_with_tax", "expression": "stg_orders.amount * 1.05" },
+    { "source_unique_id": "model.demo.stg_orders",     "source_column": "created_at",  "target_unique_id": "model.demo.fct_orders", "target_column": "created_at" },
+
+    { "source_unique_id": "model.demo.fct_orders",     "source_column": "id",                 "target_unique_id": "model.demo.mart_customer_summary", "target_column": "order_count",   "expression": "COUNT(fct_orders.id)" },
+    { "source_unique_id": "model.demo.fct_orders",     "source_column": "amount_with_tax",    "target_unique_id": "model.demo.mart_customer_summary", "target_column": "total_revenue", "expression": "SUM(fct_orders.amount_with_tax)" },
+    { "source_unique_id": "model.demo.dim_customers",  "source_column": "customer_id",        "target_unique_id": "model.demo.mart_customer_summary", "target_column": "customer_id" },
+    { "source_unique_id": "model.demo.dim_customers",  "source_column": "customer_name",      "target_unique_id": "model.demo.mart_customer_summary", "target_column": "customer_name" }
+  ],
+  "selected": {
+    "unique_id": "model.demo.fct_orders",
+    "column": "amount_with_tax"
+  }
+}

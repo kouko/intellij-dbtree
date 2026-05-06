@@ -17,6 +17,11 @@ build/
 # Node (Phase B / A)
 node_modules/
 .vite/
+dist/
+
+# Playwright MCP browser-automation artifacts
+.playwright-mcp/
+/phase-*.png
 
 # JetBrains plugin (Phase A)
 .gradle/
