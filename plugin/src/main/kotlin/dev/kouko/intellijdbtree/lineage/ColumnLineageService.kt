@@ -6,18 +6,18 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
-import dev.kouko.intellijdbtree.settings.DbtreeSettingsService
 import dev.kouko.intellijdbtree.sidecar.SidecarExtractor
 import kotlinx.serialization.json.Json
 
 /**
  * IDE-side wrapper that runs the bundled Python sidecar
- * (Phase C `dbtree_lineage` CLI) with the user-configured Python
- * interpreter (which must have `sqlglot` installed).
+ * (Phase C `dbtree_lineage` CLI) with a Python interpreter resolved from
+ * (in priority order) the user's setting, the project's IDE-configured
+ * Python SDK, or the dbt project's `.venv`. See [PythonInterpreterResolver].
  *
  * The actual stitching logic lives in [ColumnLineageWalker]; this service
  * is just the I/O boundary — it owns the subprocess invocation and the
- * service-level dependencies (settings, sidecar extraction).
+ * service-level dependencies (resolver, sidecar extraction).
  *
  * Phase A2 limits:
  *  - One subprocess per call (no long-lived RPC server). Each call ~1s.
@@ -29,22 +29,32 @@ class ColumnLineageService(private val project: Project) {
     private val log = Logger.getInstance(ColumnLineageService::class.java)
     private val sidecarJson = Json { ignoreUnknownKeys = true }
 
+    sealed interface Result {
+        data class Ok(val edges: List<ColumnEdge>) : Result
+        data class Failed(val warning: String) : Result
+    }
+
     /**
-     * Trace [column] of model [modelUid] both upstream and downstream and
-     * return every column-to-column edge encountered. Empty if Python
-     * interpreter is not configured or the sidecar can't run.
+     * Trace [column] of model [modelUid] both upstream and downstream.
+     * Returns [Result.Ok] with the edge list (possibly empty when sqlglot
+     * traces nothing) or [Result.Failed] with a human-readable warning that
+     * should bubble up to the toolbar.
      */
-    fun computeForColumn(modelUid: String, column: String, manifest: ParsedManifest): List<ColumnEdge> {
-        val python = DbtreeSettingsService.getInstance().state.pythonInterpreterPath.trim()
-        if (python.isBlank()) {
-            log.info("ColumnLineageService: no Python interpreter configured; skipping")
-            return emptyList()
+    fun computeForColumn(modelUid: String, column: String, manifest: ParsedManifest): Result {
+        val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
+        val (python, source) = when (resolution) {
+            is PythonInterpreterResolver.Resolution.Ok ->
+                resolution.pythonPath to resolution.source
+            is PythonInterpreterResolver.Resolution.None -> {
+                log.info("ColumnLineageService: ${resolution.reason}")
+                return Result.Failed(resolution.reason)
+            }
         }
         val sidecarDir = try {
             SidecarExtractor.ensureExtracted()
         } catch (e: Exception) {
             log.warn("ColumnLineageService: failed to extract sidecar", e)
-            return emptyList()
+            return Result.Failed("Failed to extract bundled Python sidecar: ${e.message}")
         }
 
         val pythonPath = sidecarDir.toString()
@@ -61,8 +71,8 @@ class ColumnLineageService(private val project: Project) {
         edges += traceUpstreamColumns(modelUid, column, manifest, singleSidecar)
         edges += traceDownstreamColumns(modelUid, column, manifest, allColumnsSidecar)
 
-        log.info("ColumnLineageService: traced $modelUid.$column -> ${edges.size} edges (up + down)")
-        return edges
+        log.info("ColumnLineageService: traced $modelUid.$column via $source ($python) -> ${edges.size} edges")
+        return Result.Ok(edges)
     }
 
     private fun runSidecarSingle(

@@ -57,4 +57,10 @@ export interface LineagePayload {
     unique_id: string;
     column?: string;
   };
+  /**
+   * Optional non-fatal warning surfaced to the toolbar (e.g. "no Python
+   * interpreter with sqlglot available — column lineage disabled").
+   * Cleared on the next successful payload.
+   */
+  warning?: string;
 }
