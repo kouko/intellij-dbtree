@@ -53,6 +53,17 @@ intellijPlatform {
             untilBuild = provider { null }
         }
     }
+
+    // JetBrains Plugin Verifier — checks the built plugin against the target IDE
+    // for binary compatibility issues. Runs in the `release.yml` workflow before
+    // attaching the .zip to a GitHub Release. Locally: `./gradlew verifyPlugin`.
+    // `current()` reuses the IDE pinned in the main dependencies block, so the
+    // version is single-sourced from gradle.properties.
+    pluginVerification {
+        ides {
+            current()
+        }
+    }
 }
 
 // Auto-open a project in the sandbox IDE so the tool window is reachable.

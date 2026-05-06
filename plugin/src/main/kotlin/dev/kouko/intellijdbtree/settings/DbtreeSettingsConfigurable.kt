@@ -10,7 +10,7 @@ import javax.swing.JLabel
 import javax.swing.JPanel
 
 /**
- * Settings page at: Settings → Tools → intellij-dbtree.
+ * Settings page at: Settings → Tools → dbtree.
  *
  * Phase A2: only the Python interpreter path. Test/validate buttons can
  * come later if needed.
@@ -20,7 +20,7 @@ class DbtreeSettingsConfigurable : Configurable {
     private var pythonField: TextFieldWithBrowseButton? = null
     private var component: JComponent? = null
 
-    override fun getDisplayName(): String = "intellij-dbtree"
+    override fun getDisplayName(): String = "dbtree"
     override fun getHelpTopic(): String? = null
 
     override fun createComponent(): JComponent {

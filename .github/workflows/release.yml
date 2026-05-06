@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: plugin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches gradle.properties version
+        working-directory: ${{ github.workspace }}
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          gradle_version=$(awk -F'= *' '/^version[[:space:]]*=/ { print $2; exit }' plugin/gradle.properties | tr -d '[:space:]')
+          if [ "$tag_version" != "$gradle_version" ]; then
+            echo "::error::Tag version ($tag_version) does not match plugin/gradle.properties version ($gradle_version). Bump the version, commit, then re-tag." >&2
+            exit 1
+          fi
+          echo "Releasing version $gradle_version"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Cache Plugin Verifier IDEs
+        uses: actions/cache@v4
+        with:
+          path: ~/.pluginVerifier/ides
+          key: pluginVerifier-${{ runner.os }}-DS-2026.1.1
+
+      - name: Build plugin
+        run: ./gradlew --no-daemon --stacktrace buildPlugin
+
+      - name: Verify plugin against DataSpell 2026.1.1
+        run: ./gradlew --no-daemon --stacktrace verifyPlugin
+
+      - name: Upload verifier reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-verifier-reports
+          path: plugin/build/reports/pluginVerifier/
+          if-no-files-found: ignore
+
+      - name: Create GitHub Release
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            plugin/build/distributions/*.zip \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

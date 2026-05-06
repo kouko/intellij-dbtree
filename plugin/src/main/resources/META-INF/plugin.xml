@@ -1,11 +1,11 @@
 <!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
 <idea-plugin>
     <id>dev.kouko.intellij-dbtree</id>
-    <name>intellij-dbtree</name>
+    <name>dbtree</name>
     <vendor email="kouko.d@gmail.com" url="https://github.com/kouko/intellij-dbtree">kouko</vendor>
 
     <description><![CDATA[
-        <p><b>intellij-dbtree</b> visualizes <a href="https://www.getdbt.com/">dbt</a> model lineage inside JetBrains IDEs (DataSpell, PyCharm, IntelliJ IDEA), with <b>column-level lineage</b> powered by <a href="https://github.com/tobymao/sqlglot">sqlglot</a>.</p>
+        <p><b>dbtree</b> visualizes <a href="https://www.getdbt.com/">dbt</a> model lineage inside JetBrains IDEs (DataSpell, PyCharm, IntelliJ IDEA), with <b>column-level lineage</b> powered by <a href="https://github.com/tobymao/sqlglot">sqlglot</a>.</p>
         <ul>
             <li>Interactive model-level DAG via JCEF + React Flow</li>
             <li>Column-to-column lineage tracing across CTEs, JOINs, UNIONs, window functions</li>
@@ -31,7 +31,7 @@
         <applicationConfigurable
             parentId="tools"
             id="dev.kouko.intellij-dbtree.settings"
-            displayName="intellij-dbtree"
+            displayName="dbtree"
             instance="dev.kouko.intellijdbtree.settings.DbtreeSettingsConfigurable"/>
     </extensions>
 
