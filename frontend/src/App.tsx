@@ -12,10 +12,17 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import demoFixture from "./fixtures/lineage-demo.json";
-import type { ColumnEdge, LineagePayload } from "./types";
+import type { LineagePayload } from "./types";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
 import { layoutModelGraph } from "./lib/layout";
+import {
+  buildColumnLineageTrace,
+  buildColumnTraceEdgePairs,
+  buildModelTrace,
+  edgeKey,
+  isEdgeOnModelTreePath,
+} from "./lib/lineage-trace";
 import { THEMES, detectInitialTheme, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
@@ -282,67 +289,10 @@ function App() {
   // Ancestors ∪ descendants of the selected column. Two strictly-directional
   // passes — bidirectional BFS would overreach into sibling columns that
   // share an upstream/downstream node with the seed.
-  const lineageTrace = useMemo(() => {
-    const trace = {
-      columns: new Map<string, Set<string>>(),
-      edges: new Set<string>(),
-      models: new Set<string>(),
-    };
-    if (!selectedColumn) return trace;
-
-    const noteVisit = (uniqueId: string, column: string) => {
-      let cols = trace.columns.get(uniqueId);
-      if (!cols) {
-        cols = new Set();
-        trace.columns.set(uniqueId, cols);
-      }
-      cols.add(column);
-      trace.models.add(uniqueId);
-    };
-    noteVisit(selectedColumn.unique_id, selectedColumn.column);
-
-    // Upstream: from cur, follow edges where target == cur, walk to source.
-    {
-      const queue: Array<{ unique_id: string; column: string }> = [selectedColumn];
-      const seen = new Set<string>([`${selectedColumn.unique_id}|${selectedColumn.column}`]);
-      while (queue.length > 0) {
-        const cur = queue.shift()!;
-        for (const ce of payload.column_edges) {
-          if (ce.target_unique_id === cur.unique_id && ce.target_column === cur.column) {
-            trace.edges.add(edgeKey(ce));
-            const next = { unique_id: ce.source_unique_id, column: ce.source_column };
-            const key = `${next.unique_id}|${next.column}`;
-            if (!seen.has(key)) {
-              seen.add(key);
-              noteVisit(next.unique_id, next.column);
-              queue.push(next);
-            }
-          }
-        }
-      }
-    }
-    // Downstream: from cur, follow edges where source == cur, walk to target.
-    {
-      const queue: Array<{ unique_id: string; column: string }> = [selectedColumn];
-      const seen = new Set<string>([`${selectedColumn.unique_id}|${selectedColumn.column}`]);
-      while (queue.length > 0) {
-        const cur = queue.shift()!;
-        for (const ce of payload.column_edges) {
-          if (ce.source_unique_id === cur.unique_id && ce.source_column === cur.column) {
-            trace.edges.add(edgeKey(ce));
-            const next = { unique_id: ce.target_unique_id, column: ce.target_column };
-            const key = `${next.unique_id}|${next.column}`;
-            if (!seen.has(key)) {
-              seen.add(key);
-              noteVisit(next.unique_id, next.column);
-              queue.push(next);
-            }
-          }
-        }
-      }
-    }
-    return trace;
-  }, [selectedColumn, payload.column_edges]);
+  const lineageTrace = useMemo(
+    () => buildColumnLineageTrace(selectedColumn, payload.column_edges),
+    [selectedColumn, payload.column_edges],
+  );
 
   useEffect(() => {
     if (!selectedColumn) return;
@@ -359,70 +309,15 @@ function App() {
     });
   }, [selectedColumn, lineageTrace.models]);
 
-  // Model-level lineage trace, split into ancestors and descendants of the
-  // selected model. Keeping them separate (instead of a single union) lets
-  // the edge highlighter distinguish "edge inside the upstream chain",
-  // "edge inside the downstream chain", and "skip edge from an ancestor
-  // straight to a descendant that bypasses the selected model" — only the
-  // first two should be highlighted.
-  const modelTrace = useMemo(() => {
-    const ancestors = new Set<string>();
-    const descendants = new Set<string>();
-    if (!selectedModelUid) {
-      return { ancestors, descendants, all: new Set<string>() };
-    }
-    // Upstream
-    {
-      const queue: string[] = [selectedModelUid];
-      while (queue.length > 0) {
-        const cur = queue.shift()!;
-        for (const me of payload.model_edges) {
-          if (
-            me.target_unique_id === cur &&
-            me.source_unique_id !== selectedModelUid &&
-            !ancestors.has(me.source_unique_id)
-          ) {
-            ancestors.add(me.source_unique_id);
-            queue.push(me.source_unique_id);
-          }
-        }
-      }
-    }
-    // Downstream
-    {
-      const queue: string[] = [selectedModelUid];
-      while (queue.length > 0) {
-        const cur = queue.shift()!;
-        for (const me of payload.model_edges) {
-          if (
-            me.source_unique_id === cur &&
-            me.target_unique_id !== selectedModelUid &&
-            !descendants.has(me.target_unique_id)
-          ) {
-            descendants.add(me.target_unique_id);
-            queue.push(me.target_unique_id);
-          }
-        }
-      }
-    }
-    const all = new Set<string>([selectedModelUid, ...ancestors, ...descendants]);
-    return { ancestors, descendants, all };
-  }, [selectedModelUid, payload.model_edges]);
+  const modelTrace = useMemo(
+    () => buildModelTrace(selectedModelUid, payload.model_edges),
+    [selectedModelUid, payload.model_edges],
+  );
 
-  // For column-lineage edge highlighting we need the exact set of model
-  // edges the chosen column actually traverses (NOT just any edge between
-  // two models that happen to be in the trace). Each column_edge already
-  // pins this down — collapse them to (source, target) pairs.
-  const columnTraceEdgePairs = useMemo(() => {
-    const pairs = new Set<string>();
-    if (!selectedColumn) return pairs;
-    for (const ce of payload.column_edges) {
-      if (lineageTrace.edges.has(edgeKey(ce))) {
-        pairs.add(`${ce.source_unique_id}|${ce.target_unique_id}`);
-      }
-    }
-    return pairs;
-  }, [selectedColumn, payload.column_edges, lineageTrace.edges]);
+  const columnTraceEdgePairs = useMemo(
+    () => buildColumnTraceEdgePairs(selectedColumn, payload.column_edges, lineageTrace.edges),
+    [selectedColumn, payload.column_edges, lineageTrace.edges],
+  );
 
   // ---- xyflow nodes/edges --------------------------------------------------
   // `derivedNodes` is rebuilt whenever data changes. `liveNodes` is what
@@ -524,28 +419,13 @@ function App() {
   }, []);
 
   const edges: Edge[] = useMemo(() => {
-    // Edge (a → b) is "on the lineage tree from seed" iff:
-    //   - a∈{seed}∪descendants AND b∈descendants  (downstream chain edge), OR
-    //   - b∈{seed}∪ancestors   AND a∈ancestors    (upstream chain edge).
-    // This rejects "skip" edges that go directly from an ancestor to a
-    // descendant, bypassing the seed (e.g. orders → customer_combined_metrics
-    // when seed = customers — that edge isn't part of customers' tree).
-    const onModelTreePath = (a: string, b: string): boolean => {
-      if (!selectedModelUid) return false;
-      const aSeed = a === selectedModelUid;
-      const bSeed = b === selectedModelUid;
-      const downstreamEdge =
-        (aSeed || modelTrace.descendants.has(a)) && modelTrace.descendants.has(b);
-      const upstreamEdge =
-        modelTrace.ancestors.has(a) && (bSeed || modelTrace.ancestors.has(b));
-      return downstreamEdge || upstreamEdge;
-    };
-
     const onColumnTreePath = (a: string, b: string): boolean =>
       columnTraceEdgePairs.has(`${a}|${b}`);
 
     const onPath = (a: string, b: string): boolean =>
-      selectedColumn ? onColumnTreePath(a, b) : onModelTreePath(a, b);
+      selectedColumn
+        ? onColumnTreePath(a, b)
+        : isEdgeOnModelTreePath(a, b, selectedModelUid, modelTrace);
 
     const modelEdges: Edge[] = payload.model_edges.map((me) => ({
       id: `m:${me.source_unique_id}->${me.target_unique_id}`,
@@ -839,10 +719,6 @@ function modelLevelEdges(p: LineagePayload): Edge[] {
     source: me.source_unique_id,
     target: me.target_unique_id,
   }));
-}
-
-function edgeKey(ce: ColumnEdge): string {
-  return `${ce.source_unique_id}|${ce.source_column}->${ce.target_unique_id}|${ce.target_column}`;
 }
 
 export default App;
