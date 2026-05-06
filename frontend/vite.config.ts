@@ -1,8 +1,16 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // https://vite.dev/config/
 export default defineConfig({
+  test: {
+    // Pure-logic tests only (no React rendering yet), so the default Node
+    // environment is enough. If we add DOM-dependent tests later, switch
+    // this to "jsdom" and add @testing-library/react.
+    environment: "node",
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
+  },
   define: {
     // Surfaced as a tiny "bXXXXXXX" string in the toolbar so we can verify
     // visually that the JCEF browser is rendering the freshly-built bundle
