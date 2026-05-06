@@ -3,14 +3,14 @@ import type { Theme } from "../lib/theme";
 const HOP_STEPS = [0, 1, 2, 3, 5, 10] as const;
 const UNLIMITED = Number.MAX_SAFE_INTEGER;
 
-function next(value: number): number {
+export function nextHop(value: number): number {
   if (value >= 10) return UNLIMITED;
   if (!Number.isFinite(value) || value > 10) return 10;
   const idx = HOP_STEPS.indexOf(value as (typeof HOP_STEPS)[number]);
   return HOP_STEPS[Math.min(idx + 1, HOP_STEPS.length - 1)];
 }
 
-function prev(value: number): number {
+export function prevHop(value: number): number {
   if (value === UNLIMITED) return 10;
   const idx = HOP_STEPS.indexOf(value as (typeof HOP_STEPS)[number]);
   return HOP_STEPS[Math.max(idx - 1, 0)];
@@ -63,7 +63,7 @@ export function HopStepper({ label, value, onChange, theme }: HopStepperProps) {
       <span aria-hidden style={{ minWidth: 14, textAlign: "center" }}>{label}</span>
       <button
         type="button"
-        onClick={() => onChange(prev(value))}
+        onClick={() => onChange(prevHop(value))}
         style={btnStyle}
         aria-label={`decrease ${label}`}
       >
@@ -82,7 +82,7 @@ export function HopStepper({ label, value, onChange, theme }: HopStepperProps) {
       </span>
       <button
         type="button"
-        onClick={() => onChange(next(value))}
+        onClick={() => onChange(nextHop(value))}
         style={btnStyle}
         aria-label={`increase ${label}`}
       >
