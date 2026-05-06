@@ -63,14 +63,14 @@ class LineageInfoService(private val project: Project) {
             val manifest = project.service<ManifestService>().ensureLoaded() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
-            if (uid in cur.publishedUids) {
-                // In DAG: only update selection.
-                state.set(cur.copy(activeUid = uid))
-                publisher.selectedModelChanged(uid)
-            } else {
-                // Outside DAG: rebuild around this model.
-                val updated = cur.copy(activeUid = uid)
-                publishFull(manifest, updated)
+            when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
+                is FocusDecision.SelectionOnly -> {
+                    state.set(cur.copy(activeUid = decision.uid))
+                    publisher.selectedModelChanged(decision.uid)
+                }
+                is FocusDecision.Rebuild -> {
+                    publishFull(manifest, cur.copy(activeUid = decision.uid))
+                }
             }
         }
     }
