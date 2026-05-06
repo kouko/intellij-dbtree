@@ -32,6 +32,13 @@ jobs:
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
+      - name: Set up uv + Python 3.13
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.13"
+          cache-dependency-glob: python-sidecar/uv.lock
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -48,6 +55,14 @@ jobs:
       - name: Frontend — run unit tests
         working-directory: frontend
         run: pnpm run test
+
+      - name: Sidecar — install
+        working-directory: python-sidecar
+        run: uv sync --extra dev
+
+      - name: Sidecar — run tests
+        working-directory: python-sidecar
+        run: uv run pytest
 
       - name: Plugin — run unit tests
         working-directory: plugin
