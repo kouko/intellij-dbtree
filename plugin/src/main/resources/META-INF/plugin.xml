@@ -1,0 +1,32 @@
+<!-- Plugin Configuration File. Read more: https://plugins.jetbrains.com/docs/intellij/plugin-configuration-file.html -->
+<idea-plugin>
+    <id>dev.kouko.intellij-dbtree</id>
+    <name>intellij-dbtree</name>
+    <vendor email="kouko.d@gmail.com" url="https://github.com/kouko/intellij-dbtree">kouko</vendor>
+
+    <description><![CDATA[
+        <p><b>intellij-dbtree</b> visualizes <a href="https://www.getdbt.com/">dbt</a> model lineage inside JetBrains IDEs (DataSpell, PyCharm, IntelliJ IDEA), with <b>column-level lineage</b> powered by <a href="https://github.com/tobymao/sqlglot">sqlglot</a>.</p>
+        <ul>
+            <li>Interactive model-level DAG via JCEF + React Flow</li>
+            <li>Column-to-column lineage tracing across CTEs, JOINs, UNIONs, window functions</li>
+            <li>Successor of the archived <code>ramonvermeulen/dbt-toolkit</code></li>
+        </ul>
+    ]]></description>
+
+    <change-notes><![CDATA[
+        <h3>0.1.0 — Phase A0 (plugin shell)</h3>
+        <ul>
+            <li>Tool window with embedded JCEF browser</li>
+            <li>Renders the Phase B React lineage UI bundled inside the plugin</li>
+        </ul>
+    ]]></change-notes>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow
+            id="dbtree"
+            anchor="right"
+            factoryClass="dev.kouko.intellijdbtree.toolwindow.DbtreeToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
