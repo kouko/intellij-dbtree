@@ -28,6 +28,11 @@
             id="dbtree"
             anchor="right"
             factoryClass="dev.kouko.intellijdbtree.toolwindow.DbtreeToolWindowFactory"/>
+        <applicationConfigurable
+            parentId="tools"
+            id="dev.kouko.intellij-dbtree.settings"
+            displayName="intellij-dbtree"
+            instance="dev.kouko.intellijdbtree.settings.DbtreeSettingsConfigurable"/>
     </extensions>
 
     <projectListeners>

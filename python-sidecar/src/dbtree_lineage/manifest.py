@@ -42,10 +42,17 @@ class ModelRef:
 
 
 class DbtManifest:
-    def __init__(self, manifest: dict[str, Any], project_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        manifest: dict[str, Any],
+        project_dir: Path | None = None,
+        catalog: dict[str, Any] | None = None,
+    ) -> None:
         self._raw = manifest
         self._project_dir = project_dir
         self._nodes: dict[str, Any] = manifest.get("nodes", {})
+        self._sources: dict[str, Any] = manifest.get("sources", {})
+        self._catalog: dict[str, Any] = catalog or {}
 
     @classmethod
     def load(cls, manifest_path: Path) -> "DbtManifest":
@@ -55,9 +62,15 @@ class DbtManifest:
             data = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             raise ManifestError(f"manifest.json is not valid JSON: {e}") from e
-        # project_dir is two levels up from target/manifest.json
         project_dir = manifest_path.parent.parent
-        return cls(data, project_dir=project_dir)
+        catalog_path = project_dir / "target" / "catalog.json"
+        catalog: dict[str, Any] | None = None
+        if catalog_path.is_file():
+            try:
+                catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                catalog = None
+        return cls(data, project_dir=project_dir, catalog=catalog)
 
     @classmethod
     def from_project(cls, project_dir: Path) -> "DbtManifest":
@@ -134,3 +147,78 @@ class DbtManifest:
             f"Model {node.get('unique_id')!r} has no compiled SQL. "
             "Run `dbt compile` first."
         )
+
+    def list_model_columns(self, unique_id: str) -> list[str]:
+        """Return every known column name for a model.
+
+        Prefers ``catalog.json`` (real warehouse columns) over manifest
+        (yml-documented). Empty if neither has anything.
+        """
+        catalog_node = (
+            self._catalog.get("nodes", {}).get(unique_id, {}) if self._catalog else {}
+        )
+        catalog_cols = list(catalog_node.get("columns", {}).keys())
+        if catalog_cols:
+            return catalog_cols
+        node = self._nodes.get(unique_id, {})
+        return list((node.get("columns") or {}).keys())
+
+    def build_sqlglot_schema(self) -> dict[str, Any]:
+        """Build a nested ``{db: {schema: {table: {col: type}}}}`` dict
+        suitable for sqlglot's ``schema=`` parameter.
+
+        Reads dbt ``relation_name`` per model + source (full warehouse
+        identifier like ``"jaffle_shop"."main"."stg_orders"``) and pulls
+        column types from ``catalog.json`` when available, falling back
+        to ``schema.yml``-documented types from the manifest itself.
+        """
+        catalog_nodes = self._catalog.get("nodes", {}) if self._catalog else {}
+        catalog_sources = self._catalog.get("sources", {}) if self._catalog else {}
+
+        schema: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
+
+        def add(uid: str, node: dict[str, Any], catalog_entry: dict[str, Any] | None) -> None:
+            relation = node.get("relation_name")
+            if not isinstance(relation, str):
+                return
+            parts = [p.strip().strip('"').strip("`") for p in relation.split(".")]
+            if len(parts) == 3:
+                db, sch, table = parts
+            elif len(parts) == 2:
+                db, sch, table = "", parts[0], parts[1]
+            elif len(parts) == 1:
+                db, sch, table = "", "", parts[0]
+            else:
+                return
+
+            cols: dict[str, str] = {}
+            cat_cols = (catalog_entry or {}).get("columns", {})
+            for col, spec in cat_cols.items():
+                t = spec.get("type") if isinstance(spec, dict) else None
+                if t:
+                    cols[col] = t
+            for col, spec in (node.get("columns") or {}).items():
+                if col in cols:
+                    continue
+                t = spec.get("data_type") if isinstance(spec, dict) else None
+                if t:
+                    cols[col] = t
+            if not cols:
+                return
+
+            schema.setdefault(db, {}).setdefault(sch, {})[table] = cols
+
+        for uid, node in self._nodes.items():
+            if node.get("resource_type") != "model":
+                continue
+            add(uid, node, catalog_nodes.get(uid))
+        for uid, node in self._sources.items():
+            add(uid, node, catalog_sources.get(uid))
+
+        # Strip the empty-string outer wrappers if the warehouse is single-tier.
+        if "" in schema and len(schema) == 1:
+            inner = schema[""]
+            if "" in inner and len(inner) == 1:
+                return inner[""]
+            return inner
+        return schema

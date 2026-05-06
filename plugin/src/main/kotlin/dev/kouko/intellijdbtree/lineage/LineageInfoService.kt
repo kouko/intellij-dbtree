@@ -100,6 +100,34 @@ class LineageInfoService(private val project: Project) {
         }
     }
 
+    /**
+     * The user clicked a column in the React UI. Spawn the Python sidecar
+     * to compute its full upstream column lineage, then re-publish the
+     * payload with `column_edges` populated. Layout doesn't change.
+     */
+    fun onColumnClicked(modelUid: String, column: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val manifest = project.service<ManifestService>().ensureLoaded()
+                ?: return@executeOnPooledThread
+            val cur = state.get()
+            val activeUid = cur.activeUid ?: modelUid
+
+            val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
+            val edges = project.service<ColumnLineageService>()
+                .computeForColumn(modelUid, column, manifest)
+
+            val payload = basePayload.copy(
+                columnEdges = edges,
+                selected = Selected(uniqueId = modelUid, column = column),
+            )
+            // Topology hasn't changed (same nodes / model edges); the
+            // frontend's topologyKey memo will skip the re-fit.
+            val publishedUids = payload.models.map { it.uniqueId }.toSet()
+            state.set(cur.copy(publishedUids = publishedUids))
+            publisher.lineagePayloadChanged(payload)
+        }
+    }
+
     private fun publishFull(manifest: ParsedManifest, s: State) {
         val payload = if (s.activeUid != null) {
             manifest.buildLineage(s.activeUid, upHops = s.upHops, downHops = s.downHops)

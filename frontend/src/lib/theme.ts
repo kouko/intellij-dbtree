@@ -75,7 +75,9 @@ const DARK: Theme = {
   buttonBg: "#3c3f41",
   buttonBorder: "#4e5256",
   buttonHoverBg: "#4a4d4f",
-  edge: "#4e5256",
+  // Lifted off the panelBorder gray so unhighlighted edges stay visible
+  // against the dark canvas — previous #4e5256 dropped into the bg.
+  edge: "#7a808a",
   edgeHighlight: "#fbbf24",
   selectedBorder: "#fbbf24",
   highlightBg: "rgba(251, 191, 36, 0.22)",

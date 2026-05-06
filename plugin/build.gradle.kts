@@ -114,11 +114,30 @@ val copyFrontendDist by tasks.registering(Sync::class) {
     into(layout.buildDirectory.dir("frontend-resources/$frontendResourceDir"))
 }
 
-// Make the synced output a Java source set resource directory.
+// ---- Python sidecar (Phase C CLI) integration --------------------------------------
+// Bundle ../python-sidecar/src/dbtree_lineage/*.py into the plugin classpath.
+// At runtime the plugin extracts these to PathManager.getSystemPath() and runs
+// them via the user-configured Python interpreter (which must have sqlglot).
+
+val pythonSidecarSrc = layout.projectDirectory.dir("../python-sidecar/src")
+
+val copyPythonSidecar by tasks.registering(Sync::class) {
+    group = "python-sidecar"
+    description = "Copy python-sidecar Python source into plugin resources"
+    from(pythonSidecarSrc) {
+        include("dbtree_lineage/**/*.py")
+        exclude("**/__pycache__/**")
+    }
+    includeEmptyDirs = false
+    into(layout.buildDirectory.dir("python-resources"))
+}
+
+// Make both synced outputs java source set resource directories.
 sourceSets.named("main") {
     resources.srcDir(layout.buildDirectory.dir("frontend-resources"))
+    resources.srcDir(layout.buildDirectory.dir("python-resources"))
 }
 
 tasks.named("processResources") {
-    dependsOn(copyFrontendDist)
+    dependsOn(copyFrontendDist, copyPythonSidecar)
 }

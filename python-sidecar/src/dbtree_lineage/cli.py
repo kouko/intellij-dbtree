@@ -39,7 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Direct path to manifest.json (alternative to --project-dir).",
     )
     p.add_argument("--model", required=True, help="Model name or unique_id.")
-    p.add_argument("--column", required=True, help="Column name to trace.")
+    p.add_argument(
+        "--column",
+        required=False,
+        help="Column name to trace. Required unless --all-columns is set.",
+    )
+    p.add_argument(
+        "--all-columns",
+        action="store_true",
+        help="Return lineage for every column in the model (single Python startup).",
+    )
     p.add_argument(
         "--dialect",
         default=None,
@@ -61,21 +70,57 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     model = manifest.resolve_model(args.model)
     dialect = args.dialect or manifest.dialect
+    schema = manifest.build_sqlglot_schema()
+    schema_arg = schema if schema else None
 
-    tree = extract_column_lineage(
-        column=args.column,
-        sql=model.compiled_sql,
-        dialect=dialect,
-    )
-
-    return {
+    base = {
         "model": {
             "unique_id": model.unique_id,
             "name": model.name,
             "package_name": model.package_name,
         },
-        "column": args.column,
         "dialect": dialect,
+    }
+
+    if args.all_columns:
+        # Single Python startup, parse the SQL once via sqlglot, query each
+        # column's lineage. Used by the JetBrains plugin's downstream walk.
+        column_names = manifest.list_model_columns(model.unique_id)
+        results: list[dict[str, Any]] = []
+        for col in column_names:
+            try:
+                tree = extract_column_lineage(
+                    column=col,
+                    sql=model.compiled_sql,
+                    dialect=dialect,
+                    schema=schema_arg,
+                )
+            except Exception as e:  # noqa: BLE001 — record per-column failures, keep going
+                results.append({"column": col, "error": str(e)})
+                continue
+            results.append(
+                {
+                    "column": col,
+                    "lineage": tree.to_dict(),
+                    "source_columns": [
+                        {"table": t, "column": c} for t, c in collect_source_columns(tree)
+                    ],
+                }
+            )
+        return {**base, "columns": results}
+
+    if not args.column:
+        raise SystemExit("--column is required unless --all-columns is set")
+
+    tree = extract_column_lineage(
+        column=args.column,
+        sql=model.compiled_sql,
+        dialect=dialect,
+        schema=schema_arg,
+    )
+    return {
+        **base,
+        "column": args.column,
         "lineage": tree.to_dict(),
         "source_columns": [
             {"table": t, "column": c} for t, c in collect_source_columns(tree)

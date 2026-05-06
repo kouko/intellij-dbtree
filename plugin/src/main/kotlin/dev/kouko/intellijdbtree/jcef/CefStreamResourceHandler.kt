@@ -40,6 +40,12 @@ class CefStreamResourceHandler(
     ) {
         response.mimeType = mimeType
         response.status = 200
+        // The plugin always serves the latest classpath bundle; never let JCEF
+        // hand back a stale cached body when the IDE LAF / hot-reload triggers
+        // a same-URL navigation.
+        response.setHeaderByName("Cache-Control", "no-cache, no-store, must-revalidate", true)
+        response.setHeaderByName("Pragma", "no-cache", true)
+        response.setHeaderByName("Expires", "0", true)
     }
 
     override fun readResponse(

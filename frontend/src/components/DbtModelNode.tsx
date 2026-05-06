@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
 import type { Theme } from "../lib/theme";
@@ -26,10 +27,14 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   const colors = data.theme.layers[layer];
   const t = data.theme;
   const openable = !!data.onOpenFile;
+  const [hover, setHover] = useState(false);
 
   // Fixed card width — long names wrap to multiple header lines instead of
   // being truncated. Matches the user's rule: a model name must always be
   // fully visible.
+  //
+  // Hover state: thicker outline using the layer's bright chip color.
+  // `outline` doesn't affect layout, so the card doesn't shift on hover.
   const cardStyle: React.CSSProperties = {
     borderRadius: 10,
     border: `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.border}`,
@@ -40,7 +45,11 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
     boxShadow: data.onLineagePath
       ? `0 0 0 3px ${t.highlightBg}, 0 4px 12px rgba(0,0,0,0.08)`
       : "0 1px 3px rgba(0,0,0,0.06)",
-    transition: "box-shadow 120ms",
+    outline: hover && openable
+      ? `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.chip}`
+      : "none",
+    outlineOffset: 0,
+    transition: "outline-color 80ms",
     cursor: openable ? "pointer" : "default",
   };
 
@@ -53,6 +62,8 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
       style={cardStyle}
       title={tooltip}
       onClick={() => data.onOpenFile?.(data.unique_id)}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
     >
       <Handle type="target" position={Position.Left} style={{ background: colors.chip }} />
       <Handle type="source" position={Position.Right} style={{ background: colors.chip }} />
@@ -103,29 +114,15 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
             {data.name}
           </span>
         </div>
-        <button
-          type="button"
+        <ChevronButton
+          expanded={data.expanded}
+          columnCount={data.columns.length}
+          theme={t}
           onClick={(e) => {
             e.stopPropagation();
             data.onToggleExpanded(data.unique_id);
           }}
-          title={data.expanded ? "Collapse columns" : "Expand columns"}
-          style={{
-            background: "transparent",
-            border: "none",
-            padding: "2px 6px",
-            color: t.toolbarTextMuted,
-            cursor: "pointer",
-            fontSize: 11,
-            borderRadius: 3,
-            display: "flex",
-            alignItems: "center",
-            gap: 2,
-            flexShrink: 0,
-          }}
-        >
-          {data.expanded ? "▾" : "▸"} {data.columns.length}
-        </button>
+        />
       </header>
 
       {data.expanded && (
@@ -166,5 +163,47 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
         </ul>
       )}
     </div>
+  );
+}
+
+function ChevronButton({
+  expanded,
+  columnCount,
+  theme,
+  onClick,
+}: {
+  expanded: boolean;
+  columnCount: number;
+  theme: Theme;
+  onClick: (e: React.MouseEvent) => void;
+}) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      title={expanded ? "Collapse columns" : "Expand columns"}
+      style={{
+        background: hover ? theme.buttonHoverBg : "transparent",
+        border: "none",
+        padding: "5px 10px",
+        color: theme.toolbarText,
+        cursor: "pointer",
+        fontSize: 12,
+        borderRadius: 4,
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        flexShrink: 0,
+        minWidth: 40,
+        justifyContent: "center",
+        transition: "background 80ms",
+      }}
+    >
+      <span style={{ fontSize: 11 }}>{expanded ? "▾" : "▸"}</span>
+      <span style={{ fontVariantNumeric: "tabular-nums" }}>{columnCount}</span>
+    </button>
   );
 }
