@@ -22,7 +22,7 @@ import java.nio.file.Paths
  */
 object DbtProjectDetector {
 
-    private val SKIP_PATH_PATTERN: Regex = Regex(
+    internal val SKIP_PATH_PATTERN: Regex = Regex(
         ".*/(target|dbt_packages|\\.venv|venv|node_modules|\\.git|build|dist|__pycache__)(/.*)?$",
     )
 

@@ -32,6 +32,19 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Run unit tests
+        run: ./gradlew --no-daemon --stacktrace test
+
+      - name: Upload test reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            plugin/build/reports/tests/
+            plugin/build/test-results/
+          if-no-files-found: ignore
+
       - name: Build plugin
         run: ./gradlew --no-daemon --stacktrace buildPlugin
 
