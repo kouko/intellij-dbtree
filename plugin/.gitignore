@@ -1,0 +1,12 @@
+# Gradle
+.gradle/
+build/
+
+# IntelliJ Platform Gradle Plugin sandbox / cache
+.intellijPlatform/
+.kotlin/
+
+# IDEA / runtime
+out/
+*.iml
+.idea/
