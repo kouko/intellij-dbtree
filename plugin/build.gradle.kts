@@ -30,6 +30,13 @@ dependencies {
             type = IntelliJPlatformType.fromCode(providers.gradleProperty("platformType").get()),
             version = providers.gradleProperty("platformVersion").get(),
         )
+        // Pull the bundled Python plugin's classes onto the compile classpath
+        // so PythonSdkResolver can call PythonSdkUtil. Marked optional in
+        // plugin.xml so the plugin still loads on Python-less IDEs.
+        // ID is "PythonCore" (the bundled Community variant DataSpell ships);
+        // it provides the `com.intellij.modules.python` module our optional
+        // <depends> entry references.
+        bundledPlugin("PythonCore")
     }
 }
 

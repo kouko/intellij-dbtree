@@ -49,6 +49,14 @@ export function layoutModelGraph(
     return {
       ...n,
       position: { x: pos.x - opts.nodeWidth / 2, y: pos.y - pos.height / 2 },
+      // xyflow v12's MiniMap reads `width` / `height` (or measured dims) to
+      // draw each node's rectangle. Without them — because our `onNodesChange`
+      // callback only handles position events, never dimension events — the
+      // MiniMap would render empty. Threading dagre's known dimensions back
+      // onto the node fixes that without forcing a full controlled-changes
+      // refactor.
+      width: opts.nodeWidth,
+      height: pos.height,
     };
   });
 }

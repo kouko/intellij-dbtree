@@ -512,6 +512,7 @@ function App() {
         onClear={() => setSelectedColumn(null)}
         traceCount={lineageTrace.edges.size}
       />
+      {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
       <div style={{ flex: 1, position: "relative" }}>
         {isEmpty ? (
           <EmptyState theme={theme} insidePlugin={isInsidePlugin} />
@@ -709,6 +710,33 @@ function Toolbar({
           {(isUnlimited(upHops) ? "∞" : upHops)} up · {(isUnlimited(downHops) ? "∞" : downHops)} down · click model name to open
         </span>
       )}
+    </div>
+  );
+}
+
+function WarningBanner({ theme, message }: { theme: Theme; message: string }) {
+  // Lifted from highlight token so it visually ties to the orange "selected"
+  // / "edge highlight" theme without inventing new colors. Uses an
+  // alert-icon prefix so screen-readers announce it as a warning.
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 8,
+        padding: "8px 14px",
+        background: theme.highlightBg,
+        color: theme.highlightText,
+        borderBottom: `1px solid ${theme.panelBorder}`,
+        fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
+        fontSize: 12,
+        lineHeight: 1.4,
+      }}
+    >
+      <span aria-hidden style={{ fontWeight: 700, marginTop: 1 }}>⚠</span>
+      <span>{message}</span>
     </div>
   );
 }

@@ -113,12 +113,18 @@ class LineageInfoService(private val project: Project) {
             val activeUid = cur.activeUid ?: modelUid
 
             val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
-            val edges = project.service<ColumnLineageService>()
+            val result = project.service<ColumnLineageService>()
                 .computeForColumn(modelUid, column, manifest)
+
+            val (edges, warning) = when (result) {
+                is ColumnLineageService.Result.Ok -> result.edges to null
+                is ColumnLineageService.Result.Failed -> emptyList<ColumnEdge>() to result.warning
+            }
 
             val payload = basePayload.copy(
                 columnEdges = edges,
                 selected = Selected(uniqueId = modelUid, column = column),
+                warning = warning,
             )
             // Topology hasn't changed (same nodes / model edges); the
             // frontend's topologyKey memo will skip the re-fit.

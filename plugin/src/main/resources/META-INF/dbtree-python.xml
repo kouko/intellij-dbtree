@@ -1,0 +1,9 @@
+<!--
+  Auxiliary plugin descriptor activated only when the Python plugin
+  (com.intellij.modules.python) is loaded. See plugin.xml's optional
+  <depends> entry. Currently empty: PythonSdkResolver calls Python plugin
+  APIs from regular code paths and uses class-load probes to detect
+  availability, so we don't need to register conditional extensions here.
+-->
+<idea-plugin>
+</idea-plugin>

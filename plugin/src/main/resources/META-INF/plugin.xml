@@ -26,6 +26,11 @@
     ]]></change-notes>
 
     <depends>com.intellij.modules.platform</depends>
+    <!-- Optional: enables auto-detection of the project's Python interpreter
+         (configured in DataSpell / PyCharm / IntelliJ + Python plugin). On
+         IDEs without the Python plugin, the auxiliary descriptor is skipped
+         and the user falls back to manually setting the interpreter path. -->
+    <depends optional="true" config-file="dbtree-python.xml">com.intellij.modules.python</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <toolWindow

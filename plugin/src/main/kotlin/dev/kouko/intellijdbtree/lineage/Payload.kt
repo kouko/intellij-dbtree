@@ -56,6 +56,12 @@ data class LineagePayload(
     @SerialName("model_edges") val modelEdges: List<ModelEdge> = emptyList(),
     @SerialName("column_edges") val columnEdges: List<ColumnEdge> = emptyList(),
     val selected: Selected? = null,
+    /**
+     * Optional non-fatal warning surfaced to the toolbar (e.g. "no Python
+     * interpreter with sqlglot available — column lineage disabled").
+     * Cleared on the next successful payload.
+     */
+    val warning: String? = null,
 )
 
 internal val LineageJson: Json = Json {

@@ -37,8 +37,11 @@ class DbtreeSettingsConfigurable : Configurable {
         val description = JLabel(
             "<html><body style='width: 480px; color: #888'>" +
                 "Path to a Python interpreter that has the <code>sqlglot</code> package installed. " +
-                "Used to compute column-level lineage by parsing each model's compiled SQL. " +
-                "Leave blank to disable column-level lineage.<br><br>" +
+                "Used to compute column-level lineage by parsing each model's compiled SQL.<br><br>" +
+                "<b>Leave blank to auto-detect.</b> dbtree will try, in order:<br>" +
+                "&nbsp;&nbsp;1. The project's IDE-configured Python interpreter (DataSpell / PyCharm / IntelliJ + Python plugin)<br>" +
+                "&nbsp;&nbsp;2. <code>&lt;dbt_project&gt;/.venv/bin/python</code> (the convention <code>uv</code> and <code>python -m venv</code> use)<br><br>" +
+                "Set this field manually to override auto-detection — useful when sqlglot is in a different env (conda, pyenv, system).<br><br>" +
                 "Example: <code>/path/to/your/dbt-project/.venv/bin/python</code>" +
                 "</body></html>",
         )
