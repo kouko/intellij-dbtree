@@ -162,6 +162,47 @@ class ParsedManifest(
         return n.string("original_file_path")
     }
 
+    /** Find a model unique_id by its bare name (no package qualifier). */
+    fun findModelByName(name: String): String? {
+        for ((uid, v) in nodes.entrySet()) {
+            val n = v.asJsonObject
+            if (n.string("resource_type") == "model" && n.string("name") == name) {
+                return uid
+            }
+        }
+        return null
+    }
+
+    /** Return the unique_id of a model, paired with its bare name (for matching). */
+    fun modelName(uniqueId: String): String? {
+        val n = nodes.getAsJsonObject(uniqueId) ?: return null
+        if (n.string("resource_type") != "model") return null
+        return n.string("name")
+    }
+
+    /** Direct downstream models / sources of [uniqueId] (child_map entries). */
+    fun directChildren(uniqueId: String): List<String> {
+        val arr = childMap.getAsJsonArray(uniqueId) ?: return emptyList()
+        return arr.mapNotNull { e ->
+            val s = e?.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString ?: return@mapNotNull null
+            // Only consider models — sources/tests/seeds aren't downstream column targets we care about.
+            if (nodes.getAsJsonObject(s)?.string("resource_type") == "model") s else null
+        }
+    }
+
+    /**
+     * Find a source unique_id by its dbt source `name` (table identifier in
+     * the warehouse). dbt sources are `source.<package>.<source>.<table>`,
+     * but the relevant identifier for sqlglot column lineage is the table.
+     */
+    fun findSourceByName(name: String): String? {
+        for ((uid, v) in sources.entrySet()) {
+            val s = v.asJsonObject
+            if (s.string("name") == name) return uid
+        }
+        return null
+    }
+
     /**
      * BFS upstream and/or downstream from [seed], bounded by hop counts.
      *
@@ -217,6 +258,28 @@ class ParsedManifest(
             for ((uid, _) in sources.entrySet()) {
                 visited.add(uid)
                 walkDown(uid, downHops)
+            }
+        }
+
+        // After the directional walks, include every manifest edge whose
+        // *both* endpoints already landed in `visited`. Without this pass,
+        // a "diamond" pattern like
+        //     orders ─┐
+        //     customers ┴─→ customer_combined_metrics
+        // (with seed = customers) would lose the orders→customer_combined_metrics
+        // edge: walkUp from customers reaches orders, walkDown reaches
+        // customer_combined_metrics, but neither walk picks up the lateral
+        // edge that joins them through a *descendant's* other parent.
+        for (uid in visited.toList()) {
+            childMap.getAsJsonArray(uid)?.forEach { c ->
+                val child = c.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString
+                    ?: return@forEach
+                if (child in visited) edges += ModelEdge(uid, child)
+            }
+            parentMap.getAsJsonArray(uid)?.forEach { p ->
+                val parent = p.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString
+                    ?: return@forEach
+                if (parent in visited) edges += ModelEdge(parent, uid)
             }
         }
 

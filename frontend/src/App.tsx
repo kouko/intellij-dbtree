@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  applyNodeChanges,
   Background,
   Controls,
   MiniMap,
@@ -50,6 +49,8 @@ declare global {
     __DBTREE_THEME__?: ThemeName;
     __DBTREE_HOST_STATE__?: HostState;
   }
+  // Injected by Vite at build time; see vite.config.ts.
+  const __DBTREE_BUILD_ID__: string;
 }
 
 const EMPTY_PAYLOAD: LineagePayload = {
@@ -133,11 +134,26 @@ function App() {
   );
 
   useEffect(() => {
+    // When the focused model changes, drop the column selection if it
+    // belongs to a different model. Doing this in the same handler that
+    // sets selectedModelUid keeps both updates batched into one render —
+    // a useEffect-based fallback would leave a transient frame where the
+    // old column trace still drives edge highlighting.
+    const dropStaleColumn = (newModel: string | null) => {
+      setSelectedColumn((prev) =>
+        prev && (newModel == null || prev.unique_id !== newModel) ? null : prev,
+      );
+    };
     window.setLineageInfo = (next) => {
       setPayload(next);
-      setSelectedModelUid(next.selected?.unique_id ?? null);
+      const newModel = next.selected?.unique_id ?? null;
+      setSelectedModelUid(newModel);
+      dropStaleColumn(newModel);
     };
-    window.setSelectedModel = (uid) => setSelectedModelUid(uid);
+    window.setSelectedModel = (uid) => {
+      setSelectedModelUid(uid);
+      dropStaleColumn(uid);
+    };
     return () => {
       delete window.setLineageInfo;
       delete window.setSelectedModel;
@@ -170,17 +186,14 @@ function App() {
     });
   }, [payload]);
 
-  // When the selected model changes (full or selection-only), expand it so
-  // the user can see the column list of the file they just navigated to.
-  useEffect(() => {
-    if (!selectedModelUid) return;
-    setExpanded((prev) => {
-      if (prev.has(selectedModelUid)) return prev;
-      const next = new Set(prev);
-      next.add(selectedModelUid);
-      return next;
-    });
-  }, [selectedModelUid]);
+  // (Previously this auto-expanded the selected model on every selection
+  // change. Removed — the user explicitly does not want clicking a card or
+  // navigating to a model file to force the column list open. Expansion
+  // is now driven purely by the chevron button or by clicking a column
+  // row, both explicit user gestures. Stale column-selection cleanup is
+  // now done synchronously inside window.setSelectedModel /
+  // window.setLineageInfo so the same render that switches models also
+  // clears the column trace.)
 
   const toggleExpanded = useCallback((uniqueId: string) => {
     setExpanded((prev) => {
@@ -203,11 +216,17 @@ function App() {
       next.add(uniqueId);
       return next;
     });
-    // Clicking a column commits to that model: orange border + open the
-    // model's .sql in the IDE editor (same as clicking the model card).
     setSelectedModelUid(uniqueId);
     if (window.kotlinCallback) {
+      // Open the model file in the IDE.
       window.kotlinCallback(JSON.stringify({ event: "NODE_CLICK", unique_id: uniqueId }));
+      // Ask the backend (Phase C python-sidecar) to trace this column's
+      // upstream lineage. The backend will push a fresh payload with
+      // column_edges populated; React's lineageTrace memo paints the
+      // orange dashed lines.
+      window.kotlinCallback(
+        JSON.stringify({ event: "COLUMN_CLICK", unique_id: uniqueId, column }),
+      );
     }
   }, []);
 
@@ -227,10 +246,15 @@ function App() {
   }, [allExpanded, payload.models]);
 
   // ---- Manual node positions (drag override) -------------------------------
-  // Dagre re-runs every render, but if the user has dragged a node we want
-  // to honor that position instead. Cleared whenever DAG topology changes
-  // (new payload) — those drags would no longer be meaningful anyway.
+  // Two layers:
+  //   - manualPositions: persisted across renders, set on drag stop
+  //   - livePositions: in-flight during drag (xyflow `onNodesChange` feeds
+  //     position changes here so the card follows the cursor in real time)
+  // Final node position = livePositions ?? manualPositions ?? dagre.
+  // Cleared whenever DAG topology changes — those drags wouldn't carry
+  // meaning to a different node set.
   const [manualPositions, setManualPositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [livePositions, setLivePositions] = useState<Record<string, { x: number; y: number }>>({});
 
   const onNodeDragStop = useCallback(
     (_e: React.MouseEvent | unknown, node: Node) => {
@@ -238,14 +262,26 @@ function App() {
         ...prev,
         [node.id]: { x: node.position.x, y: node.position.y },
       }));
+      setLivePositions((prev) => {
+        if (!(node.id in prev)) return prev;
+        const next = { ...prev };
+        delete next[node.id];
+        return next;
+      });
     },
     [],
   );
 
-  const onResetLayout = useCallback(() => setManualPositions({}), []);
+  const onResetLayout = useCallback(() => {
+    setManualPositions({});
+    setLivePositions({});
+  }, []);
   const hasManualPositions = Object.keys(manualPositions).length > 0;
 
   // ---- Column lineage trace ------------------------------------------------
+  // Ancestors ∪ descendants of the selected column. Two strictly-directional
+  // passes — bidirectional BFS would overreach into sibling columns that
+  // share an upstream/downstream node with the seed.
   const lineageTrace = useMemo(() => {
     const trace = {
       columns: new Map<string, Set<string>>(),
@@ -254,26 +290,54 @@ function App() {
     };
     if (!selectedColumn) return trace;
 
-    const queue: Array<{ unique_id: string; column: string }> = [selectedColumn];
-    const seen = new Set<string>();
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      const key = `${cur.unique_id}|${cur.column}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      let cols = trace.columns.get(cur.unique_id);
+    const noteVisit = (uniqueId: string, column: string) => {
+      let cols = trace.columns.get(uniqueId);
       if (!cols) {
         cols = new Set();
-        trace.columns.set(cur.unique_id, cols);
+        trace.columns.set(uniqueId, cols);
       }
-      cols.add(cur.column);
-      trace.models.add(cur.unique_id);
+      cols.add(column);
+      trace.models.add(uniqueId);
+    };
+    noteVisit(selectedColumn.unique_id, selectedColumn.column);
 
-      for (const ce of payload.column_edges) {
-        if (ce.target_unique_id === cur.unique_id && ce.target_column === cur.column) {
-          trace.edges.add(edgeKey(ce));
-          queue.push({ unique_id: ce.source_unique_id, column: ce.source_column });
+    // Upstream: from cur, follow edges where target == cur, walk to source.
+    {
+      const queue: Array<{ unique_id: string; column: string }> = [selectedColumn];
+      const seen = new Set<string>([`${selectedColumn.unique_id}|${selectedColumn.column}`]);
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const ce of payload.column_edges) {
+          if (ce.target_unique_id === cur.unique_id && ce.target_column === cur.column) {
+            trace.edges.add(edgeKey(ce));
+            const next = { unique_id: ce.source_unique_id, column: ce.source_column };
+            const key = `${next.unique_id}|${next.column}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              noteVisit(next.unique_id, next.column);
+              queue.push(next);
+            }
+          }
+        }
+      }
+    }
+    // Downstream: from cur, follow edges where source == cur, walk to target.
+    {
+      const queue: Array<{ unique_id: string; column: string }> = [selectedColumn];
+      const seen = new Set<string>([`${selectedColumn.unique_id}|${selectedColumn.column}`]);
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const ce of payload.column_edges) {
+          if (ce.source_unique_id === cur.unique_id && ce.source_column === cur.column) {
+            trace.edges.add(edgeKey(ce));
+            const next = { unique_id: ce.target_unique_id, column: ce.target_column };
+            const key = `${next.unique_id}|${next.column}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              noteVisit(next.unique_id, next.column);
+              queue.push(next);
+            }
+          }
         }
       }
     }
@@ -295,6 +359,71 @@ function App() {
     });
   }, [selectedColumn, lineageTrace.models]);
 
+  // Model-level lineage trace, split into ancestors and descendants of the
+  // selected model. Keeping them separate (instead of a single union) lets
+  // the edge highlighter distinguish "edge inside the upstream chain",
+  // "edge inside the downstream chain", and "skip edge from an ancestor
+  // straight to a descendant that bypasses the selected model" — only the
+  // first two should be highlighted.
+  const modelTrace = useMemo(() => {
+    const ancestors = new Set<string>();
+    const descendants = new Set<string>();
+    if (!selectedModelUid) {
+      return { ancestors, descendants, all: new Set<string>() };
+    }
+    // Upstream
+    {
+      const queue: string[] = [selectedModelUid];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const me of payload.model_edges) {
+          if (
+            me.target_unique_id === cur &&
+            me.source_unique_id !== selectedModelUid &&
+            !ancestors.has(me.source_unique_id)
+          ) {
+            ancestors.add(me.source_unique_id);
+            queue.push(me.source_unique_id);
+          }
+        }
+      }
+    }
+    // Downstream
+    {
+      const queue: string[] = [selectedModelUid];
+      while (queue.length > 0) {
+        const cur = queue.shift()!;
+        for (const me of payload.model_edges) {
+          if (
+            me.source_unique_id === cur &&
+            me.target_unique_id !== selectedModelUid &&
+            !descendants.has(me.target_unique_id)
+          ) {
+            descendants.add(me.target_unique_id);
+            queue.push(me.target_unique_id);
+          }
+        }
+      }
+    }
+    const all = new Set<string>([selectedModelUid, ...ancestors, ...descendants]);
+    return { ancestors, descendants, all };
+  }, [selectedModelUid, payload.model_edges]);
+
+  // For column-lineage edge highlighting we need the exact set of model
+  // edges the chosen column actually traverses (NOT just any edge between
+  // two models that happen to be in the trace). Each column_edge already
+  // pins this down — collapse them to (source, target) pairs.
+  const columnTraceEdgePairs = useMemo(() => {
+    const pairs = new Set<string>();
+    if (!selectedColumn) return pairs;
+    for (const ce of payload.column_edges) {
+      if (lineageTrace.edges.has(edgeKey(ce))) {
+        pairs.add(`${ce.source_unique_id}|${ce.target_unique_id}`);
+      }
+    }
+    return pairs;
+  }, [selectedColumn, payload.column_edges, lineageTrace.edges]);
+
   // ---- xyflow nodes/edges --------------------------------------------------
   // `derivedNodes` is rebuilt whenever data changes. `liveNodes` is what
   // ReactFlow actually renders — it's seeded from derivedNodes but accepts
@@ -314,6 +443,9 @@ function App() {
       heights[m.unique_id] = headerH + colsH;
     }
 
+    const onLineagePath = (uid: string) =>
+      selectedColumn ? lineageTrace.models.has(uid) : modelTrace.all.has(uid);
+
     const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = payload.models.map((m) => ({
       id: m.unique_id,
       type: "dbtModel" as const,
@@ -326,7 +458,7 @@ function App() {
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
         highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
-        onLineagePath: lineageTrace.models.has(m.unique_id),
+        onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
         theme,
         cardWidth: NODE_WIDTH,
@@ -351,6 +483,8 @@ function App() {
     payload,
     expanded,
     lineageTrace,
+    modelTrace,
+    selectedColumn,
     theme,
     selectedModelUid,
     manualPositions,
@@ -359,19 +493,59 @@ function App() {
     onOpenFile,
   ]);
 
-  const [liveNodes, setLiveNodes] = useState<Node[]>(derivedNodes);
-
-  useEffect(() => {
-    setLiveNodes(derivedNodes);
-  }, [derivedNodes]);
+  // What ReactFlow actually renders: derivedNodes overlaid with any
+  // in-flight drag positions. No separate state — derivedNodes is the
+  // source of truth, so changes to data (theme, expanded, lineage trace)
+  // propagate on the same render that triggered them, instead of waiting
+  // for a separate useEffect to sync a duplicate liveNodes state.
+  const nodes: Node[] = useMemo(() => {
+    if (Object.keys(livePositions).length === 0) return derivedNodes;
+    return derivedNodes.map((n) => {
+      const live = livePositions[n.id];
+      return live ? { ...n, position: live } : n;
+    });
+  }, [derivedNodes, livePositions]);
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
-    setLiveNodes((current) => applyNodeChanges(changes, current));
+    // We only trap *position* changes from xyflow (drag in progress).
+    // Selection / dimension / data updates flow through derivedNodes via
+    // React state instead.
+    let dragSeen = false;
+    const positionUpdates: Record<string, { x: number; y: number }> = {};
+    for (const c of changes) {
+      if (c.type === "position" && c.position) {
+        dragSeen = true;
+        positionUpdates[c.id] = { x: c.position.x, y: c.position.y };
+      }
+    }
+    if (dragSeen) {
+      setLivePositions((prev) => ({ ...prev, ...positionUpdates }));
+    }
   }, []);
 
   const edges: Edge[] = useMemo(() => {
-    const onPath = (a: string, b: string) =>
-      lineageTrace.models.has(a) && lineageTrace.models.has(b);
+    // Edge (a → b) is "on the lineage tree from seed" iff:
+    //   - a∈{seed}∪descendants AND b∈descendants  (downstream chain edge), OR
+    //   - b∈{seed}∪ancestors   AND a∈ancestors    (upstream chain edge).
+    // This rejects "skip" edges that go directly from an ancestor to a
+    // descendant, bypassing the seed (e.g. orders → customer_combined_metrics
+    // when seed = customers — that edge isn't part of customers' tree).
+    const onModelTreePath = (a: string, b: string): boolean => {
+      if (!selectedModelUid) return false;
+      const aSeed = a === selectedModelUid;
+      const bSeed = b === selectedModelUid;
+      const downstreamEdge =
+        (aSeed || modelTrace.descendants.has(a)) && modelTrace.descendants.has(b);
+      const upstreamEdge =
+        modelTrace.ancestors.has(a) && (bSeed || modelTrace.ancestors.has(b));
+      return downstreamEdge || upstreamEdge;
+    };
+
+    const onColumnTreePath = (a: string, b: string): boolean =>
+      columnTraceEdgePairs.has(`${a}|${b}`);
+
+    const onPath = (a: string, b: string): boolean =>
+      selectedColumn ? onColumnTreePath(a, b) : onModelTreePath(a, b);
 
     const modelEdges: Edge[] = payload.model_edges.map((me) => ({
       id: `m:${me.source_unique_id}->${me.target_unique_id}`,
@@ -399,7 +573,15 @@ function App() {
       : [];
 
     return [...modelEdges, ...columnEdges];
-  }, [payload, lineageTrace, selectedColumn, theme]);
+  }, [
+    payload,
+    lineageTrace,
+    modelTrace,
+    columnTraceEdgePairs,
+    selectedColumn,
+    selectedModelUid,
+    theme,
+  ]);
 
   // Re-fit only on topology change (model set / edge set), not on selection
   // changes. Without this, every editor selection inside the same DAG would
@@ -419,6 +601,7 @@ function App() {
     // New topology = previous drag positions are not meaningful for the
     // new node set; reset so dagre can lay out cleanly.
     setManualPositions({});
+    setLivePositions({});
   }, [topologyKey]);
 
   const isEmpty = payload.models.length === 0;
@@ -455,7 +638,7 @@ function App() {
         ) : (
           <ReactFlow
             key={fitKey}
-            nodes={liveNodes}
+            nodes={nodes}
             edges={edges}
             onNodesChange={onNodesChange}
             nodeTypes={NODE_TYPES}
@@ -581,6 +764,9 @@ function Toolbar({
       }}
     >
       <strong style={{ color: t.toolbarText }}>intellij-dbtree</strong>
+      <span style={{ color: t.toolbarTextSubtle, fontSize: 10 }} title="Build timestamp">
+        b{__DBTREE_BUILD_ID__}
+      </span>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <HopStepper label="↑" value={upHops} onChange={onUpHops} theme={t} />
         <HopStepper label="↓" value={downHops} onChange={onDownHops} theme={t} />

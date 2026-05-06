@@ -269,8 +269,14 @@ class LineagePanel(private val project: Project) : Disposable {
             "NODE_CLICK" -> handleNodeClick(event.uniqueId)
             "HOP_CHANGE" -> handleHopChange(event.upHops, event.downHops)
             "REFRESH" -> project.service<LineageInfoService>().refreshFromDisk()
+            "COLUMN_CLICK" -> handleColumnClick(event.uniqueId, event.column)
             else -> log.info("Unhandled JS event: ${event.event}")
         }
+    }
+
+    private fun handleColumnClick(uniqueId: String?, column: String?) {
+        if (uniqueId.isNullOrBlank() || column.isNullOrBlank()) return
+        project.service<LineageInfoService>().onColumnClicked(uniqueId, column)
     }
 
     private fun handleNodeClick(uniqueId: String?) {
