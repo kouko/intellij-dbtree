@@ -14,10 +14,14 @@
     ]]></description>
 
     <change-notes><![CDATA[
-        <h3>0.1.0 — Phase A0 (plugin shell)</h3>
+        <h3>0.1.0 — Initial release</h3>
         <ul>
-            <li>Tool window with embedded JCEF browser</li>
-            <li>Renders the Phase B React lineage UI bundled inside the plugin</li>
+            <li>Interactive model-level DAG via JCEF + React Flow + dagre</li>
+            <li>Column-level lineage tracing across CTEs, JOINs, UNIONs, and window functions, powered by sqlglot via a Python sidecar</li>
+            <li>Reads dbt <code>manifest.json</code> + <code>catalog.json</code> (real warehouse column types when available)</li>
+            <li>IDE theme integration (light / dark)</li>
+            <li>Drag-to-rearrange nodes, click model card to open file, configurable hop depth (0 / 1 / 2 / 3 / 5 / 10 / ∞)</li>
+            <li>Tested on DataSpell 2026.1.1; should work on any IntelliJ-based IDE on build 261+</li>
         </ul>
     ]]></change-notes>
 
