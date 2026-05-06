@@ -5,6 +5,7 @@ rootProject.name = "intellij-dbtree"
 pluginManagement {
     plugins {
         id("org.jetbrains.kotlin.jvm") version "2.3.21"
+        id("org.jetbrains.kotlin.plugin.serialization") version "2.3.21"
         id("com.github.node-gradle.node") version "7.1.0"
     }
 }

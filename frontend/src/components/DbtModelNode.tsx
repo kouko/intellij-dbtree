@@ -16,6 +16,7 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   isSelectedModel: boolean;
   onToggleExpanded: (uniqueId: string) => void;
   onColumnClick: (uniqueId: string, column: string) => void;
+  onOpenFile?: (uniqueId: string) => void;
 }
 
 export type DbtModelNodeType = Node<DbtModelNodeData, "dbtModel">;
@@ -60,7 +61,12 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
           justifyContent: "space-between",
           gap: 8,
         }}
+        title={data.onOpenFile ? "click to expand · double-click to open file" : undefined}
         onClick={() => data.onToggleExpanded(data.unique_id)}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          data.onOpenFile?.(data.unique_id);
+        }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
           <span
