@@ -53,9 +53,24 @@ class LineageInfoService(private val project: Project) {
         val downHops: Int = DEFAULT_DOWN_HOPS,
         /** unique_ids in the most recently published full payload. */
         val publishedUids: Set<String> = emptySet(),
+        /**
+         * Monotonic counter bumped at every public entry point that triggers
+         * async work. Each pooled task captures the value at dispatch and
+         * checks it again before publishing — if the user fired a newer
+         * intent in the meantime, the late task drops its result instead of
+         * stomping on the fresher payload.
+         *
+         * Without this, a slow `onActiveFileChanged` for file A followed by
+         * a fast one for file B can publish in either order, and the user's
+         * canvas may snap back to A after they've moved on to B.
+         */
+        val epoch: Long = 0,
     )
 
     fun snapshot(): State = state.get()
+
+    /** Increments [State.epoch] atomically and returns the new value. */
+    private fun bumpEpoch(): Long = state.updateAndGet { it.copy(epoch = it.epoch + 1) }.epoch
 
     /**
      * Triggered by editor selection changes. If the file's model is
@@ -65,17 +80,22 @@ class LineageInfoService(private val project: Project) {
      */
     fun onActiveFileChanged(file: VirtualFile?) {
         if (file == null || file.extension != "sql") return
+        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             val manifest = project.service<ManifestService>().ensureLoaded() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
+            if (isSuperseded(myEpoch, cur)) return@executeOnPooledThread
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    state.set(cur.copy(activeUid = decision.uid))
+                    // updateAndGet (not set) so we don't roll back fields a
+                    // newer racing task may have written between the epoch
+                    // check and here — including the epoch itself.
+                    state.updateAndGet { it.copy(activeUid = decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
-                    publishFull(manifest, cur.copy(activeUid = decision.uid))
+                    publishFull(manifest, decision.uid)
                 }
             }
         }
@@ -83,27 +103,35 @@ class LineageInfoService(private val project: Project) {
 
     /** UI changed up/down hop limits — always re-emit a full payload. */
     fun setHops(upHops: Int, downHops: Int) {
+        // Bump epoch + write hops atomically on the calling thread so a
+        // rapid slider drag (multiple events per second) can't race the
+        // hop value ahead of the epoch.
+        val updated = state.updateAndGet {
+            it.copy(
+                upHops = upHops.coerceAtLeast(0),
+                downHops = downHops.coerceAtLeast(0),
+                epoch = it.epoch + 1,
+            )
+        }
+        val myEpoch = updated.epoch
         ApplicationManager.getApplication().executeOnPooledThread {
-            val updated = state.updateAndGet {
-                it.copy(
-                    upHops = upHops.coerceAtLeast(0),
-                    downHops = downHops.coerceAtLeast(0),
-                )
-            }
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
-            publishFull(manifest, updated)
+            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
+            publishFull(manifest, state.get().activeUid)
         }
     }
 
     /** Force a full re-read from disk (e.g. after `dbt parse`). */
     fun refreshFromDisk() {
+        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             project.service<ManifestService>().refresh()
             project.service<ColumnLineageService>().invalidateColumnListCache()
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
-            publishFull(manifest, state.get())
+            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
+            publishFull(manifest, state.get().activeUid)
         }
     }
 
@@ -113,12 +141,14 @@ class LineageInfoService(private val project: Project) {
      * compiled SQL via sqlglot, then publish the per-model patch event.
      */
     fun onRequestColumns(modelUid: String) {
+        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
             val names = project.service<ColumnLineageService>()
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
+            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
         }
@@ -130,6 +160,7 @@ class LineageInfoService(private val project: Project) {
      * payload with `column_edges` populated. Layout doesn't change.
      */
     fun onColumnClicked(modelUid: String, column: String) {
+        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
@@ -139,6 +170,10 @@ class LineageInfoService(private val project: Project) {
             val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
             val result = project.service<ColumnLineageService>()
                 .computeForColumn(modelUid, column, manifest)
+
+            // Sidecar takes ~1s — the user may have clicked another column or
+            // switched files in the meantime, so re-check epoch before publish.
+            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
 
             val (edges, warning) = when (result) {
                 is ColumnLineageService.Result.Ok -> result.edges to null
@@ -153,19 +188,27 @@ class LineageInfoService(private val project: Project) {
             // Topology hasn't changed (same nodes / model edges); the
             // frontend's topologyKey memo will skip the re-fit.
             val publishedUids = payload.models.map { it.uniqueId }.toSet()
-            state.set(cur.copy(publishedUids = publishedUids))
+            state.updateAndGet { it.copy(publishedUids = publishedUids) }
             publisher.lineagePayloadChanged(payload)
         }
     }
 
-    private fun publishFull(manifest: ParsedManifest, s: State) {
-        val payload = if (s.activeUid != null) {
-            manifest.buildLineage(s.activeUid, upHops = s.upHops, downHops = s.downHops)
+    /**
+     * Build + publish a full lineage payload centered on [newActiveUid] (or
+     * an empty payload when null). Reads the latest hops off [state] so it
+     * always uses the freshest UI value, and writes back only the fields it
+     * owns ([State.activeUid] + [State.publishedUids]) to avoid clobbering
+     * concurrent updates from other entry points.
+     */
+    private fun publishFull(manifest: ParsedManifest, newActiveUid: String?) {
+        val cur = state.get()
+        val payload = if (newActiveUid != null) {
+            manifest.buildLineage(newActiveUid, upHops = cur.upHops, downHops = cur.downHops)
         } else {
             LineagePayload()
         }
         val publishedUids = payload.models.map { it.uniqueId }.toSet()
-        state.set(s.copy(publishedUids = publishedUids))
+        state.updateAndGet { it.copy(activeUid = newActiveUid, publishedUids = publishedUids) }
         publisher.lineagePayloadChanged(payload)
     }
 

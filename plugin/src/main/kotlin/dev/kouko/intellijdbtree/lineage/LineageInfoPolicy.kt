@@ -22,3 +22,16 @@ internal sealed interface FocusDecision {
 
 internal fun decideFocusEvent(uid: String, publishedUids: Set<String>): FocusDecision =
     if (uid in publishedUids) FocusDecision.SelectionOnly(uid) else FocusDecision.Rebuild(uid)
+
+/**
+ * Policy: a pooled task should drop its result if the service's epoch has
+ * advanced since the task was dispatched. This is how we suppress
+ * out-of-order publishes when slow I/O (manifest cold load, Python sidecar
+ * ~1s) makes a late task race a fresher user intent.
+ *
+ * The contract is symmetric: monotonic epoch comparison only. Any other
+ * state difference (active uid, hops) is irrelevant — a task captures its
+ * epoch at dispatch and must lose if a newer entry-point bumped it since.
+ */
+internal fun isSuperseded(myEpoch: Long, current: LineageInfoService.State): Boolean =
+    myEpoch != current.epoch
