@@ -24,8 +24,15 @@ export interface DbtModel {
   /** Short name, e.g. "fct_orders". */
   name: string;
   package_name: string;
-  /** Logical layer for color coding: "staging" | "intermediate" | "marts" | "source". */
+  /** Canonical color bucket: "staging" | "intermediate" | "marts" | "source". */
   layer?: ModelLayer;
+  /**
+   * Raw first folder segment of the model's `path` (e.g. "marts_msd",
+   * "dash"). Shown verbatim on the model card chip; preserves dbt
+   * namespacing even when [layer] collapses to one of the four canonical
+   * buckets. Falls back to [layer] when absent (older Kotlin payloads).
+   */
+  folder?: string;
   columns: ColumnSpec[];
 }
 

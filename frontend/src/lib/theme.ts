@@ -2,6 +2,24 @@ import type { ModelLayer } from "../types";
 
 export type ThemeName = "light" | "dark";
 
+const KNOWN_LAYERS: ReadonlySet<string> = new Set<ModelLayer>([
+  "source",
+  "staging",
+  "intermediate",
+  "marts",
+]);
+
+/**
+ * Map an arbitrary layer string from the wire payload to a renderable
+ * [ModelLayer]. dbt projects often have non-canonical folder names
+ * (e.g. `marts_msd/`, `dash/`) that the Kotlin side may pass through
+ * verbatim — silently coerce those to "staging" rather than crash on
+ * `theme.layers[unknown].bg`.
+ */
+export function normalizeLayer(layer: string | undefined | null): ModelLayer {
+  return layer && KNOWN_LAYERS.has(layer) ? (layer as ModelLayer) : "staging";
+}
+
 export interface LayerColors {
   border: string;
   bg: string;

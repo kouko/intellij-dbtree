@@ -24,8 +24,18 @@ data class DbtModel(
     @SerialName("unique_id") val uniqueId: String,
     val name: String,
     @SerialName("package_name") val packageName: String,
-    /** "staging" | "intermediate" | "marts" | "source" | null. */
+    /**
+     * Canonical color bucket: "staging" | "intermediate" | "marts" | "source" | null.
+     * The frontend uses this to pick chip / border / background color tokens.
+     */
     val layer: String? = null,
+    /**
+     * Raw first folder segment of the model's path (e.g. `marts_msd`,
+     * `dash`, `staging`). Shown verbatim on the model card chip so dbt
+     * projects with namespaced subfolders preserve the distinction even
+     * when [layer] collapses to one of the four canonical buckets.
+     */
+    val folder: String? = null,
     val columns: List<ColumnSpec> = emptyList(),
 )
 

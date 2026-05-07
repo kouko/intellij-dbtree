@@ -593,12 +593,29 @@ class ParsedManifestTest {
         }
 
         @Test
-        fun `unknown first segment is returned as-is`() {
-            assertEquals("custom", layerFor("custom/orders.sql"))
+        fun `marts-prefix subdirectories all map to marts (regression)`() {
+            // dbt projects often namespace marts (e.g. iCHEF's `marts_msd/`,
+            // `marts_qlr/`). All such mart_* / marts_* prefixes share the
+            // "marts" color tier instead of being passed through verbatim.
+            // The regression: passing through "marts_msd" verbatim made the
+            // frontend crash on `theme.layers["marts_msd"].bg` undefined.
+            assertEquals("marts", layerFor("marts_msd/orders.sql"))
+            assertEquals("marts", layerFor("marts_qlr/orders.sql"))
+            assertEquals("marts", layerFor("mart_team_a/orders.sql"))
         }
 
         @Test
-        fun `model with no path field returns null layer`() {
+        fun `unknown first segment returns null (frontend defaults to staging)`() {
+            // Returning the raw segment broke the frontend (which expects only
+            // four canonical layer names). null lets the frontend's
+            // normalizeLayer fall back to "staging" cleanly.
+            assertNull(layerFor("custom/orders.sql"))
+            assertNull(layerFor("dash/orders.sql"))
+            assertNull(layerFor("ads_data/orders.sql"))
+        }
+
+        @Test
+        fun `model with no path field returns null layer and folder`() {
             val manifest = parseManifest(
                 """
                 {
@@ -616,11 +633,53 @@ class ParsedManifestTest {
                 }
                 """.trimIndent(),
             )
-            val payload = manifest.buildLineage(seed = "model.demo.orders")
-            assertNull(payload.models.single().layer)
+            val model = manifest.buildLineage(seed = "model.demo.orders").models.single()
+            assertNull(model.layer)
+            assertNull(model.folder)
         }
 
-        private fun layerFor(path: String): String? {
+        @Test
+        fun `folder preserves the raw first path segment verbatim`() {
+            // The frontend renders this on the model card chip, so namespaced
+            // dbt project layouts (`marts_msd/`, `dash/`, etc.) keep their
+            // distinction even when `layer` collapses to a canonical bucket.
+            assertEquals("marts_msd" to "marts", folderAndLayerFor("marts_msd/orders.sql"))
+            assertEquals("marts_qlr" to "marts", folderAndLayerFor("marts_qlr/orders.sql"))
+            assertEquals("staging" to "staging", folderAndLayerFor("staging/stg_orders.sql"))
+            assertEquals("dash" to null, folderAndLayerFor("dash/orders.sql"))
+        }
+
+        @Test
+        fun `folder preserves original case (chip rendering uses display name)`() {
+            // inferLayer lowercases for canonical-bucket matching, but folder
+            // keeps the original path so the chip respects the user's casing.
+            assertEquals("Marts_MSD", folderAndLayerFor("Marts_MSD/orders.sql").first)
+        }
+
+        @Test
+        fun `source models get folder=source so chip is non-empty`() {
+            // Sources have no path/folder structure on disk; we still want the
+            // chip to render something rather than a blank pill.
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {},
+                  "sources": {
+                    "source.demo.app.users": ${source("users")}
+                  },
+                  "child_map": {},
+                  "parent_map": {}
+                }
+                """.trimIndent(),
+            )
+            val model = manifest.buildLineage(seed = null).models.single()
+            assertEquals("source", model.layer)
+            assertEquals("source", model.folder)
+        }
+
+        private fun layerFor(path: String): String? = folderAndLayerFor(path).second
+
+        private fun folderAndLayerFor(path: String): Pair<String?, String?> {
             val manifest = parseManifest(
                 """
                 {
@@ -633,7 +692,8 @@ class ParsedManifestTest {
                 }
                 """.trimIndent(),
             )
-            return manifest.buildLineage(seed = "model.demo.x").models.single().layer
+            val model = manifest.buildLineage(seed = "model.demo.x").models.single()
+            return model.folder to model.layer
         }
     }
 

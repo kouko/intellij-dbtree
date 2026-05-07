@@ -1,13 +1,16 @@
 import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
-import type { Theme } from "../lib/theme";
+import { normalizeLayer, type Theme } from "../lib/theme";
 
 export interface DbtModelNodeData extends Record<string, unknown> {
   unique_id: string;
   name: string;
   package_name: string;
+  /** Canonical color bucket. */
   layer?: ModelLayer;
+  /** Raw folder name shown on the chip; falls back to [layer]. */
+  folder?: string;
   columns: ColumnSpec[];
   expanded: boolean;
   highlightedColumns: Set<string>;
@@ -23,8 +26,12 @@ export interface DbtModelNodeData extends Record<string, unknown> {
 export type DbtModelNodeType = Node<DbtModelNodeData, "dbtModel">;
 
 export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
-  const layer = data.layer ?? "staging";
+  const layer = normalizeLayer(data.layer);
   const colors = data.theme.layers[layer];
+  // Chip displays the raw folder name (preserves dbt namespacing like
+  // `marts_msd`) and falls back to the canonical layer when older payloads
+  // don't include `folder`.
+  const chipText = data.folder ?? layer;
   const t = data.theme;
   const openable = !!data.onOpenFile;
   const [hover, setHover] = useState(false);
@@ -100,7 +107,7 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
               flexShrink: 0,
             }}
           >
-            {layer}
+            {chipText}
           </span>
           <span
             style={{

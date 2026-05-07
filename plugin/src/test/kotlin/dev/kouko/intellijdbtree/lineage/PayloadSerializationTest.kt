@@ -40,6 +40,27 @@ class PayloadSerializationTest {
     }
 
     @Test
+    fun `DbtModel folder field is serialized when set and elided when null`() {
+        val withFolder = DbtModel(
+            uniqueId = "model.demo.orders",
+            name = "orders",
+            packageName = "demo",
+            layer = "marts",
+            folder = "marts_msd",
+        )
+        val withoutFolder = DbtModel(
+            uniqueId = "model.demo.orders",
+            name = "orders",
+            packageName = "demo",
+        )
+        val withTree = json.parseToJsonElement(json.encodeToString(DbtModel.serializer(), withFolder)).jsonObject
+        val withoutTree = json.parseToJsonElement(json.encodeToString(DbtModel.serializer(), withoutFolder)).jsonObject
+
+        assertEquals("marts_msd", withTree["folder"]!!.jsonPrimitive.content)
+        assertFalse("folder" in withoutTree, "null folder is omitted (explicitNulls=false)")
+    }
+
+    @Test
     fun `ModelEdge serializes source_unique_id and target_unique_id`() {
         val edge = ModelEdge(sourceUniqueId = "a", targetUniqueId = "b")
         val tree = json.parseToJsonElement(json.encodeToString(ModelEdge.serializer(), edge)).jsonObject
