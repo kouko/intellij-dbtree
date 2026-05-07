@@ -6,9 +6,11 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import dev.kouko.intellijdbtree.settings.DbtreeSettingsService
 import dev.kouko.intellijdbtree.sidecar.SidecarExtractor
 import kotlinx.serialization.json.Json
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * IDE-side wrapper that runs the bundled Python sidecar
@@ -37,6 +39,16 @@ class ColumnLineageService(private val project: Project) {
      * to compiled SQL are picked up.
      */
     private val columnListCache = ConcurrentHashMap<String, List<String>>()
+
+    /**
+     * First user-actionable sidecar failure observed during the current
+     * [computeForColumn] call. Cleared on entry, read on exit. Concurrent
+     * column clicks are already serialized in practice by [LineageInfoService]'s
+     * epoch counter (older calls drop their results before the publish), so
+     * a single ref is enough — older calls' failures get overwritten but
+     * those calls are about to be discarded anyway.
+     */
+    private val currentFailure = AtomicReference<String?>(null)
 
     sealed interface Result {
         data class Ok(val edges: List<ColumnEdge>) : Result
@@ -76,11 +88,23 @@ class ColumnLineageService(private val project: Project) {
             runSidecarAllColumns(python, pythonPath, projectDir, uid)
         }
 
+        // Reset failure capture for this trace. Subsequent runSidecar calls
+        // will record the first user-actionable failure they hit.
+        currentFailure.set(null)
+
         val edges = mutableListOf<ColumnEdge>()
         edges += traceUpstreamColumns(modelUid, column, manifest, singleSidecar)
         edges += traceDownstreamColumns(modelUid, column, manifest, allColumnsSidecar)
 
         log.info("ColumnLineageService: traced $modelUid.$column via $source ($python) -> ${edges.size} edges")
+
+        // Surface a sidecar failure to the toolbar ONLY when it produced no
+        // edges. A partial trace with one failed branch is still useful — the
+        // user gets the edges we did find, the failure shows in idea.log.
+        val failure = currentFailure.get()
+        if (edges.isEmpty() && failure != null) {
+            return Result.Failed(failure)
+        }
         return Result.Ok(edges)
     }
 
@@ -176,23 +200,68 @@ class ColumnLineageService(private val project: Project) {
         label: String,
         deserializer: kotlinx.serialization.KSerializer<T>,
     ): T? {
+        val timeoutSeconds = DbtreeSettingsService.getInstance().state.sidecarTimeoutSeconds
+            .let(DbtreeSettingsService::clampTimeoutSeconds)
+        val timeoutMs = timeoutSeconds * 1000
+
         return try {
             val handler = CapturingProcessHandler(cmd)
-            val out = handler.runProcess(SIDECAR_TIMEOUT_MS, true)
-            if (out.exitCode != 0) {
-                log.info("Sidecar failed for $label: exit=${out.exitCode} stderr=${out.stderr.take(400)}")
+            val out = handler.runProcess(timeoutMs, true)
+            val failure = describeSidecarFailure(
+                isTimeout = out.isTimeout,
+                exitCode = out.exitCode,
+                stderr = out.stderr,
+                label = label,
+                timeoutSeconds = timeoutSeconds,
+            )
+            if (failure != null) {
+                log.info("Sidecar failed for $label: $failure")
+                currentFailure.compareAndSet(null, failure)
                 return null
             }
             sidecarJson.decodeFromString(deserializer, out.stdout)
+        } catch (e: kotlinx.serialization.SerializationException) {
+            val msg = "Sidecar returned invalid JSON for $label: ${e.message?.take(200) ?: e::class.simpleName}"
+            log.warn(msg, e)
+            currentFailure.compareAndSet(null, msg)
+            null
         } catch (e: Exception) {
-            log.warn("Sidecar invocation crashed for $label", e)
+            val msg = "Sidecar invocation crashed for $label: ${e.message ?: e::class.simpleName}"
+            log.warn(msg, e)
+            currentFailure.compareAndSet(null, msg)
             null
         }
     }
+}
 
-    companion object {
-        private const val SIDECAR_TIMEOUT_MS = 15_000
+/**
+ * Classify a sidecar invocation outcome into a user-actionable warning
+ * string, or null on success. Pure function — takes the
+ * [com.intellij.execution.process.ProcessOutput] fields as primitives so
+ * unit tests don't need IntelliJ runtime classes.
+ *
+ * Wording prioritizes "what should the user do?":
+ *  - Timeout → tell them where to raise the limit (Settings → Tools → dbtree)
+ *  - Non-zero exit → quote the first chunk of stderr so the issue is visible
+ *    in the toolbar without forcing them to open idea.log
+ */
+internal fun describeSidecarFailure(
+    isTimeout: Boolean,
+    exitCode: Int,
+    stderr: String,
+    label: String,
+    timeoutSeconds: Int,
+): String? = when {
+    isTimeout ->
+        "Sidecar timed out after ${timeoutSeconds}s while computing $label. " +
+            "Raise “Sidecar timeout” in Settings → Tools → dbtree if your " +
+            "project's column chains are deep, or see idea.log for partial output."
+    exitCode != 0 -> {
+        val tail = stderr.trim().takeLast(200).ifBlank { "(no stderr)" }
+        "Sidecar exited with code $exitCode while computing $label. " +
+            "stderr: $tail. See idea.log for full output."
     }
+    else -> null
 }
 
 private fun Project.columnLineageService(): ColumnLineageService = service()

@@ -8,6 +8,8 @@ import com.intellij.util.ui.JBUI
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
+import javax.swing.JSpinner
+import javax.swing.SpinnerNumberModel
 
 /**
  * Settings page at: Settings → Tools → dbtree.
@@ -18,6 +20,7 @@ import javax.swing.JPanel
 class DbtreeSettingsConfigurable : Configurable {
 
     private var pythonField: TextFieldWithBrowseButton? = null
+    private var timeoutSpinner: JSpinner? = null
     private var component: JComponent? = null
 
     override fun getDisplayName(): String = "dbtree"
@@ -46,9 +49,31 @@ class DbtreeSettingsConfigurable : Configurable {
                 "</body></html>",
         )
 
+        val spinner = JSpinner(
+            SpinnerNumberModel(
+                DbtreeSettingsService.DEFAULT_TIMEOUT_SECONDS,
+                DbtreeSettingsService.TIMEOUT_MIN_SECONDS,
+                DbtreeSettingsService.TIMEOUT_MAX_SECONDS,
+                1,
+            ),
+        )
+        timeoutSpinner = spinner
+
+        val timeoutDescription = JLabel(
+            "<html><body style='width: 480px; color: #888'>" +
+                "Per-invocation timeout for the Python sidecar. " +
+                "Default <b>${DbtreeSettingsService.DEFAULT_TIMEOUT_SECONDS}s</b>; " +
+                "raise this if your column traces involve deep " +
+                "upstream/downstream chains (large dbt projects can need 30-60s).<br><br>" +
+                "Range: ${DbtreeSettingsService.TIMEOUT_MIN_SECONDS}-${DbtreeSettingsService.TIMEOUT_MAX_SECONDS} seconds." +
+                "</body></html>",
+        )
+
         val panel = FormBuilder.createFormBuilder()
             .addLabeledComponent("Python interpreter:", field, 1, false)
             .addComponent(description)
+            .addLabeledComponent("Sidecar timeout (seconds):", spinner, 1, false)
+            .addComponent(timeoutDescription)
             .addComponentFillVertically(JPanel(), 0)
             .panel
         panel.border = JBUI.Borders.empty(12)
@@ -58,20 +83,26 @@ class DbtreeSettingsConfigurable : Configurable {
 
     override fun isModified(): Boolean {
         val cur = DbtreeSettingsService.getInstance().state
-        return pythonField?.text != cur.pythonInterpreterPath
+        if (pythonField?.text != cur.pythonInterpreterPath) return true
+        if ((timeoutSpinner?.value as? Int) != cur.sidecarTimeoutSeconds) return true
+        return false
     }
 
     override fun apply() {
         val cur = DbtreeSettingsService.getInstance().state
         cur.pythonInterpreterPath = pythonField?.text?.trim().orEmpty()
+        (timeoutSpinner?.value as? Int)?.let { cur.sidecarTimeoutSeconds = it }
     }
 
     override fun reset() {
-        pythonField?.text = DbtreeSettingsService.getInstance().state.pythonInterpreterPath
+        val cur = DbtreeSettingsService.getInstance().state
+        pythonField?.text = cur.pythonInterpreterPath
+        timeoutSpinner?.value = DbtreeSettingsService.clampTimeoutSeconds(cur.sidecarTimeoutSeconds)
     }
 
     override fun disposeUIResources() {
         pythonField = null
+        timeoutSpinner = null
         component = null
     }
 }
