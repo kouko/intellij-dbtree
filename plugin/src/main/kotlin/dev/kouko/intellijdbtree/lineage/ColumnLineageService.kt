@@ -118,35 +118,37 @@ class ColumnLineageService(private val project: Project) {
      * sidecar fails — callers should treat this as "leave columns empty",
      * the warning banner will already explain how to fix it.
      */
-    fun listColumnsViaSidecar(modelUid: String, manifest: ParsedManifest): List<String>? {
-        columnListCache[modelUid]?.let { return it }
-
-        val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
-        val python = (resolution as? PythonInterpreterResolver.Resolution.Ok)?.pythonPath
-            ?: run {
-                log.info("ColumnLineageService.listColumnsViaSidecar: ${(resolution as PythonInterpreterResolver.Resolution.None).reason}")
-                return null
+    fun listColumnsViaSidecar(modelUid: String, manifest: ParsedManifest): List<String>? =
+        columnListCache.getOrCompute(modelUid) {
+            val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
+            val python = (resolution as? PythonInterpreterResolver.Resolution.Ok)?.pythonPath
+                ?: run {
+                    log.info(
+                        "ColumnLineageService.listColumnsViaSidecar: " +
+                            "${(resolution as PythonInterpreterResolver.Resolution.None).reason}",
+                    )
+                    return@getOrCompute null
+                }
+            val sidecarDir = try {
+                SidecarExtractor.ensureExtracted()
+            } catch (e: Exception) {
+                log.warn("ColumnLineageService.listColumnsViaSidecar: failed to extract sidecar", e)
+                return@getOrCompute null
             }
-        val sidecarDir = try {
-            SidecarExtractor.ensureExtracted()
-        } catch (e: Exception) {
-            log.warn("ColumnLineageService.listColumnsViaSidecar: failed to extract sidecar", e)
-            return null
-        }
 
-        val cmd = sidecarCommand(python, sidecarDir.toString(), manifest.dbtProjectDir.toString(), modelUid).apply {
-            addParameter("--list-columns")
-        }
-        val result = runSidecar(cmd, "$modelUid (list-columns)", ListColumnsResult.serializer())
-            ?: return null
+            val cmd = sidecarCommand(
+                python,
+                sidecarDir.toString(),
+                manifest.dbtProjectDir.toString(),
+                modelUid,
+            ).apply { addParameter("--list-columns") }
+            val result = runSidecar(cmd, "$modelUid (list-columns)", ListColumnsResult.serializer())
+                ?: return@getOrCompute null
 
-        // sqlglot returns ["*"] when SELECT * can't be expanded; treat that
-        // as "no columns" rather than rendering a literal "*" entry.
-        val cols = result.columns.filter { it != "*" }
-        columnListCache[modelUid] = cols
-        log.info("ColumnLineageService.listColumnsViaSidecar: $modelUid -> ${cols.size} columns")
-        return cols
-    }
+            val cols = parseColumnList(result.columns)
+            log.info("ColumnLineageService.listColumnsViaSidecar: $modelUid -> ${cols.size} columns")
+            cols
+        }
 
     /** Drop cached column lists (call on manifest reload / refresh-from-disk). */
     fun invalidateColumnListCache() {
@@ -205,26 +207,26 @@ class ColumnLineageService(private val project: Project) {
         val timeoutMs = timeoutSeconds * 1000
 
         return try {
-            val handler = CapturingProcessHandler(cmd)
-            val out = handler.runProcess(timeoutMs, true)
-            val failure = describeSidecarFailure(
-                isTimeout = out.isTimeout,
-                exitCode = out.exitCode,
-                stderr = out.stderr,
-                label = label,
-                timeoutSeconds = timeoutSeconds,
-            )
-            if (failure != null) {
-                log.info("Sidecar failed for $label: $failure")
-                currentFailure.compareAndSet(null, failure)
-                return null
+            val out = CapturingProcessHandler(cmd).runProcess(timeoutMs, true)
+            when (
+                val outcome = processSidecarOutput(
+                    isTimeout = out.isTimeout,
+                    exitCode = out.exitCode,
+                    stderr = out.stderr,
+                    stdout = out.stdout,
+                    label = label,
+                    timeoutSeconds = timeoutSeconds,
+                    deserializer = deserializer,
+                    json = sidecarJson,
+                )
+            ) {
+                is SidecarOutcome.Ok -> outcome.value
+                is SidecarOutcome.Failed -> {
+                    log.info("Sidecar failed for $label: ${outcome.message}")
+                    currentFailure.compareAndSet(null, outcome.message)
+                    null
+                }
             }
-            sidecarJson.decodeFromString(deserializer, out.stdout)
-        } catch (e: kotlinx.serialization.SerializationException) {
-            val msg = "Sidecar returned invalid JSON for $label: ${e.message?.take(200) ?: e::class.simpleName}"
-            log.warn(msg, e)
-            currentFailure.compareAndSet(null, msg)
-            null
         } catch (e: Exception) {
             val msg = "Sidecar invocation crashed for $label: ${e.message ?: e::class.simpleName}"
             log.warn(msg, e)
@@ -232,6 +234,82 @@ class ColumnLineageService(private val project: Project) {
             null
         }
     }
+}
+
+/**
+ * Outcome of a single sidecar invocation, decoupled from IntelliJ's
+ * subprocess types. Pure data, used as the seam between
+ * [ColumnLineageService.runSidecar]'s I/O half (subprocess + logging +
+ * `currentFailure` mutation) and the post-processing half
+ * ([processSidecarOutput]).
+ */
+internal sealed interface SidecarOutcome<out T> {
+    data class Ok<T>(val value: T) : SidecarOutcome<T>
+    data class Failed(val message: String) : SidecarOutcome<Nothing>
+}
+
+/**
+ * Pure post-processor for one sidecar invocation. Takes the
+ * [com.intellij.execution.process.ProcessOutput] fields as primitives so
+ * tests don't need IntelliJ runtime classes — feed in fake stdout/stderr
+ * and exercise the failure-classification + JSON-deserialization paths
+ * in isolation.
+ *
+ * Failure classification (timeout / non-zero exit / blank-stderr fallback)
+ * is delegated to [describeSidecarFailure]. JSON parse errors are caught
+ * here and converted to a `Failed` outcome with a label-bearing message
+ * so the caller doesn't have to thread the label through a separate catch.
+ */
+internal fun <T> processSidecarOutput(
+    isTimeout: Boolean,
+    exitCode: Int,
+    stderr: String,
+    stdout: String,
+    label: String,
+    timeoutSeconds: Int,
+    deserializer: kotlinx.serialization.KSerializer<T>,
+    json: Json,
+): SidecarOutcome<T> {
+    describeSidecarFailure(isTimeout, exitCode, stderr, label, timeoutSeconds)?.let {
+        return SidecarOutcome.Failed(it)
+    }
+    return try {
+        SidecarOutcome.Ok(json.decodeFromString(deserializer, stdout))
+    } catch (e: kotlinx.serialization.SerializationException) {
+        SidecarOutcome.Failed(
+            "Sidecar returned invalid JSON for $label: " +
+                (e.message?.take(200) ?: e::class.simpleName),
+        )
+    }
+}
+
+/**
+ * Drop sqlglot's `["*"]` placeholder from a column-list response.
+ *
+ * sqlglot emits a literal `"*"` when SELECT * can't be expanded (no source
+ * schema). Rendering that as a column name confuses users — treat it as
+ * "no columns" instead. Pure function, so the rule is locked by tests.
+ */
+internal fun parseColumnList(raw: List<String>): List<String> = raw.filter { it != "*" }
+
+/**
+ * Cache get-or-compute with non-poisoning null semantics: if [compute]
+ * returns null, the entry is NOT cached and the next call retries.
+ *
+ * `ConcurrentHashMap.computeIfAbsent` has the right semantics but Kotlin's
+ * type-system signature insists on a non-null return for the lambda; this
+ * extension just wraps the same behavior with a nullable result, which is
+ * what every callsite in this file actually wants.
+ */
+internal fun <K, V : Any> ConcurrentHashMap<K, V>.getOrCompute(
+    key: K,
+    compute: () -> V?,
+): V? {
+    this[key]?.let { return it }
+    val value = compute() ?: return null
+    // putIfAbsent returns the existing value if another thread won the race;
+    // either way the caller gets the same logical answer.
+    return putIfAbsent(key, value) ?: value
 }
 
 /**

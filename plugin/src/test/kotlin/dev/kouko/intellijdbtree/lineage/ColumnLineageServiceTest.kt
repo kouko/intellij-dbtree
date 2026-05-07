@@ -1,9 +1,15 @@
 package dev.kouko.intellijdbtree.lineage
 
+import kotlinx.serialization.json.Json
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -98,6 +104,184 @@ class ColumnLineageServiceTest {
             )
             assertNotNull(msg)
             assertTrue(tail in msg, "tail of stderr must survive truncation — that's where the actual error is")
+        }
+    }
+
+    @Nested
+    inner class ProcessSidecarOutputTests {
+
+        // Lenient JSON to match the production sidecarJson; tests should
+        // accept the same payload shape the real service does.
+        private val testJson = Json { ignoreUnknownKeys = true }
+
+        @Test
+        fun `valid stdout deserializes to Ok`() {
+            val outcome = processSidecarOutput(
+                isTimeout = false,
+                exitCode = 0,
+                stderr = "",
+                stdout = """{"columns": ["id", "name"], "error": null}""",
+                label = "model.demo.x (list-columns)",
+                timeoutSeconds = 15,
+                deserializer = ListColumnsResult.serializer(),
+                json = testJson,
+            )
+            val ok = assertIs<SidecarOutcome.Ok<ListColumnsResult>>(outcome)
+            assertEquals(listOf("id", "name"), ok.value.columns)
+        }
+
+        @Test
+        fun `timeout returns Failed with the timeout message — does NOT attempt to parse stdout`() {
+            // Even if stdout happens to contain valid JSON (partial output
+            // before the timeout fired), the timeout takes priority — running
+            // a partial trace as if it were complete would silently mislead
+            // the user.
+            val outcome = processSidecarOutput(
+                isTimeout = true,
+                exitCode = -1,
+                stderr = "",
+                stdout = """{"columns": ["partial"]}""",
+                label = "model.demo.x.y",
+                timeoutSeconds = 30,
+                deserializer = ListColumnsResult.serializer(),
+                json = testJson,
+            )
+            val failed = assertIs<SidecarOutcome.Failed>(outcome)
+            assertTrue("timed out after 30s" in failed.message, "must include configured timeout: ${failed.message}")
+        }
+
+        @Test
+        fun `non-zero exit returns Failed regardless of stdout`() {
+            val outcome = processSidecarOutput(
+                isTimeout = false,
+                exitCode = 2,
+                stderr = "ImportError: sqlglot not installed",
+                stdout = "",
+                label = "model.demo.x.y",
+                timeoutSeconds = 15,
+                deserializer = ListColumnsResult.serializer(),
+                json = testJson,
+            )
+            val failed = assertIs<SidecarOutcome.Failed>(outcome)
+            assertTrue("exit" in failed.message && "2" in failed.message)
+            assertTrue("ImportError" in failed.message, "stderr must surface in the message")
+        }
+
+        @Test
+        fun `bad JSON on a successful exit code returns Failed with invalid-JSON wording`() {
+            // exitCode == 0, but stdout isn't parseable. Must classify as a
+            // distinct failure — "the sidecar lied" — not silently lose data.
+            val outcome = processSidecarOutput(
+                isTimeout = false,
+                exitCode = 0,
+                stderr = "",
+                stdout = "this is not json",
+                label = "model.demo.x (list-columns)",
+                timeoutSeconds = 15,
+                deserializer = ListColumnsResult.serializer(),
+                json = testJson,
+            )
+            val failed = assertIs<SidecarOutcome.Failed>(outcome)
+            assertTrue(
+                "invalid JSON" in failed.message,
+                "must classify as 'invalid JSON' so user can grep idea.log: ${failed.message}",
+            )
+            assertTrue("model.demo.x (list-columns)" in failed.message, "label must appear")
+        }
+    }
+
+    @Nested
+    inner class ParseColumnListTests {
+
+        @Test
+        fun `bare star is dropped — sqlglot 'SELECT *' placeholder must not render`() {
+            assertEquals(emptyList(), parseColumnList(listOf("*")))
+        }
+
+        @Test
+        fun `mixed list keeps real columns and drops only the star`() {
+            assertEquals(listOf("id", "name"), parseColumnList(listOf("id", "*", "name")))
+        }
+
+        @Test
+        fun `regular column list passes through unchanged`() {
+            val cols = listOf("id", "user_id", "created_at")
+            assertEquals(cols, parseColumnList(cols))
+        }
+
+        @Test
+        fun `empty list stays empty`() {
+            assertEquals(emptyList(), parseColumnList(emptyList()))
+        }
+    }
+
+    @Nested
+    inner class GetOrComputeTests {
+
+        @Test
+        fun `first call computes and caches`() {
+            val cache = ConcurrentHashMap<String, List<String>>()
+            val invocations = AtomicInteger(0)
+            val result = cache.getOrCompute("k") {
+                invocations.incrementAndGet()
+                listOf("a", "b")
+            }
+            assertEquals(listOf("a", "b"), result)
+            assertEquals(1, invocations.get())
+            assertEquals(listOf("a", "b"), cache["k"], "cache must contain the computed value")
+        }
+
+        @Test
+        fun `second call returns cached value without invoking compute`() {
+            val cache = ConcurrentHashMap<String, List<String>>()
+            cache["k"] = listOf("cached")
+            val result = cache.getOrCompute("k") {
+                error("compute must NOT be called when cache is hit")
+            }
+            assertEquals(listOf("cached"), result)
+        }
+
+        @Test
+        fun `compute returning null does NOT poison the cache`() {
+            // The whole point of using a custom helper instead of
+            // computeIfAbsent: a failing sidecar (returning null) must let
+            // the next call retry — not lock in a permanent null.
+            val cache = ConcurrentHashMap<String, List<String>>()
+            val invocations = AtomicInteger(0)
+
+            val first = cache.getOrCompute("k") {
+                invocations.incrementAndGet()
+                null
+            }
+            assertNull(first)
+            assertTrue(cache.isEmpty(), "null result must NOT be cached")
+
+            // Second call with a successful compute — should run, not return cached null.
+            val second = cache.getOrCompute("k") {
+                invocations.incrementAndGet()
+                listOf("retry succeeded")
+            }
+            assertEquals(listOf("retry succeeded"), second)
+            assertEquals(2, invocations.get(), "compute must run again after a null return")
+        }
+
+        @Test
+        fun `concurrent winners share the same cached instance via putIfAbsent`() {
+            // Race window: thread A reads null, computes valueA, calls putIfAbsent.
+            // Thread B reads null, computes valueB, calls putIfAbsent — A's already
+            // there so B gets A's value back. Both threads return THE SAME instance.
+            // We can't reliably trigger the race in a deterministic test, so we
+            // simulate by pre-populating the cache between the get-null check and
+            // the putIfAbsent. The invariant we lock: putIfAbsent return is honored.
+            val cache = ConcurrentHashMap<String, List<String>>()
+            val winning = listOf("winner")
+            val result = cache.getOrCompute("k") {
+                // Simulate another thread winning during compute.
+                cache.putIfAbsent("k", winning)
+                listOf("loser")
+            }
+            assertSame(winning, result, "race winner must be returned, even if our compute also produced a value")
+            assertSame(winning, cache["k"], "cache must hold the race winner, not our late value")
         }
     }
 }
