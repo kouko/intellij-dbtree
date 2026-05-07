@@ -73,6 +73,25 @@ class LineageInfoService(private val project: Project) {
     private fun bumpEpoch(): Long = state.updateAndGet { it.copy(epoch = it.epoch + 1) }.epoch
 
     /**
+     * Get the loaded manifest, or — if loading failed — publish an empty
+     * payload carrying the failure reason so the React panel can display
+     * a "run dbt parse" / "manifest.json failed to parse" banner via its
+     * existing [LineagePayload.warning] surface.
+     *
+     * Replaces the old `ensureLoaded() ?: return` pattern, which silently
+     * left the canvas blank when the manifest was missing or broken — the
+     * #1 confusion point for first-time users.
+     */
+    private fun ensureManifestOrPublishStatus(): ParsedManifest? {
+        val ms = project.service<ManifestService>()
+        ms.ensureLoaded()?.let { return it }
+        val warning = manifestStatusWarning(ms.lastRefreshResult()) ?: return null
+        publisher.lineagePayloadChanged(LineagePayload(warning = warning))
+        state.updateAndGet { it.copy(publishedUids = emptySet()) }
+        return null
+    }
+
+    /**
      * Triggered by editor selection changes. If the file's model is
      * already inside the current DAG, emit a lightweight selection-only
      * event (no re-layout). Otherwise, recenter on this model and emit
@@ -83,7 +102,7 @@ class LineageInfoService(private val project: Project) {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
-            val manifest = project.service<ManifestService>().ensureLoaded() ?: return@executeOnPooledThread
+            val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
             if (isSuperseded(myEpoch, cur)) return@executeOnPooledThread
@@ -117,8 +136,7 @@ class LineageInfoService(private val project: Project) {
         val myEpoch = updated.epoch
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
-            val manifest = project.service<ManifestService>().ensureLoaded()
-                ?: return@executeOnPooledThread
+            val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
             publishFull(manifest, state.get().activeUid)
         }
@@ -131,8 +149,7 @@ class LineageInfoService(private val project: Project) {
             if (project.isDisposed) return@executeOnPooledThread
             project.service<ManifestService>().refresh()
             project.service<ColumnLineageService>().invalidateColumnListCache()
-            val manifest = project.service<ManifestService>().ensureLoaded()
-                ?: return@executeOnPooledThread
+            val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
             publishFull(manifest, state.get().activeUid)
         }
@@ -147,8 +164,7 @@ class LineageInfoService(private val project: Project) {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
-            val manifest = project.service<ManifestService>().ensureLoaded()
-                ?: return@executeOnPooledThread
+            val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val names = project.service<ColumnLineageService>()
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
@@ -168,8 +184,7 @@ class LineageInfoService(private val project: Project) {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
-            val manifest = project.service<ManifestService>().ensureLoaded()
-                ?: return@executeOnPooledThread
+            val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val cur = state.get()
             val activeUid = cur.activeUid ?: modelUid
 

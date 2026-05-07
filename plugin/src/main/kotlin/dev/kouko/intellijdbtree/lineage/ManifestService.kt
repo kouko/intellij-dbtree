@@ -36,6 +36,18 @@ class ManifestService(private val project: Project) {
     private val state = AtomicReference<ParsedManifest?>(null)
 
     /**
+     * Most recent [RefreshResult]. Survives even when [state] gets reset to
+     * null on failure, so callers (e.g. [LineageInfoService]) can surface a
+     * user-facing reason ("run dbt parse first") rather than silently
+     * showing a blank canvas. Initialised pessimistically — anyone reading
+     * before the first refresh sees "no project" rather than a stale Ok.
+     */
+    private val lastResult = AtomicReference<RefreshResult>(RefreshResult.NoDbtProject)
+
+    /** Latest refresh outcome — Ok if a manifest is currently loaded, else the failure reason. */
+    fun lastRefreshResult(): RefreshResult = lastResult.get()
+
+    /**
      * Re-detect the dbt project, reload manifest.json, and (if present)
      * load catalog.json to enrich model column lists with real warehouse
      * types. Safe to call from any thread; performs file I/O.
@@ -61,6 +73,7 @@ class ManifestService(private val project: Project) {
             }
             else -> state.set(null)
         }
+        lastResult.set(result)
         return result
     }
 
