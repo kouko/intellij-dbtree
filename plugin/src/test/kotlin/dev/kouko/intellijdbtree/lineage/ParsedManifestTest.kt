@@ -214,6 +214,66 @@ class ParsedManifestTest {
         }
 
         @Test
+        fun `skip-edge re-entry preserves shortest-path reachability under hop budget`() {
+            // Regression guard: A→B→C→D→E plus a skip edge A→C. With downHops=3
+            // and seed=A, all 5 nodes should be visible because the skip edge
+            // A→C re-enters C with `remaining=2` (vs the long path's `remaining=1`),
+            // unlocking access to D→E within the hop budget.
+            //
+            // The behavior depends on the `|| remaining > 0` condition in walkDown.
+            // If a future "cleanup" removes that OR (treating it as dead code),
+            // this test will fail — and that's intentional. Removing the OR
+            // breaks ~10% of iCHEF lineage queries because dbt projects commonly
+            // mix shortcut refs into the dependency graph.
+            val skipEdgeChain = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.a": ${node("a", layerPath = "staging/a.sql")},
+                    "model.demo.b": ${node("b", layerPath = "intermediate/b.sql")},
+                    "model.demo.c": ${node("c", layerPath = "intermediate/c.sql")},
+                    "model.demo.d": ${node("d", layerPath = "marts/d.sql")},
+                    "model.demo.e": ${node("e", layerPath = "marts/e.sql")}
+                  },
+                  "sources": {},
+                  "child_map": {
+                    "model.demo.a": ["model.demo.b", "model.demo.c"],
+                    "model.demo.b": ["model.demo.c"],
+                    "model.demo.c": ["model.demo.d"],
+                    "model.demo.d": ["model.demo.e"],
+                    "model.demo.e": []
+                  },
+                  "parent_map": {
+                    "model.demo.a": [],
+                    "model.demo.b": ["model.demo.a"],
+                    "model.demo.c": ["model.demo.a", "model.demo.b"],
+                    "model.demo.d": ["model.demo.c"],
+                    "model.demo.e": ["model.demo.d"]
+                  }
+                }
+                """.trimIndent(),
+            )
+
+            val payload = skipEdgeChain.buildLineage(
+                seed = "model.demo.a",
+                upHops = 0,
+                downHops = 3,
+            )
+            val ids = payload.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf(
+                    "model.demo.a",
+                    "model.demo.b",
+                    "model.demo.c",
+                    "model.demo.d",
+                    "model.demo.e",
+                ),
+                ids,
+                "E must be reachable via the A→C shortcut despite the long path A→B→C→D exhausting budget first",
+            )
+        }
+
+        @Test
         fun `tests and seeds are filtered out of interesting nodes`() {
             val manifest = parseManifest(
                 """
