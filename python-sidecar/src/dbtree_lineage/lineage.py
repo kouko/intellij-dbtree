@@ -12,9 +12,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import sqlglot
 from sqlglot import exp
 from sqlglot.lineage import Node as SqlglotNode
 from sqlglot.lineage import lineage as sqlglot_lineage
+from sqlglot.optimizer.qualify import qualify
 
 
 @dataclass
@@ -77,6 +79,45 @@ def _convert(node: SqlglotNode, dialect: str | None) -> LineageNode:
         table=table,
         downstream=[_convert(child, dialect) for child in node.downstream],
     )
+
+
+def list_output_columns(
+    sql: str,
+    dialect: str | None = None,
+    schema: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return the names of columns the top-level SELECT in ``sql`` produces.
+
+    For ``SELECT a, b, c FROM ...`` returns ``["a", "b", "c"]``. For
+    ``SELECT *`` we run sqlglot's qualifier with the supplied [schema] to
+    expand the star — without a schema for the source, ``*`` cannot be
+    resolved and we return ``["*"]`` (the caller should treat that as "no
+    columns recoverable").
+
+    Args:
+        sql: Compiled SQL of the model.
+        dialect: sqlglot dialect (e.g. ``"redshift"``, ``"postgres"``).
+        schema: Optional nested-dict schema for ``SELECT *`` expansion.
+
+    Returns:
+        Ordered list of output column names. Unique within a single SELECT,
+        but the caller is responsible for deduping if it merges multiple
+        sources.
+    """
+    tree = sqlglot.parse_one(sql, dialect=dialect)
+    if schema is not None:
+        try:
+            tree = qualify(tree, schema=schema, dialect=dialect)
+        except Exception:
+            # qualify can fail on aggressive normalization; fall back to the
+            # un-qualified tree rather than crashing the whole call.
+            pass
+    if not isinstance(tree, exp.Query):
+        return []
+    # `named_selects` handles Select, Union, and CTE-wrapped queries
+    # uniformly; for Union it returns the left branch's column names,
+    # which matches SQL's union-output-naming rule.
+    return list(tree.named_selects)
 
 
 def collect_source_columns(node: LineageNode) -> list[tuple[str, str]]:

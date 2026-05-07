@@ -26,6 +26,12 @@ import java.util.concurrent.atomic.AtomicReference
 interface LineageInfoListener {
     fun lineagePayloadChanged(payload: LineagePayload) {}
     fun selectedModelChanged(uniqueId: String) {}
+    /**
+     * A model's column list was lazily computed (e.g. via the sqlglot sidecar
+     * after the user expanded a card with empty columns). Subscribers should
+     * surgically patch the payload's model entry without re-layout.
+     */
+    fun modelColumnsUpdated(uniqueId: String, columns: List<ColumnSpec>) {}
 }
 
 /**
@@ -94,9 +100,27 @@ class LineageInfoService(private val project: Project) {
     fun refreshFromDisk() {
         ApplicationManager.getApplication().executeOnPooledThread {
             project.service<ManifestService>().refresh()
+            project.service<ColumnLineageService>().invalidateColumnListCache()
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
             publishFull(manifest, state.get())
+        }
+    }
+
+    /**
+     * The user expanded a model card whose column list was empty. Spawn
+     * the Python sidecar to extract output columns from the model's
+     * compiled SQL via sqlglot, then publish the per-model patch event.
+     */
+    fun onRequestColumns(modelUid: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val manifest = project.service<ManifestService>().ensureLoaded()
+                ?: return@executeOnPooledThread
+            val names = project.service<ColumnLineageService>()
+                .listColumnsViaSidecar(modelUid, manifest)
+                ?: return@executeOnPooledThread
+            val columns = names.map { ColumnSpec(name = it) }
+            publisher.modelColumnsUpdated(modelUid, columns)
         }
     }
 

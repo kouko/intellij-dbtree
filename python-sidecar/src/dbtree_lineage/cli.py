@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .lineage import collect_source_columns, extract_column_lineage
+from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
 from .manifest import DbtManifest, ManifestError
 
 
@@ -48,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--all-columns",
         action="store_true",
         help="Return lineage for every column in the model (single Python startup).",
+    )
+    p.add_argument(
+        "--list-columns",
+        action="store_true",
+        help="Return only the names of columns the model's compiled SQL "
+             "produces (no lineage). Used by the plugin to populate cards "
+             "for models lacking schema.yml docs.",
     )
     p.add_argument(
         "--dialect",
@@ -81,6 +88,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         },
         "dialect": dialect,
     }
+
+    if args.list_columns:
+        # Parse the model's SELECT and return its output column names.
+        # Used by the plugin to populate model cards whose dbt yml docs
+        # don't list columns. Cheap operation (no per-column lineage walk),
+        # so suitable for lazy on-demand calls when the user expands a card.
+        try:
+            names = list_output_columns(
+                sql=model.compiled_sql,
+                dialect=dialect,
+                schema=schema_arg,
+            )
+            return {**base, "columns": names}
+        except Exception as e:  # noqa: BLE001 — surface error to plugin, don't crash
+            return {**base, "columns": [], "error": str(e)}
 
     if args.all_columns:
         # Single Python startup, parse the SQL once via sqlglot, query each

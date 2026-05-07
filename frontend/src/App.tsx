@@ -12,7 +12,7 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import demoFixture from "./fixtures/lineage-demo.json";
-import type { LineagePayload } from "./types";
+import type { ColumnSpec, LineagePayload } from "./types";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
 import { layoutModelGraph } from "./lib/layout";
@@ -52,6 +52,12 @@ declare global {
     setSelectedModel?: (uniqueId: string) => void;
     setIdeTheme?: (theme: ThemeName) => void;
     applyHostState?: (state: HostState) => void;
+    /**
+     * Surgical patch: update only the [columns] of one model in the payload.
+     * Used after the Kotlin side resolves a column list lazily via the
+     * sqlglot sidecar — avoids re-pushing the whole DAG.
+     */
+    applyModelColumns?: (uniqueId: string, columns: ColumnSpec[]) => void;
     kotlinCallback?: (payload: string) => void;
     __DBTREE_THEME__?: ThemeName;
     __DBTREE_HOST_STATE__?: HostState;
@@ -161,11 +167,35 @@ function App() {
       setSelectedModelUid(uid);
       dropStaleColumn(uid);
     };
+    window.applyModelColumns = (uid, columns) => {
+      setPayload((prev) => ({
+        ...prev,
+        models: prev.models.map((m) =>
+          m.unique_id === uid ? { ...m, columns } : m,
+        ),
+      }));
+      setPendingColumns((prev) => {
+        if (!prev.has(uid)) return prev;
+        const next = new Set(prev);
+        next.delete(uid);
+        return next;
+      });
+    };
     return () => {
       delete window.setLineageInfo;
       delete window.setSelectedModel;
+      delete window.applyModelColumns;
     };
   }, []);
+
+  /**
+   * Set of model uids whose columns are currently being computed by the
+   * Kotlin side. Frontend uses this to (a) skip duplicate REQUEST_COLUMNS
+   * events and (b) show a "Loading…" placeholder in the expanded card.
+   */
+  const [pendingColumns, setPendingColumns] = useState<Set<string>>(
+    () => new Set(),
+  );
 
   // ---- Expanded models -----------------------------------------------------
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -202,14 +232,47 @@ function App() {
   // window.setLineageInfo so the same render that switches models also
   // clears the column trace.)
 
-  const toggleExpanded = useCallback((uniqueId: string) => {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(uniqueId)) next.delete(uniqueId);
-      else next.add(uniqueId);
-      return next;
-    });
-  }, []);
+  /**
+   * If the model has no columns yet (yml/catalog absent), fire a
+   * REQUEST_COLUMNS event so Kotlin can compute the column list via
+   * sqlglot. Idempotent: skipped when columns already populated or a
+   * fetch is already in flight.
+   */
+  const requestColumnsIfNeeded = useCallback(
+    (uniqueId: string) => {
+      if (!isInsidePlugin || !window.kotlinCallback) return;
+      const model = payload.models.find((m) => m.unique_id === uniqueId);
+      if (!model || model.columns.length > 0) return;
+      if (pendingColumns.has(uniqueId)) return;
+      setPendingColumns((prev) => {
+        const next = new Set(prev);
+        next.add(uniqueId);
+        return next;
+      });
+      window.kotlinCallback(
+        JSON.stringify({ event: "REQUEST_COLUMNS", unique_id: uniqueId }),
+      );
+    },
+    [payload.models, pendingColumns],
+  );
+
+  const toggleExpanded = useCallback(
+    (uniqueId: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(uniqueId)) {
+          next.delete(uniqueId);
+        } else {
+          next.add(uniqueId);
+          // Going from collapsed → expanded: trigger lazy column fetch.
+          // No-op if columns already populated or already fetching.
+          requestColumnsIfNeeded(uniqueId);
+        }
+        return next;
+      });
+    },
+    [requestColumnsIfNeeded],
+  );
 
   const onColumnClick = useCallback((uniqueId: string, column: string) => {
     setSelectedColumn((prev) =>
@@ -353,6 +416,7 @@ function App() {
         folder: m.folder,
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
+        columnsPending: pendingColumns.has(m.unique_id),
         highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
         onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
@@ -378,6 +442,7 @@ function App() {
   }, [
     payload,
     expanded,
+    pendingColumns,
     lineageTrace,
     modelTrace,
     selectedColumn,
@@ -736,7 +801,9 @@ function WarningBanner({ theme, message }: { theme: Theme; message: string }) {
       }}
     >
       <span aria-hidden style={{ fontWeight: 700, marginTop: 1 }}>⚠</span>
-      <span>{message}</span>
+      <span style={{ whiteSpace: "pre-line", fontFamily: "inherit" }}>
+        {message}
+      </span>
     </div>
   );
 }

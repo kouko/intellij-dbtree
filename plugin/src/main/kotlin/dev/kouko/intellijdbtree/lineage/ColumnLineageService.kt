@@ -8,6 +8,7 @@ import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import dev.kouko.intellijdbtree.sidecar.SidecarExtractor
 import kotlinx.serialization.json.Json
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * IDE-side wrapper that runs the bundled Python sidecar
@@ -28,6 +29,14 @@ class ColumnLineageService(private val project: Project) {
 
     private val log = Logger.getInstance(ColumnLineageService::class.java)
     private val sidecarJson = Json { ignoreUnknownKeys = true }
+
+    /**
+     * Memo of sqlglot-derived column lists per model uid. Populated lazily
+     * by [listColumnsViaSidecar] and consulted before spawning Python.
+     * Cleared by [invalidateColumnListCache] on manifest reload so changes
+     * to compiled SQL are picked up.
+     */
+    private val columnListCache = ConcurrentHashMap<String, List<String>>()
 
     sealed interface Result {
         data class Ok(val edges: List<ColumnEdge>) : Result
@@ -73,6 +82,51 @@ class ColumnLineageService(private val project: Project) {
 
         log.info("ColumnLineageService: traced $modelUid.$column via $source ($python) -> ${edges.size} edges")
         return Result.Ok(edges)
+    }
+
+    /**
+     * Parse the model's compiled SQL via sqlglot and return its output column
+     * names. Used to populate cards for models whose schema.yml docs don't
+     * list columns and whose project lacks a `target/catalog.json`.
+     *
+     * Caches by `modelUid` indefinitely (until [invalidateColumnListCache]).
+     * Returns `null` when no usable Python interpreter can be resolved or the
+     * sidecar fails — callers should treat this as "leave columns empty",
+     * the warning banner will already explain how to fix it.
+     */
+    fun listColumnsViaSidecar(modelUid: String, manifest: ParsedManifest): List<String>? {
+        columnListCache[modelUid]?.let { return it }
+
+        val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
+        val python = (resolution as? PythonInterpreterResolver.Resolution.Ok)?.pythonPath
+            ?: run {
+                log.info("ColumnLineageService.listColumnsViaSidecar: ${(resolution as PythonInterpreterResolver.Resolution.None).reason}")
+                return null
+            }
+        val sidecarDir = try {
+            SidecarExtractor.ensureExtracted()
+        } catch (e: Exception) {
+            log.warn("ColumnLineageService.listColumnsViaSidecar: failed to extract sidecar", e)
+            return null
+        }
+
+        val cmd = sidecarCommand(python, sidecarDir.toString(), manifest.dbtProjectDir.toString(), modelUid).apply {
+            addParameter("--list-columns")
+        }
+        val result = runSidecar(cmd, "$modelUid (list-columns)", ListColumnsResult.serializer())
+            ?: return null
+
+        // sqlglot returns ["*"] when SELECT * can't be expanded; treat that
+        // as "no columns" rather than rendering a literal "*" entry.
+        val cols = result.columns.filter { it != "*" }
+        columnListCache[modelUid] = cols
+        log.info("ColumnLineageService.listColumnsViaSidecar: $modelUid -> ${cols.size} columns")
+        return cols
+    }
+
+    /** Drop cached column lists (call on manifest reload / refresh-from-disk). */
+    fun invalidateColumnListCache() {
+        columnListCache.clear()
     }
 
     private fun runSidecarSingle(

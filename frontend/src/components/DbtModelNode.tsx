@@ -13,6 +13,12 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   folder?: string;
   columns: ColumnSpec[];
   expanded: boolean;
+  /**
+   * True while the Kotlin side is computing this model's column list via
+   * the sqlglot sidecar. The expanded card shows a "Parsing SQL…" hint
+   * instead of an empty list.
+   */
+  columnsPending?: boolean;
   highlightedColumns: Set<string>;
   onLineagePath: boolean;
   isSelectedModel: boolean;
@@ -132,7 +138,19 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
         />
       </header>
 
-      {data.expanded && (
+      {data.expanded && data.columns.length === 0 && data.columnsPending && (
+        <div
+          style={{
+            padding: "8px 12px",
+            color: t.toolbarTextSubtle,
+            fontSize: 11,
+            fontStyle: "italic",
+          }}
+        >
+          Parsing SQL…
+        </div>
+      )}
+      {data.expanded && data.columns.length > 0 && (
         <ul style={{ listStyle: "none", margin: 0, padding: "4px 0" }}>
           {data.columns.map((col) => {
             const highlighted = data.highlightedColumns.has(col.name);

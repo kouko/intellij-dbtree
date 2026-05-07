@@ -54,6 +54,12 @@ internal data class ColumnEntry(
     val error: String? = null,
 )
 
+@Serializable
+internal data class ListColumnsResult(
+    val columns: List<String> = emptyList(),
+    val error: String? = null,
+)
+
 // ---- Helpers ----------------------------------------------------------
 
 /**
