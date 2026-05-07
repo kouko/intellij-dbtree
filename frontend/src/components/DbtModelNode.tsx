@@ -117,7 +117,6 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
               flex: 1,
             }}
           >
-            <MaterializationBadge value={data.materialization} theme={t} />
             <span
               style={{
                 fontSize: 10,
@@ -140,6 +139,7 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
             >
               {chipText}
             </span>
+            <MaterializationBadge value={data.materialization} theme={t} />
           </div>
           <ChevronButton
             expanded={data.expanded}
