@@ -41,43 +41,27 @@ class ManifestService(private val project: Project) {
      * types. Safe to call from any thread; performs file I/O.
      */
     fun refresh(): RefreshResult {
-        val dbtProjectDir = DbtProjectDetector.findFirst(project)
-            ?: run {
+        val result = loadManifestFromDisk(
+            dbtProjectDir = DbtProjectDetector.findFirst(project),
+            onWarn = { msg, e -> log.warn(msg, e) },
+        )
+        when (result) {
+            is RefreshResult.Ok -> {
+                state.set(result.manifest)
+                log.info(
+                    "ManifestService: loaded ${result.manifest.modelCount()} models, " +
+                        "${result.manifest.sourceCount()} sources from " +
+                        "${result.manifest.dbtProjectDir.resolve("target").resolve("manifest.json")}" +
+                        (if (result.manifest.hasCatalog()) " (+ catalog.json)" else " (no catalog.json)"),
+                )
+            }
+            is RefreshResult.ParseError -> {
                 state.set(null)
-                return RefreshResult.NoDbtProject
+                log.warn("ManifestService: failed to parse ${result.path}", result.cause)
             }
-        val targetDir = dbtProjectDir.resolve("target")
-        val manifestPath = targetDir.resolve("manifest.json")
-        if (!Files.isRegularFile(manifestPath)) {
-            state.set(null)
-            return RefreshResult.NoManifest(manifestPath)
+            else -> state.set(null)
         }
-        return try {
-            val manifestJson = JsonParser.parseString(Files.readString(manifestPath)).asJsonObject
-            val catalogPath = targetDir.resolve("catalog.json")
-            val catalogJson = if (Files.isRegularFile(catalogPath)) {
-                try {
-                    JsonParser.parseString(Files.readString(catalogPath)).asJsonObject
-                } catch (e: Exception) {
-                    log.warn("ManifestService: failed to parse $catalogPath, ignoring", e)
-                    null
-                }
-            } else {
-                null
-            }
-            val parsed = ParsedManifest(manifestJson, catalogJson, dbtProjectDir)
-            state.set(parsed)
-            log.info(
-                "ManifestService: loaded ${parsed.modelCount()} models, " +
-                    "${parsed.sourceCount()} sources from $manifestPath" +
-                    (if (catalogJson != null) " (+ catalog.json)" else " (no catalog.json)"),
-            )
-            RefreshResult.Ok(parsed)
-        } catch (e: Exception) {
-            log.warn("ManifestService: failed to parse $manifestPath", e)
-            state.set(null)
-            RefreshResult.ParseError(manifestPath, e)
-        }
+        return result
     }
 
     /**
@@ -122,6 +106,49 @@ class ManifestService(private val project: Project) {
 }
 
 /**
+ * Pure file-I/O half of [ManifestService.refresh]: given a candidate dbt
+ * project directory (already resolved by the caller via [DbtProjectDetector]
+ * or otherwise), read `target/manifest.json` and optionally `target/catalog.json`
+ * and return the matching [ManifestService.RefreshResult].
+ *
+ * No state mutation, no IDE coupling — extracted so the four RefreshResult
+ * branches can be exercised by `@TempDir`-based unit tests.
+ *
+ * @param dbtProjectDir result of project detection; null = no dbt project found
+ * @param onWarn        called for non-fatal parse failures (currently:
+ *                      catalog.json present but unparseable). Defaults to
+ *                      no-op for tests; production passes a Logger.warn binding.
+ */
+internal fun loadManifestFromDisk(
+    dbtProjectDir: Path?,
+    onWarn: (String, Throwable) -> Unit = { _, _ -> },
+): ManifestService.RefreshResult {
+    if (dbtProjectDir == null) return ManifestService.RefreshResult.NoDbtProject
+    val targetDir = dbtProjectDir.resolve("target")
+    val manifestPath = targetDir.resolve("manifest.json")
+    if (!Files.isRegularFile(manifestPath)) {
+        return ManifestService.RefreshResult.NoManifest(manifestPath)
+    }
+    return try {
+        val manifestJson = JsonParser.parseString(Files.readString(manifestPath)).asJsonObject
+        val catalogPath = targetDir.resolve("catalog.json")
+        val catalogJson = if (Files.isRegularFile(catalogPath)) {
+            try {
+                JsonParser.parseString(Files.readString(catalogPath)).asJsonObject
+            } catch (e: Exception) {
+                onWarn("ManifestService: failed to parse $catalogPath, ignoring", e)
+                null
+            }
+        } else {
+            null
+        }
+        ManifestService.RefreshResult.Ok(ParsedManifest(manifestJson, catalogJson, dbtProjectDir))
+    } catch (e: Exception) {
+        ManifestService.RefreshResult.ParseError(manifestPath, e)
+    }
+}
+
+/**
  * Cached, read-only view over a parsed manifest.json. Thread-safe to
  * read concurrently; never mutated after construction.
  */
@@ -136,6 +163,8 @@ class ParsedManifest(
     private val parentMap: JsonObject = raw.getAsJsonObject("parent_map") ?: JsonObject()
     private val catalogNodes: JsonObject = catalog?.getAsJsonObject("nodes") ?: JsonObject()
     private val catalogSources: JsonObject = catalog?.getAsJsonObject("sources") ?: JsonObject()
+
+    fun hasCatalog(): Boolean = catalog != null
 
     /** Map: absolute filesystem path of a model file → model unique_id. */
     private val pathToModelId: Map<String, String> = buildMap {
