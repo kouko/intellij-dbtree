@@ -68,3 +68,33 @@ jobs:
             plugin/build/distributions/*.zip \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+      # Regenerate the custom-plugin-repository XML so it points at the
+      # zip we just published. This is the file users reference from
+      # JetBrains IDE → Settings → Plugins → ⚙ → Manage Plugin
+      # Repositories…, served by GitHub Pages from main/docs/.
+      #
+      # We commit back to main directly. The push uses the default
+      # GITHUB_TOKEN which deliberately won't trigger another workflow
+      # run, so this doesn't loop. The build workflow has a different
+      # path (PR + push to main paths) and treats this as a normal
+      # source update.
+      - name: Update custom plugin repository XML
+        working-directory: ${{ github.workspace }}
+        run: ./scripts/update-plugin-repo.sh "$GITHUB_REF_NAME"
+
+      - name: Commit and push updatePlugins.xml back to main
+        working-directory: ${{ github.workspace }}
+        run: |
+          if git diff --quiet docs/updatePlugins.xml; then
+            echo "updatePlugins.xml unchanged — nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          ./scripts/update-plugin-repo.sh "$GITHUB_REF_NAME"
+          git add docs/updatePlugins.xml
+          git commit -m "chore: update plugin repository XML for $GITHUB_REF_NAME [skip ci]"
+          git push origin main
