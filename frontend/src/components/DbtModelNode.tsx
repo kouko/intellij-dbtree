@@ -11,6 +11,8 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   layer?: ModelLayer;
   /** Raw folder name shown on the chip; falls back to [layer]. */
   folder?: string;
+  /** dbt materialization (table / view / incremental / …); drives type badge. */
+  materialization?: string;
   columns: ColumnSpec[];
   expanded: boolean;
   /**
@@ -103,30 +105,42 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
             alignItems: "center",
             justifyContent: "space-between",
             gap: 8,
+            minWidth: 0,
           }}
         >
-          <span
+          <div
             style={{
-              fontSize: 10,
-              fontWeight: 600,
-              color: "white",
-              background: colors.chip,
-              padding: "1px 6px",
-              borderRadius: 4,
-              textTransform: "uppercase",
-              letterSpacing: 0.4,
-              // Defensive ceiling: an absurdly long folder (>30 chars) gets
-              // ellipsised rather than overflowing the card. Real-world
-              // folders top out around 22 chars (`export_to_googlesheets`).
-              maxWidth: "100%",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              minWidth: 0,
+              flex: 1,
             }}
-            title={chipText}
           >
-            {chipText}
-          </span>
+            <span
+              style={{
+                fontSize: 10,
+                fontWeight: 600,
+                color: "white",
+                background: colors.chip,
+                padding: "1px 6px",
+                borderRadius: 4,
+                textTransform: "uppercase",
+                letterSpacing: 0.4,
+                // Defensive ceiling: an absurdly long folder (>30 chars) gets
+                // ellipsised rather than overflowing the card. Real-world
+                // folders top out around 22 chars (`export_to_googlesheets`).
+                maxWidth: "100%",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+              }}
+              title={chipText}
+            >
+              {chipText}
+            </span>
+            <MaterializationBadge value={data.materialization} theme={t} />
+          </div>
           <ChevronButton
             expanded={data.expanded}
             columnCount={data.columns.length}
@@ -200,6 +214,65 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
         </ul>
       )}
     </div>
+  );
+}
+
+/**
+ * Map a dbt materialization string to its user-facing single-letter label.
+ * Returning null suppresses the badge entirely (sources, missing config,
+ * unknown custom-adapter materializations).
+ *
+ * Centralised here so the wire format can carry whatever string dbt emits,
+ * while the UI controls which ones are worth a badge slot. Add new entries
+ * as new materializations become common in the wild.
+ */
+export function materializationLetter(value: string | undefined): string | null {
+  switch (value) {
+    case "table":
+      return "T";
+    case "view":
+      return "V";
+    case "incremental":
+      return "I";
+    case "ephemeral":
+      return "E";
+    case "materialized_view":
+      return "MV";
+    default:
+      return null;
+  }
+}
+
+function MaterializationBadge({
+  value,
+  theme,
+}: {
+  value: string | undefined;
+  theme: Theme;
+}) {
+  const letter = materializationLetter(value);
+  if (letter === null) return null;
+  // Outlined pill in theme-neutral colors so it reads as secondary metadata
+  // and doesn't compete visually with the colourful folder chip.
+  return (
+    <span
+      title={`Materialization: ${value}`}
+      style={{
+        fontSize: 10,
+        fontWeight: 700,
+        color: theme.toolbarText,
+        background: "transparent",
+        border: `1px solid ${theme.toolbarTextSubtle}`,
+        padding: "0 4px",
+        borderRadius: 3,
+        letterSpacing: 0.3,
+        flexShrink: 0,
+        lineHeight: 1.4,
+        fontVariant: "tabular-nums",
+      }}
+    >
+      {letter}
+    </span>
   );
 }
 

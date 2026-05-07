@@ -414,6 +414,7 @@ function App() {
         package_name: m.package_name,
         layer: m.layer,
         folder: m.folder,
+        materialization: m.materialization,
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
         columnsPending: pendingColumns.has(m.unique_id),

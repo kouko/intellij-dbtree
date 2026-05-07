@@ -1029,6 +1029,108 @@ class ParsedManifestTest {
         }
     }
 
+    @Nested
+    inner class MaterializationTests {
+
+        @Test
+        fun `table materialization is extracted from config`() {
+            assertEquals("table", materializationFor("""{"materialized": "table"}"""))
+        }
+
+        @Test
+        fun `view materialization is extracted from config`() {
+            assertEquals("view", materializationFor("""{"materialized": "view"}"""))
+        }
+
+        @Test
+        fun `incremental materialization is extracted from config`() {
+            assertEquals("incremental", materializationFor("""{"materialized": "incremental"}"""))
+        }
+
+        @Test
+        fun `unknown materialization values pass through verbatim`() {
+            // We don't enumerate dbt's full materialization vocabulary in
+            // Kotlin; the frontend's letter-badge map decides which strings
+            // to render. Strings like "ephemeral" / "materialized_view" /
+            // some custom adapter materialization must reach the React side
+            // unchanged.
+            assertEquals("materialized_view", materializationFor("""{"materialized": "materialized_view"}"""))
+            assertEquals("ephemeral", materializationFor("""{"materialized": "ephemeral"}"""))
+        }
+
+        @Test
+        fun `model with no config object yields null materialization`() {
+            // Defensive: older / partial manifests may lack config entirely.
+            // The frontend treats null as "skip the badge" rather than a
+            // mystery dash, so this test locks the null-vs-empty contract.
+            assertNull(materializationFor(configJson = null))
+        }
+
+        @Test
+        fun `config without materialized key yields null materialization`() {
+            // dbt always emits `materialized` for models, but we still want
+            // to be defensive in case a future/older schema differs.
+            assertNull(materializationFor("""{"some_other_key": "value"}"""))
+        }
+
+        @Test
+        fun `config that is a string instead of object yields null (no crash)`() {
+            // Pathological — we don't expect this from real dbt, but Gson
+            // would throw ClassCastException on .asJsonObject. The extractor
+            // must defend against that.
+            assertNull(materializationFor("\"oops_string\""))
+        }
+
+        @Test
+        fun `sources never get a materialization regardless of payload shape`() {
+            // Sources are warehouse inputs; rendering "T"/"V"/"I" on a
+            // source card would be misleading. Locked to null.
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {},
+                  "sources": {
+                    "source.demo.app.users": ${source("users")}
+                  },
+                  "child_map": {},
+                  "parent_map": {}
+                }
+                """.trimIndent(),
+            )
+            val src = manifest.buildLineage(seed = null).models.single { it.uniqueId.startsWith("source.") }
+            assertNull(src.materialization, "sources must always have null materialization")
+        }
+
+        /**
+         * Build a one-model manifest where the model node optionally carries
+         * a `config` field with [configJson] verbatim, then return the
+         * extracted materialization value (or null).
+         */
+        private fun materializationFor(configJson: String?): String? {
+            val configField = if (configJson != null) ""","config": $configJson""" else ""
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.x": {
+                      "resource_type": "model",
+                      "name": "x",
+                      "package_name": "demo",
+                      "path": "marts/x.sql",
+                      "original_file_path": "models/marts/x.sql"
+                      $configField
+                    }
+                  },
+                  "sources": {},
+                  "child_map": {},
+                  "parent_map": {}
+                }
+                """.trimIndent(),
+            )
+            return manifest.buildLineage(seed = "model.demo.x").models.single().materialization
+        }
+    }
+
     // ---- helpers --------------------------------------------------------
 
     private fun parseManifest(

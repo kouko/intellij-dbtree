@@ -36,6 +36,17 @@ data class DbtModel(
      * when [layer] collapses to one of the four canonical buckets.
      */
     val folder: String? = null,
+    /**
+     * dbt materialization strategy from `config.materialized` —
+     * "table" | "view" | "incremental" | "ephemeral" | "materialized_view"
+     * | other. Null for sources (no materialization concept) and for
+     * models whose manifest entry omits config.
+     *
+     * Rendered as a small T / V / I letter badge on the model card so
+     * the user can spot expensive (table / incremental) vs cheap (view)
+     * objects at a glance.
+     */
+    val materialization: String? = null,
     val columns: List<ColumnSpec> = emptyList(),
 )
 
