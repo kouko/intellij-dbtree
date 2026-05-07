@@ -67,18 +67,24 @@ class PythonInterpreterResolverTest {
         }
 
         @Test
-        fun `all candidates failing validate yields None mentioning sqlglot`() {
+        fun `all candidates failing yields None with copy-pasteable install command`() {
+            // The install command should pin to the FIRST candidate's path so
+            // running it actually installs into the env we're tracing — not
+            // some other env on the user's PATH. This is the regression: the
+            // earlier message just said `pip install sqlglot`, which often
+            // hit a different env and confused users.
             val res = PythonInterpreterResolver.runChain(
                 listOf(
-                    PythonInterpreterResolver.Source.Manual to "/manual",
-                    PythonInterpreterResolver.Source.ProjectVenv to "/venv",
+                    PythonInterpreterResolver.Source.Manual to "/manual/python",
+                    PythonInterpreterResolver.Source.ProjectVenv to "/venv/python",
                 ),
                 validate = { false },
             )
             assertIs<PythonInterpreterResolver.Resolution.None>(res)
             assert("sqlglot" in res.reason)
-            assert("Manual: /manual" in res.reason)
-            assert("ProjectVenv: /venv" in res.reason)
+            assert("/manual/python" in res.reason)
+            // The exact pip install command must include the python path
+            assert("/manual/python -m pip install sqlglot" in res.reason)
         }
 
         @Test

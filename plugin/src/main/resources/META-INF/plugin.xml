@@ -14,6 +14,11 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.1.3</h3>
+        <ul>
+            <li><b>Lazy column extraction from compiled SQL.</b> Models without yml docs or <code>catalog.json</code> now show columns on demand: expand a card → dbtree spawns the bundled Python sidecar to parse the compiled SQL via sqlglot → columns appear (~1s). Extracts from explicit <code>SELECT</code> lists; <code>SELECT *</code> still requires <code>catalog.json</code> for source schema.</li>
+            <li><b>Better Python-missing warning.</b> When the resolved Python interpreter lacks <code>sqlglot</code>, the toolbar warning now includes a copy-pasteable, path-pinned install command (e.g. <code>/path/to/python -m pip install sqlglot</code>) instead of generic instructions.</li>
+        </ul>
         <h3>0.1.2</h3>
         <ul>
             <li><b>Fix: white-screen crash</b> on dbt projects with non-canonical folder layouts (e.g. <code>marts_msd/</code>, <code>dash/</code>, <code>ads_data/</code>). The frontend now defensively falls back to a default color when an unknown layer arrives.</li>

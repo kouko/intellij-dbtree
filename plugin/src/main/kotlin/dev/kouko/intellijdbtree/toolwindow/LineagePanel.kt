@@ -19,6 +19,7 @@ import com.intellij.ui.jcef.JBCefBrowserBuilder
 import com.intellij.ui.jcef.JBCefJSQuery
 import dev.kouko.intellijdbtree.jcef.CefLocalRequestHandler
 import dev.kouko.intellijdbtree.jcef.CefStreamResourceHandler
+import dev.kouko.intellijdbtree.lineage.ColumnSpec
 import dev.kouko.intellijdbtree.lineage.LineageInfoListener
 import dev.kouko.intellijdbtree.lineage.LineageInfoService
 import dev.kouko.intellijdbtree.lineage.LineageJson
@@ -172,6 +173,10 @@ class LineagePanel(private val project: Project) : Disposable {
                 override fun selectedModelChanged(uniqueId: String) {
                     if (pageReady.get()) pushSelected(uniqueId)
                 }
+
+                override fun modelColumnsUpdated(uniqueId: String, columns: List<ColumnSpec>) {
+                    if (pageReady.get()) pushModelColumns(uniqueId, columns)
+                }
             },
         )
     }
@@ -210,6 +215,19 @@ class LineagePanel(private val project: Project) : Disposable {
     private fun pushSelected(uniqueId: String) {
         val browser = this.browser ?: return
         val script = "window.setSelectedModel && window.setSelectedModel(${jsStringLiteral(uniqueId)});"
+        SwingUtilities.invokeLater {
+            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+        }
+    }
+
+    private fun pushModelColumns(uniqueId: String, columns: List<ColumnSpec>) {
+        val browser = this.browser ?: return
+        val json = LineageJson.encodeToString(
+            kotlinx.serialization.builtins.ListSerializer(ColumnSpec.serializer()),
+            columns,
+        )
+        val script = "window.applyModelColumns && window.applyModelColumns(" +
+            "${jsStringLiteral(uniqueId)}, JSON.parse(${jsStringLiteral(json)}));"
         SwingUtilities.invokeLater {
             browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
         }
@@ -270,6 +288,7 @@ class LineagePanel(private val project: Project) : Disposable {
             "HOP_CHANGE" -> handleHopChange(event.upHops, event.downHops)
             "REFRESH" -> project.service<LineageInfoService>().refreshFromDisk()
             "COLUMN_CLICK" -> handleColumnClick(event.uniqueId, event.column)
+            "REQUEST_COLUMNS" -> handleRequestColumns(event.uniqueId)
             else -> log.info("Unhandled JS event: ${event.event}")
         }
     }
@@ -302,6 +321,11 @@ class LineagePanel(private val project: Project) : Disposable {
     private fun handleHopChange(upHops: Int?, downHops: Int?) {
         if (upHops == null || downHops == null) return
         project.service<LineageInfoService>().setHops(upHops, downHops)
+    }
+
+    private fun handleRequestColumns(uniqueId: String?) {
+        if (uniqueId.isNullOrBlank()) return
+        project.service<LineageInfoService>().onRequestColumns(uniqueId)
     }
 
     // ---- Disposable ---------------------------------------------------------------

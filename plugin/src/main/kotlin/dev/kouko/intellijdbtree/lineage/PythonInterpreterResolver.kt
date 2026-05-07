@@ -99,10 +99,15 @@ internal object PythonInterpreterResolver {
             }
         }
 
-        val pathList = candidates.joinToString(", ") { (s, p) -> "$s: $p" }
+        // Suggest the install command for the highest-priority candidate.
+        // Using the path-specific form (`<python> -m pip install sqlglot`)
+        // pins the install to the environment we just tried, avoiding the
+        // common "I ran `pip install sqlglot` and it still doesn't work"
+        // confusion when the shell `pip` points at a different env.
+        val (firstSource, firstPath) = candidates.first()
         return Resolution.None(
-            "Found Python interpreters but none have `sqlglot` installed. " +
-                "Tried: $pathList. Install with `pip install sqlglot` in the chosen environment.",
+            "Python interpreter found at $firstPath ($firstSource), but it lacks the `sqlglot` package. " +
+                "Install it with:\n  $firstPath -m pip install sqlglot\nAfter installing, click ↻ to refresh.",
         )
     }
 
