@@ -21,9 +21,23 @@ Visualize [dbt](https://www.getdbt.com/) model lineage inside JetBrains IDEs wit
 
 ## Install
 
+### Option A — Custom plugin repository (recommended)
+
+Add this URL to your IDE so dbtree installs and **auto-updates** like a Marketplace plugin (and syncs across machines via JetBrains Settings Sync):
+
+```
+https://kouko.github.io/intellij-dbtree/updatePlugins.xml
+```
+
+**Settings → Plugins → ⚙ → Manage Plugin Repositories…** → add the URL above → search "dbtree" → Install → Restart.
+
+### Option B — Manual zip install
+
 Download the latest `dbtree-<version>.zip` from the [Releases](https://github.com/kouko/intellij-dbtree/releases) page, then in your IDE:
 
 **Settings → Plugins → ⚙ → Install Plugin from Disk…** → pick the zip → Restart.
+
+Note: zip-installed plugins are **not** synced by JetBrains Settings Sync — use Option A if you want the plugin to follow you across machines.
 
 ## Usage
 
