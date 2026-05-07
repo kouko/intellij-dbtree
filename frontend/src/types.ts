@@ -33,6 +33,14 @@ export interface DbtModel {
    * buckets. Falls back to [layer] when absent (older Kotlin payloads).
    */
   folder?: string;
+  /**
+   * dbt materialization strategy from `config.materialized`:
+   * "table" | "view" | "incremental" | "ephemeral" | "materialized_view"
+   * | (custom adapter materialization). Rendered as a small T/V/I letter
+   * badge on the card; null/unknown values render no badge. Sources
+   * never carry this (no materialization concept).
+   */
+  materialization?: string;
   columns: ColumnSpec[];
 }
 

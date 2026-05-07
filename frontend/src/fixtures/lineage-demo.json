@@ -29,6 +29,7 @@
       "name": "stg_orders",
       "package_name": "demo",
       "layer": "staging",
+      "materialization": "view",
       "columns": [
         { "name": "id", "type": "BIGINT" },
         { "name": "customer_id", "type": "BIGINT" },
@@ -41,6 +42,7 @@
       "name": "dim_customers",
       "package_name": "demo",
       "layer": "marts",
+      "materialization": "table",
       "columns": [
         { "name": "customer_id", "type": "BIGINT" },
         { "name": "customer_name", "type": "VARCHAR" },
@@ -52,6 +54,7 @@
       "name": "fct_orders",
       "package_name": "demo",
       "layer": "marts",
+      "materialization": "incremental",
       "columns": [
         { "name": "id", "type": "BIGINT" },
         { "name": "customer_name", "type": "VARCHAR" },
@@ -64,6 +67,7 @@
       "name": "mart_customer_summary",
       "package_name": "demo",
       "layer": "marts",
+      "materialization": "table",
       "columns": [
         { "name": "customer_id", "type": "BIGINT" },
         { "name": "customer_name", "type": "VARCHAR" },
@@ -77,6 +81,7 @@
       "package_name": "demo",
       "layer": "marts",
       "folder": "export_to_googlesheets",
+      "materialization": "view",
       "columns": [
         { "name": "customer_id", "type": "BIGINT" },
         { "name": "customer_name", "type": "VARCHAR" },

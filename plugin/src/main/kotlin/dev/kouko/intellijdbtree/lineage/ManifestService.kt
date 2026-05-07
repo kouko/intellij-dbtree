@@ -364,6 +364,8 @@ class ParsedManifest(
                 packageName = s.string("package_name") ?: "",
                 layer = "source",
                 folder = "source",
+                // Sources are warehouse inputs, not dbt-materialised objects.
+                materialization = null,
                 columns = mergedColumns(uid, s, fromSources = true),
             )
         }
@@ -375,8 +377,21 @@ class ParsedManifest(
             packageName = n.string("package_name") ?: "",
             layer = inferLayer(n),
             folder = inferFolder(n),
+            materialization = extractMaterialization(n),
             columns = mergedColumns(uid, n, fromSources = false),
         )
+    }
+
+    /**
+     * Read `config.materialized` from a model node. Returns null if the
+     * field is absent or the config object isn't shaped as expected — the
+     * frontend treats null as "don't render the type badge", which is the
+     * safe fallback for unparseable / older manifests.
+     */
+    private fun extractMaterialization(n: JsonObject): String? {
+        val configEl = n.get("config") ?: return null
+        if (!configEl.isJsonObject) return null
+        return configEl.asJsonObject.string("materialized")
     }
 
     /**
