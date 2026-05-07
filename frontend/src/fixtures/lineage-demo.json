@@ -70,6 +70,18 @@
         { "name": "total_revenue", "type": "NUMERIC(18,2)" },
         { "name": "order_count", "type": "BIGINT" }
       ]
+    },
+    {
+      "unique_id": "model.demo.gsheets_customer_summary",
+      "name": "gsheets_customer_summary",
+      "package_name": "demo",
+      "layer": "marts",
+      "folder": "export_to_googlesheets",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "customer_name", "type": "VARCHAR" },
+        { "name": "total_revenue", "type": "NUMERIC(18,2)" }
+      ]
     }
   ],
   "model_edges": [
@@ -78,7 +90,8 @@
     { "source_unique_id": "model.demo.stg_orders",      "target_unique_id": "model.demo.fct_orders" },
     { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.fct_orders" },
     { "source_unique_id": "model.demo.fct_orders",      "target_unique_id": "model.demo.mart_customer_summary" },
-    { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.mart_customer_summary" }
+    { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.mart_customer_summary" },
+    { "source_unique_id": "model.demo.mart_customer_summary", "target_unique_id": "model.demo.gsheets_customer_summary" }
   ],
   "column_edges": [
     { "source_unique_id": "source.demo.raw.orders",    "source_column": "id",          "target_unique_id": "model.demo.stg_orders", "target_column": "id" },

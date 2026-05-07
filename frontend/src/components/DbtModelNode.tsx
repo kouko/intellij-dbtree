@@ -86,18 +86,23 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
           padding: "8px 12px",
           borderBottom: data.expanded ? `1px solid ${colors.border}` : "none",
           display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          gap: 8,
+          flexDirection: "column",
+          gap: 4,
         }}
       >
+        {/*
+          Top row: chip + chevron. Stacking the chip ABOVE the model name
+          (instead of inline beside it) gives the name the full card width
+          for wrapping. Long folder labels like `export_to_googlesheets`
+          would otherwise eat ~150px of horizontal budget and squeeze the
+          name into a 2-3 line stack of fragments.
+        */}
         <div
           style={{
             display: "flex",
             alignItems: "center",
-            gap: 6,
-            minWidth: 0,
-            flex: 1,
+            justifyContent: "space-between",
+            gap: 8,
           }}
         >
           <span
@@ -110,32 +115,39 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
               borderRadius: 4,
               textTransform: "uppercase",
               letterSpacing: 0.4,
-              flexShrink: 0,
+              // Defensive ceiling: an absurdly long folder (>30 chars) gets
+              // ellipsised rather than overflowing the card. Real-world
+              // folders top out around 22 chars (`export_to_googlesheets`).
+              maxWidth: "100%",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
             }}
+            title={chipText}
           >
             {chipText}
           </span>
-          <span
-            style={{
-              fontWeight: 600,
-              color: colors.text,
-              wordBreak: "break-word",
-              lineHeight: 1.3,
-              minWidth: 0,
+          <ChevronButton
+            expanded={data.expanded}
+            columnCount={data.columns.length}
+            theme={t}
+            onClick={(e) => {
+              e.stopPropagation();
+              data.onToggleExpanded(data.unique_id);
             }}
-          >
-            {data.name}
-          </span>
+          />
         </div>
-        <ChevronButton
-          expanded={data.expanded}
-          columnCount={data.columns.length}
-          theme={t}
-          onClick={(e) => {
-            e.stopPropagation();
-            data.onToggleExpanded(data.unique_id);
+        {/* Bottom row: full-width model name. */}
+        <span
+          style={{
+            fontWeight: 600,
+            color: colors.text,
+            wordBreak: "break-word",
+            lineHeight: 1.3,
           }}
-        />
+        >
+          {data.name}
+        </span>
       </header>
 
       {data.expanded && data.columns.length === 0 && data.columnsPending && (
