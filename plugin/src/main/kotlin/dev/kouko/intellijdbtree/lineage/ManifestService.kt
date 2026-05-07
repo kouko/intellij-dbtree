@@ -315,6 +315,7 @@ class ParsedManifest(
                 name = s.string("name") ?: uid.substringAfterLast('.'),
                 packageName = s.string("package_name") ?: "",
                 layer = "source",
+                folder = "source",
                 columns = mergedColumns(uid, s, fromSources = true),
             )
         }
@@ -325,8 +326,19 @@ class ParsedManifest(
             name = n.string("name") ?: uid.substringAfterLast('.'),
             packageName = n.string("package_name") ?: "",
             layer = inferLayer(n),
+            folder = inferFolder(n),
             columns = mergedColumns(uid, n, fromSources = false),
         )
+    }
+
+    /**
+     * The raw first path segment, shown verbatim on the model card chip.
+     * Differs from [inferLayer] which collapses to a canonical color bucket;
+     * this preserves namespaces like `marts_msd` / `dash` / `ads_data`.
+     */
+    private fun inferFolder(n: JsonObject): String? {
+        val path = n.string("path") ?: return null
+        return path.substringBefore('/').takeIf { it.isNotEmpty() }
     }
 
     private fun inferLayer(n: JsonObject): String? {
@@ -336,8 +348,15 @@ class ParsedManifest(
         return when {
             firstSegment.startsWith("stg") || firstSegment == "staging" -> "staging"
             firstSegment.startsWith("int") || firstSegment == "intermediate" -> "intermediate"
-            firstSegment == "marts" || firstSegment == "mart" || firstSegment == "models" -> "marts"
-            else -> firstSegment.takeIf { it.isNotEmpty() }
+            // `mart`, `marts`, `marts_msd`, `marts_qlr` etc. all map to "marts".
+            // dbt projects often namespace marts (`marts_<team>` / `marts_<domain>`)
+            // and we want them all to share the same "marts" color tier.
+            firstSegment.startsWith("mart") || firstSegment == "models" -> "marts"
+            // Anything else returns null. The frontend's normalizeLayer falls
+            // back to "staging" for unknown values, but emitting a non-canonical
+            // string here would crash older frontends and gives the new one
+            // nothing useful to do anyway.
+            else -> null
         }
     }
 

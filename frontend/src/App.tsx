@@ -23,7 +23,7 @@ import {
   edgeKey,
   isEdgeOnModelTreePath,
 } from "./lib/lineage-trace";
-import { THEMES, detectInitialTheme, type Theme, type ThemeName } from "./lib/theme";
+import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
 const NODE_WIDTH = 280;
@@ -350,6 +350,7 @@ function App() {
         name: m.name,
         package_name: m.package_name,
         layer: m.layer,
+        folder: m.folder,
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
         highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
@@ -537,8 +538,7 @@ function App() {
               maskColor={theme.miniMapMask}
               nodeColor={(n) => {
                 const data = n.data as DbtModelNodeData | undefined;
-                const layer = data?.layer ?? "staging";
-                return theme.layers[layer].chip;
+                return theme.layers[normalizeLayer(data?.layer)].chip;
               }}
             />
             <Controls position="bottom-right" />
