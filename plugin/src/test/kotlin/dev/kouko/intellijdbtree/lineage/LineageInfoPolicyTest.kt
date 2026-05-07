@@ -2,9 +2,12 @@ package dev.kouko.intellijdbtree.lineage
 
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
+import java.nio.file.Path
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -85,6 +88,110 @@ class LineageInfoPolicyTest {
             val b = LineageInfoService.State(epoch = 7L, activeUid = "model.demo.orders", upHops = 1)
             assertFalse(isSuperseded(myEpoch = 7L, current = a))
             assertFalse(isSuperseded(myEpoch = 7L, current = b))
+        }
+    }
+
+    @Nested
+    inner class ManifestStatusWarningTests {
+
+        @Test
+        fun `Ok yields null — caller should publish a real payload`() {
+            val ok = ManifestService.RefreshResult.Ok(
+                ParsedManifestForTest.empty(),
+            )
+            assertNull(manifestStatusWarning(ok))
+        }
+
+        @Test
+        fun `NoDbtProject names the marker file the user must add`() {
+            val msg = manifestStatusWarning(ManifestService.RefreshResult.NoDbtProject)
+            assertNotNull(msg)
+            // Must mention dbt_project.yml so user knows what we're scanning for.
+            assertTrue("dbt_project.yml" in msg, "must point at the discovery marker, was: $msg")
+        }
+
+        @Test
+        fun `NoManifest names the path AND the dbt command that creates it`() {
+            // The #1 first-time confusion: "I installed the plugin but see nothing."
+            // The fix is almost always `dbt parse`. Spell that out.
+            val msg = manifestStatusWarning(
+                ManifestService.RefreshResult.NoManifest(Path.of("/repo/dbt/target/manifest.json")),
+            )
+            assertNotNull(msg)
+            assertTrue("manifest.json" in msg)
+            assertTrue("/repo/dbt/target/manifest.json" in msg, "must echo the path so user verifies which project")
+            assertTrue("dbt parse" in msg, "must tell the user the exact command to run")
+        }
+
+        @Test
+        fun `ParseError surfaces filename and points at idea_log for the cause`() {
+            // We deliberately don't dump the full stack trace into the toolbar
+            // banner — too noisy. idea.log already has the full Throwable from
+            // ManifestService.refresh. The toolbar gives just enough to know
+            // which file went bad and where to look for details.
+            val cause = RuntimeException("Unexpected EOF at line 42")
+            val msg = manifestStatusWarning(
+                ManifestService.RefreshResult.ParseError(
+                    Path.of("/repo/dbt/target/manifest.json"),
+                    cause,
+                ),
+            )
+            assertNotNull(msg)
+            assertTrue("manifest.json" in msg)
+            assertTrue("Unexpected EOF" in msg || cause::class.simpleName!! in msg)
+            assertTrue("idea.log" in msg, "must direct user to idea.log for the full trace")
+        }
+    }
+
+    @Nested
+    inner class IsManifestStatusEventTests {
+
+        @Test
+        fun `manifest_json under target matches`() {
+            assertTrue(isManifestStatusEvent("/repo/dbt/target/manifest.json"))
+            // Monorepo: dbt project lives in a subfolder.
+            assertTrue(isManifestStatusEvent("/repo/services/data/dbt/target/manifest.json"))
+        }
+
+        @Test
+        fun `catalog_json under target matches`() {
+            assertTrue(isManifestStatusEvent("/repo/dbt/target/catalog.json"))
+        }
+
+        @Test
+        fun `manifest_json outside target does NOT match`() {
+            // We only react to dbt's compile output, not arbitrary user files
+            // that happen to be named manifest.json (e.g. a Webpack manifest).
+            assertFalse(isManifestStatusEvent("/repo/dbt/manifest.json"))
+            assertFalse(isManifestStatusEvent("/repo/frontend/dist/manifest.json"))
+        }
+
+        @Test
+        fun `partial filename matches do NOT trip the predicate`() {
+            // Backups, partial writes, etc. shouldn't trigger a refresh.
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/manifest.json.bak"))
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/manifest.json.tmp"))
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/old_manifest.json"))
+        }
+
+        @Test
+        fun `other files in target do NOT match`() {
+            // dbt produces dozens of files in target/ — we only want the two
+            // that affect lineage rendering.
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/run_results.json"))
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/graph.gpickle"))
+            assertFalse(isManifestStatusEvent("/repo/dbt/target/compiled/foo.sql"))
+        }
+    }
+
+    private object ParsedManifestForTest {
+        fun empty(): ParsedManifest {
+            // Minimal valid ParsedManifest for the Ok branch test. The actual
+            // contents don't matter — manifestStatusWarning(Ok) just returns null.
+            val raw = com.google.gson.JsonParser.parseString(
+                """{"nodes":{},"sources":{},"child_map":{},"parent_map":{}}""",
+            ).asJsonObject
+            return ParsedManifest(raw, null, Path.of("/dbt"))
         }
     }
 }

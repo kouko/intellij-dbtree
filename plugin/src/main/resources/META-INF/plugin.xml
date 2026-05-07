@@ -64,5 +64,8 @@
         <listener
             class="dev.kouko.intellijdbtree.lineage.DbtFileEditorListener"
             topic="com.intellij.openapi.fileEditor.FileEditorManagerListener"/>
+        <listener
+            class="dev.kouko.intellijdbtree.lineage.DbtTargetFileListener"
+            topic="com.intellij.openapi.vfs.newvfs.BulkFileListener"/>
     </projectListeners>
 </idea-plugin>

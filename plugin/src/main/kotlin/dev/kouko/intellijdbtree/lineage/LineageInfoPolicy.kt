@@ -35,3 +35,29 @@ internal fun decideFocusEvent(uid: String, publishedUids: Set<String>): FocusDec
  */
 internal fun isSuperseded(myEpoch: Long, current: LineageInfoService.State): Boolean =
     myEpoch != current.epoch
+
+/**
+ * Translate a [ManifestService.RefreshResult] into the user-facing message
+ * the toolbar shows when the lineage panel can't render a graph. Returns
+ * null on success — the caller should publish an actual lineage payload
+ * in that case.
+ *
+ * Wording prioritizes "what should I do next?" over "what went wrong":
+ * - NoDbtProject → tell them what marker file we're looking for
+ * - NoManifest   → tell them which dbt command produces it (the most
+ *                  common cause is "I haven't run dbt parse yet")
+ * - ParseError   → point at idea.log because the cause is usually a dbt
+ *                  internal error or a bad manifest version
+ */
+internal fun manifestStatusWarning(result: ManifestService.RefreshResult): String? = when (result) {
+    is ManifestService.RefreshResult.Ok -> null
+    is ManifestService.RefreshResult.NoDbtProject ->
+        "No dbt project found in this IntelliJ project. Open a folder containing dbt_project.yml."
+    is ManifestService.RefreshResult.NoManifest ->
+        "manifest.json not found at ${result.path}. " +
+            "Run `dbt parse` (or `dbt run` / `dbt compile`) to generate it."
+    is ManifestService.RefreshResult.ParseError ->
+        "Failed to parse ${result.path.fileName}: " +
+            "${result.cause.message ?: result.cause::class.simpleName}. " +
+            "See idea.log for details."
+}

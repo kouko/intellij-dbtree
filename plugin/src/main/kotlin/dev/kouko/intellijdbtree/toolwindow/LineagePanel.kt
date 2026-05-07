@@ -198,7 +198,10 @@ class LineagePanel(private val project: Project) : Disposable {
             if (openFile != null) {
                 project.service<LineageInfoService>().onActiveFileChanged(openFile)
             } else {
-                project.service<ManifestService>().refresh()
+                // No active file at startup: route through refreshFromDisk so
+                // a missing/broken manifest publishes a status banner instead
+                // of silently warming the cache and leaving the panel blank.
+                project.service<LineageInfoService>().refreshFromDisk()
             }
         }
     }
