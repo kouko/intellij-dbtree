@@ -82,6 +82,7 @@ class LineageInfoService(private val project: Project) {
         if (file == null || file.extension != "sql") return
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (project.isDisposed) return@executeOnPooledThread
             val manifest = project.service<ManifestService>().ensureLoaded() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
@@ -115,6 +116,7 @@ class LineageInfoService(private val project: Project) {
         }
         val myEpoch = updated.epoch
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (project.isDisposed) return@executeOnPooledThread
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
@@ -126,6 +128,7 @@ class LineageInfoService(private val project: Project) {
     fun refreshFromDisk() {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (project.isDisposed) return@executeOnPooledThread
             project.service<ManifestService>().refresh()
             project.service<ColumnLineageService>().invalidateColumnListCache()
             val manifest = project.service<ManifestService>().ensureLoaded()
@@ -143,11 +146,13 @@ class LineageInfoService(private val project: Project) {
     fun onRequestColumns(modelUid: String) {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (project.isDisposed) return@executeOnPooledThread
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
             val names = project.service<ColumnLineageService>()
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
+            if (project.isDisposed) return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
@@ -162,6 +167,7 @@ class LineageInfoService(private val project: Project) {
     fun onColumnClicked(modelUid: String, column: String) {
         val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
+            if (project.isDisposed) return@executeOnPooledThread
             val manifest = project.service<ManifestService>().ensureLoaded()
                 ?: return@executeOnPooledThread
             val cur = state.get()
@@ -171,8 +177,10 @@ class LineageInfoService(private val project: Project) {
             val result = project.service<ColumnLineageService>()
                 .computeForColumn(modelUid, column, manifest)
 
-            // Sidecar takes ~1s — the user may have clicked another column or
-            // switched files in the meantime, so re-check epoch before publish.
+            // Sidecar takes ~1s — the user may have clicked another column,
+            // switched files, or closed the project in the meantime. Re-check
+            // both before publishing.
+            if (project.isDisposed) return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
 
             val (edges, warning) = when (result) {

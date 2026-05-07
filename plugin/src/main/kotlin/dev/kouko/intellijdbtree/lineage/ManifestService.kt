@@ -254,6 +254,12 @@ class ParsedManifest(
             parentMap.getAsJsonArray(node)?.forEach { p ->
                 val parent = p.asString
                 edges += ModelEdge(parent, node)
+                // Re-walk visited nodes when we still have hop budget: a node
+                // re-entered via a skip edge may now have MORE remaining than
+                // when we first reached it via a long path, letting us extend
+                // the visit into subtrees the first walk couldn't afford.
+                // Without this, hop-bounded queries miss nodes connected via
+                // shortcut refs (iCHEF has 126 such skip edges = 9.1% of total).
                 if (parent !in visited || remaining > 0) {
                     visited.add(parent)
                     walkUp(parent, remaining - 1)

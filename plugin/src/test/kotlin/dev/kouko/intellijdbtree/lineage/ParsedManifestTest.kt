@@ -214,6 +214,66 @@ class ParsedManifestTest {
         }
 
         @Test
+        fun `skip-edge re-entry preserves shortest-path reachability under hop budget`() {
+            // Regression guard: A→B→C→D→E plus a skip edge A→C. With downHops=3
+            // and seed=A, all 5 nodes should be visible because the skip edge
+            // A→C re-enters C with `remaining=2` (vs the long path's `remaining=1`),
+            // unlocking access to D→E within the hop budget.
+            //
+            // The behavior depends on the `|| remaining > 0` condition in walkDown.
+            // If a future "cleanup" removes that OR (treating it as dead code),
+            // this test will fail — and that's intentional. Removing the OR
+            // breaks ~10% of iCHEF lineage queries because dbt projects commonly
+            // mix shortcut refs into the dependency graph.
+            val skipEdgeChain = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.a": ${node("a", layerPath = "staging/a.sql")},
+                    "model.demo.b": ${node("b", layerPath = "intermediate/b.sql")},
+                    "model.demo.c": ${node("c", layerPath = "intermediate/c.sql")},
+                    "model.demo.d": ${node("d", layerPath = "marts/d.sql")},
+                    "model.demo.e": ${node("e", layerPath = "marts/e.sql")}
+                  },
+                  "sources": {},
+                  "child_map": {
+                    "model.demo.a": ["model.demo.b", "model.demo.c"],
+                    "model.demo.b": ["model.demo.c"],
+                    "model.demo.c": ["model.demo.d"],
+                    "model.demo.d": ["model.demo.e"],
+                    "model.demo.e": []
+                  },
+                  "parent_map": {
+                    "model.demo.a": [],
+                    "model.demo.b": ["model.demo.a"],
+                    "model.demo.c": ["model.demo.a", "model.demo.b"],
+                    "model.demo.d": ["model.demo.c"],
+                    "model.demo.e": ["model.demo.d"]
+                  }
+                }
+                """.trimIndent(),
+            )
+
+            val payload = skipEdgeChain.buildLineage(
+                seed = "model.demo.a",
+                upHops = 0,
+                downHops = 3,
+            )
+            val ids = payload.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf(
+                    "model.demo.a",
+                    "model.demo.b",
+                    "model.demo.c",
+                    "model.demo.d",
+                    "model.demo.e",
+                ),
+                ids,
+                "E must be reachable via the A→C shortcut despite the long path A→B→C→D exhausting budget first",
+            )
+        }
+
+        @Test
         fun `tests and seeds are filtered out of interesting nodes`() {
             val manifest = parseManifest(
                 """
@@ -257,6 +317,278 @@ class ParsedManifestTest {
             // since it doesn't exist in nodes/sources, it's filtered out.
             assertTrue(payload.models.isEmpty())
             assertNull(payload.selected, "non-existent seed yields no Selected")
+        }
+    }
+
+    /**
+     * Patterns observed in real production dbt projects (de-identified)
+     * that the synthetic chain/diamond fixtures don't exercise:
+     *
+     * - **Sub-component aggregation**: a parent intermediate that consumes
+     *   multiple sub-component intermediates AND the staging model directly
+     *   — the dominant skip-edge shape we saw in real manifests (~9% of
+     *   total edges).
+     * - **Utility fan-out**: a staging model (date series, dimension table)
+     *   ref'd directly by 5+ downstream models, some of which are also
+     *   reachable via sibling intermediates.
+     * - **Mart fan-in with upstream shortcut**: a mart whose ancestry
+     *   spans 3+ layers, with at least one staging model bypassing the
+     *   intermediate layer to ref the mart directly.
+     * - **Multi-level shortcut interaction with hop budget**: shortcuts
+     *   at different depths, exercised under varying upHops/downHops.
+     *
+     * These guard against regressions when "cleaning up" the BFS code:
+     * the dominant real-world manifest topology must keep working, not
+     * just textbook linear/diamond shapes.
+     */
+    @Nested
+    inner class RealisticDbtPatternTests {
+
+        @Test
+        fun `sub-component aggregation pattern preserves all 4 nodes from staging seed`() {
+            // Real shape (de-identified): a parent intermediate consumes
+            // sub-component intermediates AND its source staging directly,
+            // creating a 1-hop skip edge from staging to parent intermediate.
+            //
+            //   stg_listing
+            //   ├─→ int_listing__hours
+            //   │   └─→ int_listing       (long path)
+            //   ├─→ int_listing__phone
+            //   │   └─→ int_listing       (long path)
+            //   └─→ int_listing            (direct, skip edge)
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.stg_listing":          ${node("stg_listing", layerPath = "staging/stg_listing.sql")},
+                    "model.demo.int_listing__hours":   ${node("int_listing__hours", layerPath = "intermediate/int_listing__hours.sql")},
+                    "model.demo.int_listing__phone":   ${node("int_listing__phone", layerPath = "intermediate/int_listing__phone.sql")},
+                    "model.demo.int_listing":          ${node("int_listing", layerPath = "intermediate/int_listing.sql")}
+                  },
+                  "sources": {},
+                  "child_map": {
+                    "model.demo.stg_listing":        ["model.demo.int_listing__hours", "model.demo.int_listing__phone", "model.demo.int_listing"],
+                    "model.demo.int_listing__hours": ["model.demo.int_listing"],
+                    "model.demo.int_listing__phone": ["model.demo.int_listing"],
+                    "model.demo.int_listing":        []
+                  },
+                  "parent_map": {
+                    "model.demo.stg_listing":        [],
+                    "model.demo.int_listing__hours": ["model.demo.stg_listing"],
+                    "model.demo.int_listing__phone": ["model.demo.stg_listing"],
+                    "model.demo.int_listing":        ["model.demo.stg_listing", "model.demo.int_listing__hours", "model.demo.int_listing__phone"]
+                  }
+                }
+                """.trimIndent(),
+            )
+            val payload = manifest.buildLineage(
+                seed = "model.demo.stg_listing",
+                upHops = 0,
+                downHops = 2,
+            )
+            val ids = payload.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf(
+                    "model.demo.stg_listing",
+                    "model.demo.int_listing__hours",
+                    "model.demo.int_listing__phone",
+                    "model.demo.int_listing",
+                ),
+                ids,
+                "all 4 nodes must be visible — both sub-components AND the parent intermediate",
+            )
+            // The skip edge stg_listing → int_listing must be present alongside the
+            // long-path edges, because dbt's manifest records both as direct refs.
+            val edgePairs = payload.modelEdges.map { it.sourceUniqueId to it.targetUniqueId }.toSet()
+            assertTrue(
+                "model.demo.stg_listing" to "model.demo.int_listing" in edgePairs,
+                "the skip edge stg_listing → int_listing must be preserved as-is",
+            )
+            assertTrue(
+                "model.demo.int_listing__hours" to "model.demo.int_listing" in edgePairs,
+                "the long-path edge through int_listing__hours must also be preserved",
+            )
+        }
+
+        @Test
+        fun `utility fan-out with mixed direct and transitive descendants`() {
+            // Real shape: a "utility" staging model (e.g. date series, currency
+            // dimension) with many direct children, some of which are also
+            // reachable transitively via sibling intermediates.
+            //
+            //   stg_date_series
+            //   ├─→ int_daily_a
+            //   │   └─→ int_daily_b   (long path)
+            //   ├─→ int_daily_b       (direct, skip edge)
+            //   ├─→ int_daily_c
+            //   └─→ mart_daily        (direct from utility — typical: marts often
+            //                         ref date dimensions even when an int layer
+            //                         already provides date columns)
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.stg_date_series": ${node("stg_date_series", layerPath = "staging/stg_date_series.sql")},
+                    "model.demo.int_daily_a":     ${node("int_daily_a", layerPath = "intermediate/int_daily_a.sql")},
+                    "model.demo.int_daily_b":     ${node("int_daily_b", layerPath = "intermediate/int_daily_b.sql")},
+                    "model.demo.int_daily_c":     ${node("int_daily_c", layerPath = "intermediate/int_daily_c.sql")},
+                    "model.demo.mart_daily":      ${node("mart_daily", layerPath = "marts/mart_daily.sql")}
+                  },
+                  "sources": {},
+                  "child_map": {
+                    "model.demo.stg_date_series": ["model.demo.int_daily_a", "model.demo.int_daily_b", "model.demo.int_daily_c", "model.demo.mart_daily"],
+                    "model.demo.int_daily_a":     ["model.demo.int_daily_b"],
+                    "model.demo.int_daily_b":     [],
+                    "model.demo.int_daily_c":     [],
+                    "model.demo.mart_daily":      []
+                  },
+                  "parent_map": {
+                    "model.demo.stg_date_series": [],
+                    "model.demo.int_daily_a":     ["model.demo.stg_date_series"],
+                    "model.demo.int_daily_b":     ["model.demo.stg_date_series", "model.demo.int_daily_a"],
+                    "model.demo.int_daily_c":     ["model.demo.stg_date_series"],
+                    "model.demo.mart_daily":      ["model.demo.stg_date_series"]
+                  }
+                }
+                """.trimIndent(),
+            )
+            val payload = manifest.buildLineage(
+                seed = "model.demo.stg_date_series",
+                upHops = 0,
+                downHops = 2,
+            )
+            val ids = payload.models.map { it.uniqueId }.toSet()
+            assertEquals(5, ids.size, "all 5 nodes (utility + 4 descendants) must appear")
+            assertTrue("model.demo.mart_daily" in ids, "the cross-layer direct ref to mart must be visible")
+            assertTrue("model.demo.int_daily_b" in ids, "int_daily_b reachable both directly and via int_daily_a")
+        }
+
+        @Test
+        fun `mart fan-in with multi-layer ancestry and direct staging shortcut`() {
+            // Real shape: a mart with deep ancestry where at least one staging
+            // model bypasses the intermediate layer. Symmetric of the "utility
+            // fan-out" pattern but exercised via upHops walk.
+            //
+            //   src_app__users → stg_users  ─┐
+            //   src_app__orders → stg_orders ┼─→ int_user_combined → mart_user
+            //   stg_date_series ─────────────┘                       ↑
+            //   stg_date_series ─────────────────────────────────────┘  (direct, skip)
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.stg_users":          ${node("stg_users", layerPath = "staging/stg_users.sql")},
+                    "model.demo.stg_orders":         ${node("stg_orders", layerPath = "staging/stg_orders.sql")},
+                    "model.demo.stg_date_series":    ${node("stg_date_series", layerPath = "staging/stg_date_series.sql")},
+                    "model.demo.int_user_combined":  ${node("int_user_combined", layerPath = "intermediate/int_user_combined.sql")},
+                    "model.demo.mart_user":          ${node("mart_user", layerPath = "marts/mart_user.sql")}
+                  },
+                  "sources": {
+                    "source.demo.app.users":  ${source("users")},
+                    "source.demo.app.orders": ${source("orders")}
+                  },
+                  "child_map": {
+                    "source.demo.app.users":         ["model.demo.stg_users"],
+                    "source.demo.app.orders":        ["model.demo.stg_orders"],
+                    "model.demo.stg_users":          ["model.demo.int_user_combined"],
+                    "model.demo.stg_orders":         ["model.demo.int_user_combined"],
+                    "model.demo.stg_date_series":    ["model.demo.int_user_combined", "model.demo.mart_user"],
+                    "model.demo.int_user_combined":  ["model.demo.mart_user"],
+                    "model.demo.mart_user":          []
+                  },
+                  "parent_map": {
+                    "source.demo.app.users":         [],
+                    "source.demo.app.orders":        [],
+                    "model.demo.stg_users":          ["source.demo.app.users"],
+                    "model.demo.stg_orders":         ["source.demo.app.orders"],
+                    "model.demo.stg_date_series":    [],
+                    "model.demo.int_user_combined":  ["model.demo.stg_users", "model.demo.stg_orders", "model.demo.stg_date_series"],
+                    "model.demo.mart_user":          ["model.demo.int_user_combined", "model.demo.stg_date_series"]
+                  }
+                }
+                """.trimIndent(),
+            )
+            val payload = manifest.buildLineage(
+                seed = "model.demo.mart_user",
+                upHops = 3,
+                downHops = 0,
+            )
+            val ids = payload.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf(
+                    "model.demo.mart_user",
+                    "model.demo.int_user_combined",
+                    "model.demo.stg_users",
+                    "model.demo.stg_orders",
+                    "model.demo.stg_date_series",
+                    "source.demo.app.users",
+                    "source.demo.app.orders",
+                ),
+                ids,
+                "upHops=3 must reach all 4 layers (mart, int, staging, source) including the shortcut-ancestor stg_date_series",
+            )
+            // Verify the skip edge stg_date_series → mart_user is in the output.
+            val edgePairs = payload.modelEdges.map { it.sourceUniqueId to it.targetUniqueId }.toSet()
+            assertTrue(
+                "model.demo.stg_date_series" to "model.demo.mart_user" in edgePairs,
+                "stg → mart skip edge must survive (it's how the user spots redundant refs in their dbt code)",
+            )
+        }
+
+        @Test
+        fun `multi-level shortcuts at different depths obey hop budget independently`() {
+            // Two shortcuts of different lengths from the same seed — exercises
+            // that hop budget interacts correctly with skip-edge re-entry.
+            //
+            //   A → B → C → D → E
+            //   A → C (skip 1, depth-1 shortcut)
+            //   A → E (skip 3, depth-1 shortcut to a deep node)
+            val manifest = parseManifest(
+                """
+                {
+                  "nodes": {
+                    "model.demo.a": ${node("a", layerPath = "staging/a.sql")},
+                    "model.demo.b": ${node("b", layerPath = "intermediate/b.sql")},
+                    "model.demo.c": ${node("c", layerPath = "intermediate/c.sql")},
+                    "model.demo.d": ${node("d", layerPath = "intermediate/d.sql")},
+                    "model.demo.e": ${node("e", layerPath = "marts/e.sql")}
+                  },
+                  "sources": {},
+                  "child_map": {
+                    "model.demo.a": ["model.demo.b", "model.demo.c", "model.demo.e"],
+                    "model.demo.b": ["model.demo.c"],
+                    "model.demo.c": ["model.demo.d"],
+                    "model.demo.d": ["model.demo.e"],
+                    "model.demo.e": []
+                  },
+                  "parent_map": {
+                    "model.demo.a": [],
+                    "model.demo.b": ["model.demo.a"],
+                    "model.demo.c": ["model.demo.a", "model.demo.b"],
+                    "model.demo.d": ["model.demo.c"],
+                    "model.demo.e": ["model.demo.a", "model.demo.d"]
+                  }
+                }
+                """.trimIndent(),
+            )
+
+            // downHops=1: only direct children reachable. D needs >=1 hop AFTER C, so out.
+            val tightBudget = manifest.buildLineage(seed = "model.demo.a", upHops = 0, downHops = 1)
+            val tightIds = tightBudget.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf("model.demo.a", "model.demo.b", "model.demo.c", "model.demo.e"),
+                tightIds,
+                "downHops=1 reaches direct children only — D is 2-hop minimum, must be excluded",
+            )
+
+            // downHops=2: D becomes reachable via the A→C skip + C→D edge.
+            val mediumBudget = manifest.buildLineage(seed = "model.demo.a", upHops = 0, downHops = 2)
+            val mediumIds = mediumBudget.models.map { it.uniqueId }.toSet()
+            assertEquals(
+                setOf("model.demo.a", "model.demo.b", "model.demo.c", "model.demo.d", "model.demo.e"),
+                mediumIds,
+                "downHops=2 unlocks D via the A→C shortcut → C→D path",
+            )
         }
     }
 
