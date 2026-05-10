@@ -29,12 +29,18 @@ const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
 const NODE_WIDTH = 280;
 // Empirical char-per-line estimate at NODE_WIDTH=280, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
-// to feed dagre an approximate per-node height; actual rendering is done
-// by the browser's wordBreak.
+// to feed the layout engine an approximate per-node height; actual rendering
+// is done by the browser's wordBreak.
 const CHARS_PER_NAME_LINE = 18;
 const NAME_LINE_HEIGHT = 16;
 const HEADER_BASE_HEIGHT = 32; // padding + first name line
-const ROW_HEIGHT = 22;
+// Column-row constants. Both name and type can wrap; the row's visible height
+// is the taller of the two columns. Char budgets are calibrated for the
+// 50/50 flex split (name flex:1 1 auto, type max-width:50%) at NODE_WIDTH=280.
+const COLUMN_NAME_CHARS_PER_LINE = 18; // monospace 11px in ~150px column
+const COLUMN_TYPE_CHARS_PER_LINE = 16; // monospace 10px in ~120px column
+const COLUMN_LINE_HEIGHT = 14; // matches CSS lineHeight 1.3 × ~11px
+const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
 
 const PLUGIN_HOST = "intellij-dbtree.local";
@@ -438,9 +444,21 @@ function App() {
     for (const m of payload.models) {
       const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
       const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
-      const colsH = expanded.has(m.unique_id)
-        ? m.columns.length * ROW_HEIGHT + COLS_VERTICAL_PADDING
-        : 0;
+      let colsH = 0;
+      if (expanded.has(m.unique_id)) {
+        for (const col of m.columns) {
+          const nameRowLines = Math.max(
+            1,
+            Math.ceil(col.name.length / COLUMN_NAME_CHARS_PER_LINE),
+          );
+          const typeRowLines = col.type
+            ? Math.max(1, Math.ceil(col.type.length / COLUMN_TYPE_CHARS_PER_LINE))
+            : 1;
+          const lines = Math.max(nameRowLines, typeRowLines);
+          colsH += lines * COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING;
+        }
+        colsH += COLS_VERTICAL_PADDING;
+      }
       h[m.unique_id] = headerH + colsH;
     }
     return h;
