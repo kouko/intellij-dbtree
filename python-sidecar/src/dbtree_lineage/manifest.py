@@ -222,3 +222,47 @@ class DbtManifest:
                 return inner[""]
             return inner
         return schema
+
+    # ---- Walker helpers ---------------------------------------------------
+    # These power the in-Python full-lineage walker. Cached on first call;
+    # cheap re-use across calls within a single sidecar invocation.
+
+    def models_by_name(self) -> dict[str, str]:
+        """Map model name → unique_id. Multiple matches collapse to one (last wins);
+        callers that need disambiguation should use [resolve_model] instead."""
+        if not hasattr(self, "_models_by_name_cache"):
+            self._models_by_name_cache = {
+                node["name"]: uid
+                for uid, node in self._nodes.items()
+                if node.get("resource_type") == "model" and node.get("name")
+            }
+        return self._models_by_name_cache
+
+    def sources_by_name(self) -> dict[str, str]:
+        """Map source name → unique_id."""
+        if not hasattr(self, "_sources_by_name_cache"):
+            self._sources_by_name_cache = {
+                node["name"]: uid
+                for uid, node in self._sources.items()
+                if node.get("name")
+            }
+        return self._sources_by_name_cache
+
+    def children_by_parent(self) -> dict[str, list[str]]:
+        """Map parent unique_id → list of child model unique_ids that depend on it."""
+        if not hasattr(self, "_children_by_parent_cache"):
+            cache: dict[str, list[str]] = {}
+            for child_uid, node in self._nodes.items():
+                if node.get("resource_type") != "model":
+                    continue
+                for parent_uid in node.get("depends_on", {}).get("nodes", []):
+                    cache.setdefault(parent_uid, []).append(child_uid)
+            self._children_by_parent_cache = cache
+        return self._children_by_parent_cache
+
+    def model_name(self, unique_id: str) -> str | None:
+        """Look up the bare model/source name for [unique_id]. Returns None if not found."""
+        node = self._nodes.get(unique_id) or self._sources.get(unique_id)
+        if node is None:
+            return None
+        return node.get("name")

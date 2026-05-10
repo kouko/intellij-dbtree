@@ -20,6 +20,7 @@ from typing import Any
 
 from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
 from .manifest import DbtManifest, ManifestError
+from .walker import walk_full_lineage
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return only the names of columns the model's compiled SQL "
              "produces (no lineage). Used by the plugin to populate cards "
              "for models lacking schema.yml docs.",
+    )
+    p.add_argument(
+        "--full-walk",
+        action="store_true",
+        help="Walk both upstream and downstream from --column entirely "
+             "in-process and return a flat list of column edges. One "
+             "sidecar invocation does the work of N-per-(uid,col) calls "
+             "the plugin used to make. Requires --column.",
     )
     p.add_argument(
         "--dialect",
@@ -103,6 +112,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             return {**base, "columns": names}
         except Exception as e:  # noqa: BLE001 — surface error to plugin, don't crash
             return {**base, "columns": [], "error": str(e)}
+
+    if args.full_walk:
+        if not args.column:
+            raise SystemExit("--column is required with --full-walk")
+        edges = walk_full_lineage(
+            manifest=manifest,
+            seed_uid=model.unique_id,
+            seed_column=args.column,
+            dialect=dialect,
+            schema=schema_arg,
+        )
+        return {**base, "column": args.column, "edges": edges}
 
     if args.all_columns:
         # Single Python startup, parse the SQL once via sqlglot, query each
