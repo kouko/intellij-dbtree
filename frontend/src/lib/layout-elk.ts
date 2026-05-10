@@ -29,6 +29,8 @@ export async function layoutModelGraph(
       "elk.layered.layerUnzipping.strategy": "ALTERNATING",
       "elk.layered.layerUnzipping.layerSplit": "2",
       "elk.layered.layerUnzipping.resetOnLongEdges": "true",
+      "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
+      "elk.layered.thoroughness": "10",
     },
     children: nodes.map((n) => ({
       id: n.id,
