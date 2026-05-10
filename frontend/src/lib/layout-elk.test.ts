@@ -90,7 +90,26 @@ describe("layoutModelGraph (elk) — variable heights", () => {
 });
 
 describe("layoutModelGraph (elk) — hub case", () => {
-  it.todo(
-    "uses layerUnzipping to spread 30 fan-in siblings across multiple sub-columns",
-  );
+  it("uses layerUnzipping to spread 30 fan-in siblings across multiple sub-columns", async () => {
+    const parents = Array.from({ length: 30 }, (_, i) => makeNode(`p${i}`));
+    const sink = makeNode("sink");
+    const nodes = [...parents, sink];
+    const edges = parents.map((p, i) => makeEdge(`e${i}`, p.id, "sink"));
+    const heights = Object.fromEntries(nodes.map((n) => [n.id, 60]));
+
+    const result = await layoutModelGraph(nodes, edges, {
+      rankdir: "LR",
+      nodeWidth: 200,
+      nodesepX: 60,
+      ranksepY: 100,
+      heights,
+    });
+
+    // The 30 parents should occupy at least 2 distinct x-bands (sub-columns).
+    const parentXs = result
+      .filter((n) => n.id.startsWith("p"))
+      .map((n) => Math.round(n.position.x));
+    const distinctX = new Set(parentXs);
+    expect(distinctX.size).toBeGreaterThanOrEqual(2);
+  });
 });
