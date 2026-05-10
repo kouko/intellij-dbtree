@@ -471,9 +471,19 @@ function App() {
     return rawNodes.map((n) => {
       const manual = manualPositions[n.id];
       const auto = positions[n.id];
+      // If a node has no position yet (fresh from a hop change, ELK still
+      // resolving), hide it rather than flashing it at the origin.
+      if (!manual && !auto) {
+        return {
+          ...n,
+          hidden: true,
+          width: NODE_WIDTH,
+          height: heights[n.id] ?? 60,
+        };
+      }
       return {
         ...n,
-        position: manual ?? auto ?? { x: 0, y: 0 },
+        position: manual ?? auto!,
         width: NODE_WIDTH,
         height: heights[n.id] ?? 60,
       };
