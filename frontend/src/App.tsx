@@ -606,13 +606,34 @@ function App() {
   }, [payload.models, payload.model_edges]);
 
   const [fitKey, setFitKey] = useState(0);
+
+  // Reset manual / live positions on topology change — previous drag
+  // positions are not meaningful for the new node set.
   useEffect(() => {
-    setFitKey((k) => k + 1);
-    // New topology = previous drag positions are not meaningful for the
-    // new node set; reset so dagre can lay out cleanly.
     setManualPositions({});
     setLivePositions({});
   }, [topologyKey]);
+
+  // Detect when ELK has produced positions for every node in the current
+  // topology. Used to defer fitView until the layout actually has all
+  // nodes — bumping fitKey too early fits the viewport to a partial set
+  // and the nodes that arrive late fall outside the visible area.
+  const positionsCompleteForTopology = useMemo(() => {
+    if (payload.models.length === 0) return false;
+    return payload.models.every((m) => positions[m.unique_id] !== undefined);
+  }, [payload.models, positions]);
+
+  // Re-fit ONLY once per topology, and only after positions are ready.
+  // lastFittedTopology guards against re-firing on subsequent position
+  // updates within the same topology (e.g. height changes from column
+  // expand).
+  const [lastFittedTopology, setLastFittedTopology] = useState<string>("");
+  useEffect(() => {
+    if (positionsCompleteForTopology && topologyKey !== lastFittedTopology) {
+      setFitKey((k) => k + 1);
+      setLastFittedTopology(topologyKey);
+    }
+  }, [positionsCompleteForTopology, topologyKey, lastFittedTopology]);
 
   const isEmpty = payload.models.length === 0;
 
