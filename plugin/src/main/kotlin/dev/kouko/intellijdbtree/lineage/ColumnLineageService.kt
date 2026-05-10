@@ -103,6 +103,13 @@ class ColumnLineageService(private val project: Project) {
             "ColumnLineageService: traced $modelUid.$column via $source ($python) " +
                 "-> ${edges.size} edges (single sidecar call)",
         )
+        // Surface walker-side notice (e.g. "manifest needs dbt compile")
+        // as a Failed result so it banners. We only get here when the
+        // sidecar exited cleanly, so the notice is the only signal the
+        // user has that something's misconfigured.
+        result.notice?.takeIf { it.isNotBlank() && edges.isEmpty() }?.let {
+            return Result.Failed(it)
+        }
         return Result.Ok(edges)
     }
 

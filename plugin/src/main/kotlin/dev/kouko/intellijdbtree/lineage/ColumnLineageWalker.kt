@@ -19,6 +19,8 @@ import kotlinx.serialization.Serializable
 @Serializable
 internal data class FullWalkResult(
     val edges: List<FullWalkEdge> = emptyList(),
+    /** Soft hint to surface to the user (e.g. "Run `dbt compile` first"). */
+    val notice: String? = null,
 )
 
 @Serializable

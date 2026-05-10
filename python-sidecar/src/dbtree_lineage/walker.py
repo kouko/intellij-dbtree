@@ -67,11 +67,17 @@ def walk_full_lineage(
     seed_column: str,
     dialect: str | None = None,
     schema: dict | None = None,
-) -> list[dict]:
+) -> tuple[list[dict], str | None]:
     """Walk both upstream and downstream from (seed_uid, seed_column).
 
-    Returns a flat list of edge dicts with shape:
-        {source_unique_id, source_column, target_unique_id, target_column, expression}
+    Returns (edges, notice):
+        edges: flat list of edge dicts with shape
+            {source_unique_id, source_column, target_unique_id,
+             target_column, expression}
+        notice: optional soft hint to surface to the user (e.g. "Run
+            dbt compile first"). Set only when the walker hit a state
+            it's confident is misconfiguration rather than absent
+            lineage, so the plugin can banner it.
 
     Each (uid, col) is visited at most once per direction, protecting
     against cycles. Source-prefix uids (`source.*`) are terminal: dbt
@@ -81,20 +87,29 @@ def walk_full_lineage(
     models_by_name = manifest.models_by_name()
     sources_by_name = manifest.sources_by_name()
     children_by_parent = manifest.children_by_parent()
+    # Track whether we ever encountered compiled SQL during the walk.
+    # If we visit nodes but none had usable SQL, the manifest most
+    # likely needs `dbt compile` rather than being a genuine zero-
+    # lineage case.
+    saw_compiled_sql = False
+    attempted_resolve = False
 
     # ---- Upstream ----------------------------------------------------
     visited_up: set[tuple[str, str]] = set()
 
     def walk_up(uid: str, col: str) -> None:
+        nonlocal saw_compiled_sql, attempted_resolve
         if (uid, col) in visited_up:
             return
         visited_up.add((uid, col))
+        attempted_resolve = True
         try:
             model = manifest.resolve_model(uid)
         except Exception:
             return
         if not model.compiled_sql:
             return
+        saw_compiled_sql = True
         try:
             tree = extract_column_lineage(
                 column=col, sql=model.compiled_sql, dialect=dialect, schema=schema,
@@ -131,13 +146,16 @@ def walk_full_lineage(
         target_name = manifest.model_name(uid)
         if not target_name:
             return
+        nonlocal saw_compiled_sql, attempted_resolve
         for child_uid in children_by_parent.get(uid, []):
+            attempted_resolve = True
             try:
                 child_model = manifest.resolve_model(child_uid)
             except Exception:
                 continue
             if not child_model.compiled_sql:
                 continue
+            saw_compiled_sql = True
             # Prefer manifest yml / catalog columns (cheap lookup). Fall
             # back to parsing SQL output columns when neither has any —
             # required for projects without catalog.json or yml docs.
@@ -190,4 +208,20 @@ def walk_full_lineage(
 
     walk_up(seed_uid, seed_column)
     walk_down(seed_uid, seed_column)
-    return [asdict(e) for e in edges]
+
+    notice: str | None = None
+    # Surface a hint when the walker had work to do but every node it
+    # touched lacked compiled SQL. Without this, the plugin renders
+    # empty highlights with no signal to the user that the manifest
+    # needs `dbt compile` rather than the column genuinely having no
+    # lineage. Skipped when edges exist (partial result is its own
+    # signal) or when no resolve was attempted (e.g. seed had no
+    # children and no SQL — could also be "leaf source", which is a
+    # legitimate empty result).
+    if not edges and attempted_resolve and not saw_compiled_sql:
+        notice = (
+            "No compiled SQL found in the manifest. Run "
+            "`dbt compile` in the project root and re-open the model."
+        )
+
+    return [asdict(e) for e in edges], notice

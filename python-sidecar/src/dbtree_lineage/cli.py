@@ -106,14 +106,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             },
             "dialect": dialect,
         }
-        edges = walk_full_lineage(
+        edges, notice = walk_full_lineage(
             manifest=manifest,
             seed_uid=seed_uid,
             seed_column=args.column,
             dialect=dialect,
             schema=schema_arg,
         )
-        return {**base, "column": args.column, "edges": edges}
+        result: dict[str, Any] = {**base, "column": args.column, "edges": edges}
+        if notice is not None:
+            result["notice"] = notice
+        return result
 
     model = manifest.resolve_model(args.model)
     base = {
