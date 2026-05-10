@@ -13,7 +13,7 @@ def _walk(project: Path, seed_model: str, seed_col: str) -> list[dict]:
     schema = manifest.build_sqlglot_schema() or None
     return walk_full_lineage(
         manifest=manifest,
-        seed_uid=manifest.resolve_model(seed_model).unique_id,
+        seed_uid=manifest.resolve_unique_id(seed_model),
         seed_column=seed_col,
         dialect=manifest.dialect,
         schema=schema,
@@ -62,6 +62,49 @@ def test_walk_with_compiled_code_on_disk_works(dbt_project_file: Path) -> None:
     edges = _walk(dbt_project_file, "fct_orders", "id")
     assert any(
         e["source_unique_id"] == "model.demo.stg_orders" for e in edges
+    )
+
+
+def test_walk_handles_seed_without_compiled_sql(tmp_path: Path) -> None:
+    """When the seed model has no compiled SQL but its children do, the
+    walker must still produce downstream edges. Regression for the case
+    where dbt compile was run only for some models."""
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    fct_sql = "SELECT id, customer_id FROM analytics.stg_orders"
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.stg_orders": {
+                "unique_id": "model.demo.stg_orders",
+                "name": "stg_orders",
+                "package_name": "demo",
+                "resource_type": "model",
+                "compiled_code": None,
+                "compiled_path": None,
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.fct_orders": {
+                "unique_id": "model.demo.fct_orders",
+                "name": "fct_orders",
+                "package_name": "demo",
+                "resource_type": "model",
+                "compiled_code": fct_sql,
+                "depends_on": {"nodes": ["model.demo.stg_orders"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+    edges = _walk(project, "stg_orders", "id")
+    # Seed has no SQL, so no upstream edges. But downstream walk through
+    # fct_orders should still find the stg_orders.id -> fct_orders.id edge.
+    assert any(
+        e["source_unique_id"] == "model.demo.stg_orders"
+        and e["target_unique_id"] == "model.demo.fct_orders"
+        for e in edges
     )
 
 

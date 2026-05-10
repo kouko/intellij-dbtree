@@ -87,6 +87,50 @@ class DbtManifest:
             return None
         return _ADAPTER_TO_DIALECT.get(adapter, adapter)
 
+    def resolve_unique_id(self, name_or_id: str) -> str:
+        """Resolve a model name or unique_id to its unique_id without
+        loading compiled SQL.
+
+        Useful for callers (e.g., the in-process full-walker) that look
+        up models lazily — the seed model's SQL might be missing while
+        its children's SQL is available, and we still want the walk to
+        produce partial edges rather than failing wholesale.
+
+        Raises ``ManifestError`` on miss or ambiguous match.
+        """
+        if name_or_id in self._nodes:
+            return name_or_id
+        candidates: list[str] = []
+        for uid, node in self._nodes.items():
+            if node.get("resource_type") != "model":
+                continue
+            if uid == name_or_id:
+                return uid
+            if node.get("name") == name_or_id:
+                candidates.append(uid)
+            elif f"{node.get('package_name')}.{node.get('name')}" == name_or_id:
+                candidates.append(uid)
+        if not candidates:
+            raise ManifestError(f"No model named {name_or_id!r} found in manifest")
+        if len(candidates) > 1:
+            raise ManifestError(
+                f"Ambiguous model name {name_or_id!r}; "
+                f"matches: {', '.join(candidates)}. Use the full unique_id."
+            )
+        return candidates[0]
+
+    def node_metadata(self, unique_id: str) -> dict[str, str]:
+        """Return the {name, package_name} for [unique_id] without loading SQL.
+
+        Returns empty strings for missing/malformed nodes rather than raising,
+        so callers can fall back gracefully when the manifest is partial.
+        """
+        node = self._nodes.get(unique_id) or self._sources.get(unique_id) or {}
+        return {
+            "name": node.get("name", ""),
+            "package_name": node.get("package_name", ""),
+        }
+
     def resolve_model(self, name_or_id: str) -> ModelRef:
         """Resolve a model by name or unique_id.
 

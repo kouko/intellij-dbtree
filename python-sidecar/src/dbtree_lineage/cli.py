@@ -84,11 +84,38 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     else:
         manifest = DbtManifest.load(args.manifest)
 
-    model = manifest.resolve_model(args.model)
     dialect = args.dialect or manifest.dialect
     schema = manifest.build_sqlglot_schema()
     schema_arg = schema if schema else None
 
+    # --full-walk only needs the seed unique_id; per-node SQL is loaded
+    # lazily by the walker and missing-SQL nodes are skipped gracefully.
+    # Resolving the seed via [resolve_model] would prematurely fail on
+    # uncompiled seed models even though their downstream children may
+    # still produce useful edges.
+    if args.full_walk:
+        if not args.column:
+            raise SystemExit("--column is required with --full-walk")
+        seed_uid = manifest.resolve_unique_id(args.model)
+        meta = manifest.node_metadata(seed_uid)
+        base = {
+            "model": {
+                "unique_id": seed_uid,
+                "name": meta["name"],
+                "package_name": meta["package_name"],
+            },
+            "dialect": dialect,
+        }
+        edges = walk_full_lineage(
+            manifest=manifest,
+            seed_uid=seed_uid,
+            seed_column=args.column,
+            dialect=dialect,
+            schema=schema_arg,
+        )
+        return {**base, "column": args.column, "edges": edges}
+
+    model = manifest.resolve_model(args.model)
     base = {
         "model": {
             "unique_id": model.unique_id,
@@ -112,18 +139,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             return {**base, "columns": names}
         except Exception as e:  # noqa: BLE001 — surface error to plugin, don't crash
             return {**base, "columns": [], "error": str(e)}
-
-    if args.full_walk:
-        if not args.column:
-            raise SystemExit("--column is required with --full-walk")
-        edges = walk_full_lineage(
-            manifest=manifest,
-            seed_uid=model.unique_id,
-            seed_column=args.column,
-            dialect=dialect,
-            schema=schema_arg,
-        )
-        return {**base, "column": args.column, "edges": edges}
 
     if args.all_columns:
         # Single Python startup, parse the SQL once via sqlglot, query each
