@@ -218,6 +218,38 @@ function App() {
       : null,
   );
 
+  // While the Python sidecar is computing column lineage, surface a
+  // "computing…" hint in the toolbar so a 5-second wait doesn't look
+  // like a hang. Cleared when the backend's response (new column_edges)
+  // touches the column we're waiting on, or after 15s as a safety net
+  // (matches the sidecar's own timeout).
+  const [computingFor, setComputingFor] = useState<{
+    unique_id: string;
+    column: string;
+  } | null>(null);
+
+  // Clear the "computing…" hint once edges touching the awaited
+  // column arrive, or after 15s (sidecar timeout) as a safety net so
+  // a column with genuinely zero lineage doesn't stay "computing…"
+  // forever.
+  useEffect(() => {
+    if (!computingFor) return;
+    const matched = payload.column_edges.some(
+      (e) =>
+        (e.source_unique_id === computingFor.unique_id &&
+          e.source_column === computingFor.column) ||
+        (e.target_unique_id === computingFor.unique_id &&
+          e.target_column === computingFor.column),
+    );
+    if (matched) setComputingFor(null);
+  }, [computingFor, payload.column_edges]);
+
+  useEffect(() => {
+    if (!computingFor) return;
+    const t = setTimeout(() => setComputingFor(null), 15_000);
+    return () => clearTimeout(t);
+  }, [computingFor]);
+
   // When a new full payload arrives, drop column selection if the column
   // no longer exists, and ensure the selected model is expanded.
   useEffect(() => {
@@ -304,6 +336,7 @@ function App() {
       window.kotlinCallback(
         JSON.stringify({ event: "COLUMN_CLICK", unique_id: uniqueId, column }),
       );
+      setComputingFor({ unique_id: uniqueId, column });
     }
   }, []);
 
@@ -662,6 +695,12 @@ function App() {
         selected={selectedColumn}
         onClear={() => setSelectedColumn(null)}
         traceCount={lineageTrace.edges.size}
+        computing={
+          !!(computingFor &&
+             selectedColumn &&
+             computingFor.unique_id === selectedColumn.unique_id &&
+             computingFor.column === selectedColumn.column)
+        }
       />
       {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
       <div style={{ flex: 1, position: "relative" }}>
@@ -745,6 +784,7 @@ function Toolbar({
   selected,
   onClear,
   traceCount,
+  computing,
 }: {
   theme: Theme;
   upHops: number;
@@ -759,6 +799,7 @@ function Toolbar({
   selected: { unique_id: string; column: string } | null;
   onClear: () => void;
   traceCount: number;
+  computing: boolean;
 }) {
   const t = theme;
   const buttonStyle: React.CSSProperties = {
@@ -849,7 +890,15 @@ function Toolbar({
               {selected.unique_id.split(".").pop()}.{selected.column}
             </code>
             {" — "}
-            {traceCount} column edge{traceCount === 1 ? "" : "s"}
+            {computing ? (
+              <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                computing column lineage…
+              </em>
+            ) : (
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}
+              </>
+            )}
           </span>
           <button type="button" onClick={onClear} style={buttonStyle}>
             clear
