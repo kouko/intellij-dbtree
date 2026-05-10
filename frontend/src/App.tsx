@@ -26,20 +26,21 @@ import {
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
-const NODE_WIDTH = 280;
-// Empirical char-per-line estimate at NODE_WIDTH=280, font-weight 600 / 12px,
+const NODE_WIDTH = 320;
+// Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
 // to feed the layout engine an approximate per-node height; actual rendering
 // is done by the browser's wordBreak.
-const CHARS_PER_NAME_LINE = 18;
+const CHARS_PER_NAME_LINE = 22;
 const NAME_LINE_HEIGHT = 16;
 const HEADER_BASE_HEIGHT = 32; // padding + first name line
 // Column-row constants. Both name and type can wrap; the row's visible height
 // is the taller of the two columns. Char budgets are calibrated for the
-// 50/50 flex split (name flex:1 1 auto, type max-width:50%) at NODE_WIDTH=280.
-const COLUMN_NAME_CHARS_PER_LINE = 18; // monospace 11px in ~150px column
-const COLUMN_TYPE_CHARS_PER_LINE = 16; // monospace 10px in ~120px column
-const COLUMN_LINE_HEIGHT = 14; // matches CSS lineHeight 1.3 × ~11px
+// 50/50 flex split (name flex:1 1 auto, type max-width:50%) at NODE_WIDTH=320,
+// font sizes 10px (name) / 9px (type).
+const COLUMN_NAME_CHARS_PER_LINE = 22; // monospace 10px in ~140px column
+const COLUMN_TYPE_CHARS_PER_LINE = 22; // monospace 9px in ~140px column
+const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
 const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
 
