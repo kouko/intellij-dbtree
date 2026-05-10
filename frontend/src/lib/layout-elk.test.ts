@@ -84,3 +84,9 @@ describe("layoutModelGraph (elk) — variable heights", () => {
     }
   });
 });
+
+describe("layoutModelGraph (elk) — hub case", () => {
+  it.todo(
+    "uses layerUnzipping to spread 30 fan-in siblings across multiple sub-columns",
+  );
+});
