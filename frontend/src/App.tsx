@@ -450,7 +450,16 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    layoutModelGraph(rawNodes, modelLevelEdges(payload), {
+    // Layout only depends on topology (ids + edges) and per-node heights.
+    // Build a minimal Node[] for layout — node `data` (highlight, selection,
+    // expansion) is irrelevant to positioning. Re-running layout when only
+    // display state changes would shift coordinates on every column click.
+    const layoutNodes: Node[] = payload.models.map((m) => ({
+      id: m.unique_id,
+      position: { x: 0, y: 0 },
+      data: {},
+    }));
+    layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
       nodesepX: 60,
@@ -465,7 +474,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [rawNodes, heights, payload]);
+  }, [payload, heights]);
 
   const derivedNodes: Node[] = useMemo(() => {
     return rawNodes.map((n) => {
