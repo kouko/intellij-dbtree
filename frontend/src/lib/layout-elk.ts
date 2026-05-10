@@ -26,6 +26,9 @@ export async function layoutModelGraph(
       "elk.direction": direction,
       "elk.layered.spacing.nodeNodeBetweenLayers": String(opts.ranksepY),
       "elk.spacing.nodeNode": String(opts.nodesepX),
+      "elk.layered.layerUnzipping.strategy": "ALTERNATING",
+      "elk.layered.layerUnzipping.layerSplit": "2",
+      "elk.layered.layerUnzipping.resetOnLongEdges": "true",
     },
     children: nodes.map((n) => ({
       id: n.id,

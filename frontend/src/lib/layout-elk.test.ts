@@ -68,19 +68,23 @@ describe("layoutModelGraph (elk) — variable heights", () => {
       heights,
     });
 
-    const byId = new Map(result.map((r) => [r.id, r]));
-    const s1 = byId.get("s1")!;
-    const s2 = byId.get("s2")!;
-    const s3 = byId.get("s3")!;
+    // With layerUnzipping=ALTERNATING the three siblings may spread across
+    // multiple sub-columns. Non-overlap only needs to hold *within* each x.
+    const buckets = new Map<number, Array<{ top: number; bottom: number }>>();
+    for (const r of result) {
+      if (r.id === "sink") continue;
+      const x = Math.round(r.position.x);
+      const h = heights[r.id as keyof typeof heights];
+      const top = r.position.y;
+      if (!buckets.has(x)) buckets.set(x, []);
+      buckets.get(x)!.push({ top, bottom: top + h });
+    }
 
-    const yIntervals = [
-      { id: "s1", top: s1.position.y, bottom: s1.position.y + 60 },
-      { id: "s2", top: s2.position.y, bottom: s2.position.y + 200 },
-      { id: "s3", top: s3.position.y, bottom: s3.position.y + 60 },
-    ].sort((a, b) => a.top - b.top);
-
-    for (let i = 0; i < yIntervals.length - 1; i++) {
-      expect(yIntervals[i].bottom).toBeLessThanOrEqual(yIntervals[i + 1].top);
+    for (const intervals of buckets.values()) {
+      intervals.sort((a, b) => a.top - b.top);
+      for (let i = 0; i < intervals.length - 1; i++) {
+        expect(intervals[i].bottom).toBeLessThanOrEqual(intervals[i + 1].top);
+      }
     }
   });
 });
