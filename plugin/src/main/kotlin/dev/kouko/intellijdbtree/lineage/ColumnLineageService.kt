@@ -81,30 +81,28 @@ class ColumnLineageService(private val project: Project) {
         val pythonPath = sidecarDir.toString()
         val projectDir = manifest.dbtProjectDir.toString()
 
-        val singleSidecar: (String, String) -> SidecarResult? = { uid, col ->
-            runSidecarSingle(python, pythonPath, projectDir, uid, col)
-        }
-        val allColumnsSidecar: (String) -> AllColumnsResult? = { uid ->
-            runSidecarAllColumns(python, pythonPath, projectDir, uid)
-        }
-
-        // Reset failure capture for this trace. Subsequent runSidecar calls
-        // will record the first user-actionable failure they hit.
+        // Reset failure capture for this trace. The single sidecar call
+        // below may write here if it crashes or returns a non-zero exit.
         currentFailure.set(null)
 
-        val edges = mutableListOf<ColumnEdge>()
-        edges += traceUpstreamColumns(modelUid, column, manifest, singleSidecar)
-        edges += traceDownstreamColumns(modelUid, column, manifest, allColumnsSidecar)
-
-        log.info("ColumnLineageService: traced $modelUid.$column via $source ($python) -> ${edges.size} edges")
-
-        // Surface a sidecar failure to the toolbar ONLY when it produced no
-        // edges. A partial trace with one failed branch is still useful — the
-        // user gets the edges we did find, the failure shows in idea.log.
-        val failure = currentFailure.get()
-        if (edges.isEmpty() && failure != null) {
-            return Result.Failed(failure)
+        // ONE subprocess per click, regardless of lineage depth/breadth.
+        // The Python walker (`dbtree_lineage.walker.walk_full_lineage`)
+        // does the recursion in-process — see python-sidecar/src/dbtree_lineage/walker.py.
+        val cmd = sidecarCommand(python, pythonPath, projectDir, modelUid).apply {
+            addParameters("--column", column, "--full-walk")
         }
+        val result = runSidecar(cmd, "$modelUid.$column (full-walk)", FullWalkResult.serializer())
+
+        if (result == null) {
+            val failure = currentFailure.get()
+            return if (failure != null) Result.Failed(failure) else Result.Ok(emptyList())
+        }
+
+        val edges = result.edges.map(FullWalkEdge::toColumnEdge)
+        log.info(
+            "ColumnLineageService: traced $modelUid.$column via $source ($python) " +
+                "-> ${edges.size} edges (single sidecar call)",
+        )
         return Result.Ok(edges)
     }
 
@@ -153,31 +151,6 @@ class ColumnLineageService(private val project: Project) {
     /** Drop cached column lists (call on manifest reload / refresh-from-disk). */
     fun invalidateColumnListCache() {
         columnListCache.clear()
-    }
-
-    private fun runSidecarSingle(
-        python: String,
-        pythonPath: String,
-        projectDir: String,
-        modelUid: String,
-        column: String,
-    ): SidecarResult? {
-        val cmd = sidecarCommand(python, pythonPath, projectDir, modelUid).apply {
-            addParameters("--column", column)
-        }
-        return runSidecar(cmd, "$modelUid.$column", SidecarResult.serializer())
-    }
-
-    private fun runSidecarAllColumns(
-        python: String,
-        pythonPath: String,
-        projectDir: String,
-        modelUid: String,
-    ): AllColumnsResult? {
-        val cmd = sidecarCommand(python, pythonPath, projectDir, modelUid).apply {
-            addParameter("--all-columns")
-        }
-        return runSidecar(cmd, "$modelUid (all columns)", AllColumnsResult.serializer())
     }
 
     private fun sidecarCommand(
