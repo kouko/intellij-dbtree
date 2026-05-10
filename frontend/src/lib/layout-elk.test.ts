@@ -49,3 +49,38 @@ describe("layoutModelGraph (elk) — linear chain", () => {
     expect(byId.get("d")! < byId.get("e")!).toBe(true);
   });
 });
+
+describe("layoutModelGraph (elk) — variable heights", () => {
+  it("does not overlap two siblings with different heights in same layer", async () => {
+    const nodes = [makeNode("s1"), makeNode("s2"), makeNode("s3"), makeNode("sink")];
+    const edges = [
+      makeEdge("e1", "s1", "sink"),
+      makeEdge("e2", "s2", "sink"),
+      makeEdge("e3", "s3", "sink"),
+    ];
+    const heights = { s1: 60, s2: 200, s3: 60, sink: 60 };
+
+    const result = await layoutModelGraph(nodes, edges, {
+      rankdir: "LR",
+      nodeWidth: 200,
+      nodesepX: 60,
+      ranksepY: 100,
+      heights,
+    });
+
+    const byId = new Map(result.map((r) => [r.id, r]));
+    const s1 = byId.get("s1")!;
+    const s2 = byId.get("s2")!;
+    const s3 = byId.get("s3")!;
+
+    const yIntervals = [
+      { id: "s1", top: s1.position.y, bottom: s1.position.y + 60 },
+      { id: "s2", top: s2.position.y, bottom: s2.position.y + 200 },
+      { id: "s3", top: s3.position.y, bottom: s3.position.y + 60 },
+    ].sort((a, b) => a.top - b.top);
+
+    for (let i = 0; i < yIntervals.length - 1; i++) {
+      expect(yIntervals[i].bottom).toBeLessThanOrEqual(yIntervals[i + 1].top);
+    }
+  });
+});
