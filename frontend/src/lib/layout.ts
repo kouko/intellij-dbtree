@@ -18,11 +18,11 @@ export interface LayoutOptions {
   heights: Record<string, number>;
 }
 
-export function layoutModelGraph(
+export async function layoutModelGraph(
   nodes: Node[],
   edges: Edge[],
   opts: LayoutOptions,
-): Node[] {
+): Promise<Node[]> {
   const g = new dagre.graphlib.Graph();
   g.setGraph({
     rankdir: opts.rankdir ?? "LR",

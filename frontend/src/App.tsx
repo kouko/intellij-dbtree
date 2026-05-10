@@ -383,28 +383,19 @@ function App() {
   );
 
   // ---- xyflow nodes/edges --------------------------------------------------
-  // `derivedNodes` is rebuilt whenever data changes. `liveNodes` is what
-  // ReactFlow actually renders — it's seeded from derivedNodes but accepts
-  // mid-drag position updates from onNodesChange so the card follows the
-  // cursor in real time. After drop, `onNodeDragStop` writes the final
-  // position into `manualPositions`, which feeds back into derivedNodes —
-  // so the position survives across re-renders without snapping back.
-  const derivedNodes: Node[] = useMemo(() => {
+  // Layout runs asynchronously, so node data and node positions are computed
+  // in two phases:
+  //   rawNodes:  pure data (sync, useMemo)
+  //   positions: layout output (async, useEffect → useState)
+  //   derivedNodes: rawNodes merged with positions and manualPositions (sync, useMemo)
+
+  const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = useMemo(() => {
     const isExpanded = (uid: string) => expanded.has(uid);
-    const heights: Record<string, number> = {};
-    for (const m of payload.models) {
-      const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
-      const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
-      const colsH = isExpanded(m.unique_id)
-        ? m.columns.length * ROW_HEIGHT + COLS_VERTICAL_PADDING
-        : 0;
-      heights[m.unique_id] = headerH + colsH;
-    }
 
     const onLineagePath = (uid: string) =>
       selectedColumn ? lineageTrace.models.has(uid) : modelTrace.all.has(uid);
 
-    const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = payload.models.map((m) => ({
+    return payload.models.map((m) => ({
       id: m.unique_id,
       type: "dbtModel" as const,
       position: { x: 0, y: 0 },
@@ -428,18 +419,6 @@ function App() {
         onOpenFile,
       },
     }));
-
-    const positioned = layoutModelGraph(rawNodes, modelLevelEdges(payload), {
-      rankdir: "LR",
-      nodeWidth: NODE_WIDTH,
-      nodesepX: 60,
-      ranksepY: 100,
-      heights,
-    });
-    return positioned.map((n) => {
-      const manual = manualPositions[n.id];
-      return manual ? { ...n, position: manual } : n;
-    });
   }, [
     payload,
     expanded,
@@ -449,11 +428,57 @@ function App() {
     selectedColumn,
     theme,
     selectedModelUid,
-    manualPositions,
     toggleExpanded,
     onColumnClick,
     onOpenFile,
   ]);
+
+  const heights: Record<string, number> = useMemo(() => {
+    const h: Record<string, number> = {};
+    for (const m of payload.models) {
+      const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
+      const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
+      const colsH = expanded.has(m.unique_id)
+        ? m.columns.length * ROW_HEIGHT + COLS_VERTICAL_PADDING
+        : 0;
+      h[m.unique_id] = headerH + colsH;
+    }
+    return h;
+  }, [payload, expanded]);
+
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    layoutModelGraph(rawNodes, modelLevelEdges(payload), {
+      rankdir: "LR",
+      nodeWidth: NODE_WIDTH,
+      nodesepX: 60,
+      ranksepY: 100,
+      heights,
+    }).then((positioned) => {
+      if (cancelled) return;
+      const next: Record<string, { x: number; y: number }> = {};
+      for (const n of positioned) next[n.id] = n.position;
+      setPositions(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [rawNodes, heights, payload]);
+
+  const derivedNodes: Node[] = useMemo(() => {
+    return rawNodes.map((n) => {
+      const manual = manualPositions[n.id];
+      const auto = positions[n.id];
+      return {
+        ...n,
+        position: manual ?? auto ?? { x: 0, y: 0 },
+        width: NODE_WIDTH,
+        height: heights[n.id] ?? 60,
+      };
+    });
+  }, [rawNodes, positions, manualPositions, heights]);
 
   // What ReactFlow actually renders: derivedNodes overlaid with any
   // in-flight drag positions. No separate state — derivedNodes is the
