@@ -78,4 +78,15 @@ export interface LineagePayload {
    * Cleared on the next successful payload.
    */
   warning?: string;
+  /**
+   * False while the sidecar is still streaming column-lineage edges for
+   * [selected]; flips to true on the final payload (success or failure).
+   *
+   * React uses this to keep the "computing column lineage…" hint visible
+   * while edges trickle in, and to clear it once the stream terminates.
+   *
+   * Defaults to true (treated as "stream finished" for non-streaming
+   * publishes — full payloads, hop changes, etc.).
+   */
+  column_lineage_done?: boolean;
 }

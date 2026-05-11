@@ -228,25 +228,30 @@ function App() {
     column: string;
   } | null>(null);
 
-  // Clear the "computing…" hint once edges touching the awaited
-  // column arrive, or after 15s (sidecar timeout) as a safety net so
-  // a column with genuinely zero lineage doesn't stay "computing…"
-  // forever.
+  // Clear the "computing…" hint when the streaming sidecar signals
+  // it's done — payload.column_lineage_done flips to true on the
+  // final flush (success or failure) and stays false during
+  // intermediate batched publishes. With streaming we explicitly
+  // CAN'T treat "first edge arrived" as done, because more edges
+  // may follow.
+  //
+  // Safety net: 60s timeout matches the new default sidecar timeout
+  // so the hint never gets stuck if the plugin somehow forgets to
+  // emit a terminal payload.
   useEffect(() => {
     if (!computingFor) return;
-    const matched = payload.column_edges.some(
-      (e) =>
-        (e.source_unique_id === computingFor.unique_id &&
-          e.source_column === computingFor.column) ||
-        (e.target_unique_id === computingFor.unique_id &&
-          e.target_column === computingFor.column),
-    );
-    if (matched) setComputingFor(null);
-  }, [computingFor, payload.column_edges]);
+    if (
+      payload.column_lineage_done !== false &&
+      payload.selected?.unique_id === computingFor.unique_id &&
+      payload.selected?.column === computingFor.column
+    ) {
+      setComputingFor(null);
+    }
+  }, [computingFor, payload.column_lineage_done, payload.selected]);
 
   useEffect(() => {
     if (!computingFor) return;
-    const t = setTimeout(() => setComputingFor(null), 15_000);
+    const t = setTimeout(() => setComputingFor(null), 60_000);
     return () => clearTimeout(t);
   }, [computingFor]);
 
@@ -890,10 +895,21 @@ function Toolbar({
               {selected.unique_id.split(".").pop()}.{selected.column}
             </code>
             {" — "}
-            {computing ? (
+            {computing && traceCount === 0 ? (
               <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
                 computing column lineage…
               </em>
+            ) : computing ? (
+              // Streaming sidecar emits edges progressively. Show the
+              // running count alongside an italic "(computing…)" suffix
+              // so the user sees forward motion without losing sight of
+              // the fact that more edges may still arrive.
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
+                <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                  (computing…)
+                </em>
+              </>
             ) : (
               <>
                 {traceCount} column edge{traceCount === 1 ? "" : "s"}
