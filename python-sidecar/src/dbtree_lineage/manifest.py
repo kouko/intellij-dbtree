@@ -225,32 +225,36 @@ class DbtManifest:
         node = self._nodes.get(unique_id, {})
         return list((node.get("columns") or {}).keys())
 
-    def build_sqlglot_schema(self) -> dict[str, Any]:
-        """Build a nested ``{db: {schema: {table: {col: type}}}}`` dict
-        suitable for sqlglot's ``schema=`` parameter.
+    def build_sqlglot_schema(self) -> dict[str, dict[str, str]]:
+        """Build a flat ``{table: {col: type}}`` dict suitable for sqlglot's
+        ``schema=`` parameter — intentionally schema-agnostic.
 
-        Reads dbt ``relation_name`` per model + source (full warehouse
-        identifier like ``"jaffle_shop"."main"."stg_orders"``) and pulls
-        column types from ``catalog.json`` when available, falling back
-        to ``schema.yml``-documented types from the manifest itself.
+        Why flat: dbt compiles SQL against the user's active TARGET
+        schema (e.g. ``dbt_dev_<user>`` for dev runs). The same model's
+        ``relation_name`` in ``manifest.json`` reflects whatever target
+        was last written there — often a DIFFERENT schema (e.g.
+        ``dbt_prod`` from a docs-generate). A fully-qualified nested
+        schema (``{db: {schema: {table: cols}}}``) is brittle to this
+        mismatch: sqlglot can't expand ``SELECT *`` from a table whose
+        qualified path doesn't match the dict's nesting.
+
+        By indexing tables by **bare name only**, the lookup succeeds
+        regardless of which target the SQL was rendered against. Trade-
+        off: a source and model with the same bare name would collide
+        — acceptable in practice because model names are unique within
+        a dbt project and source/model name collisions are unusual.
+
+        Column types come from ``catalog.json`` when available, falling
+        back to ``schema.yml``-documented types from the manifest.
         """
         catalog_nodes = self._catalog.get("nodes", {}) if self._catalog else {}
         catalog_sources = self._catalog.get("sources", {}) if self._catalog else {}
 
-        schema: dict[str, dict[str, dict[str, dict[str, str]]]] = {}
+        schema: dict[str, dict[str, str]] = {}
 
         def add(uid: str, node: dict[str, Any], catalog_entry: dict[str, Any] | None) -> None:
-            relation = node.get("relation_name")
-            if not isinstance(relation, str):
-                return
-            parts = [p.strip().strip('"').strip("`") for p in relation.split(".")]
-            if len(parts) == 3:
-                db, sch, table = parts
-            elif len(parts) == 2:
-                db, sch, table = "", parts[0], parts[1]
-            elif len(parts) == 1:
-                db, sch, table = "", "", parts[0]
-            else:
+            name = node.get("name")
+            if not name:
                 return
 
             cols: dict[str, str] = {}
@@ -268,7 +272,14 @@ class DbtManifest:
             if not cols:
                 return
 
-            schema.setdefault(db, {}).setdefault(sch, {})[table] = cols
+            # Merge on table-name collision: later writes (sources) augment
+            # earlier (models) without overwriting existing columns.
+            existing = schema.get(name)
+            if existing:
+                merged = {**cols, **existing}  # existing wins on overlap
+                schema[name] = merged
+            else:
+                schema[name] = cols
 
         for uid, node in self._nodes.items():
             if node.get("resource_type") != "model":
@@ -277,12 +288,6 @@ class DbtManifest:
         for uid, node in self._sources.items():
             add(uid, node, catalog_sources.get(uid))
 
-        # Strip the empty-string outer wrappers if the warehouse is single-tier.
-        if "" in schema and len(schema) == 1:
-            inner = schema[""]
-            if "" in inner and len(inner) == 1:
-                return inner[""]
-            return inner
         return schema
 
     # ---- Walker helpers ---------------------------------------------------
