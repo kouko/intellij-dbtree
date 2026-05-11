@@ -57,7 +57,17 @@ class DbtreeSettingsService : PersistentStateComponent<DbtreeSettingsService.Sta
         clampTimeoutSeconds(myState.sidecarTimeoutSeconds) * 1000
 
     companion object {
-        const val DEFAULT_TIMEOUT_SECONDS = 15
+        // 60s default chosen empirically against real dbt projects with
+        // deep multi-hop chains: the worst observed --full-walk takes
+        // ~30s with sqlglot[c] / ~60s without, so 60s clears almost
+        // everything without DoSing the user when sqlglot genuinely
+        // hangs.
+        //
+        // Was 15s when the sidecar ran one subprocess per (uid, col);
+        // the single-call --full-walk mode now collapses that fan-out
+        // into one longer call, so the per-click budget needs to scale
+        // accordingly.
+        const val DEFAULT_TIMEOUT_SECONDS = 60
         const val TIMEOUT_MIN_SECONDS = 5
         const val TIMEOUT_MAX_SECONDS = 120
 
