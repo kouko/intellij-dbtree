@@ -13,6 +13,7 @@ are wire-compatible.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
 from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
@@ -67,6 +68,7 @@ def walk_full_lineage(
     seed_column: str,
     dialect: str | None = None,
     schema: dict | None = None,
+    on_edge: Callable[[dict], None] | None = None,
 ) -> tuple[list[dict], str | None]:
     """Walk both upstream and downstream from (seed_uid, seed_column).
 
@@ -82,6 +84,13 @@ def walk_full_lineage(
     Each (uid, col) is visited at most once per direction, protecting
     against cycles. Source-prefix uids (`source.*`) are terminal: dbt
     sources have no compiled SQL.
+
+    If [on_edge] is provided, it is invoked synchronously with each
+    edge dict immediately upon discovery — used by streaming callers
+    (CLI ``--stream`` mode) to flush partial results to stdout for
+    progressive UI updates. The final return value still contains the
+    full list regardless of callback presence, so non-streaming
+    callers see the same contract.
     """
     edges: list[ColumnEdge] = []
     models_by_name = manifest.models_by_name()
@@ -122,13 +131,16 @@ def walk_full_lineage(
             if src_uid is None:
                 continue
             src_col_clean = _strip_quotes(src_col.split(".")[-1])
-            edges.append(ColumnEdge(
+            edge = ColumnEdge(
                 source_unique_id=src_uid,
                 source_column=src_col_clean,
                 target_unique_id=uid,
                 target_column=col,
                 expression=root_expression,
-            ))
+            )
+            edges.append(edge)
+            if on_edge is not None:
+                on_edge(asdict(edge))
             if src_uid.startswith("source."):
                 continue
             walk_up(src_uid, src_col_clean)
@@ -197,13 +209,16 @@ def walk_full_lineage(
                     if child_tree.expression and child_tree.expression.strip()
                     else None
                 )
-                edges.append(ColumnEdge(
+                edge = ColumnEdge(
                     source_unique_id=uid,
                     source_column=col,
                     target_unique_id=child_uid,
                     target_column=child_col,
                     expression=root_expression,
-                ))
+                )
+                edges.append(edge)
+                if on_edge is not None:
+                    on_edge(asdict(edge))
                 walk_down(child_uid, child_col)
 
     walk_up(seed_uid, seed_column)

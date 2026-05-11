@@ -83,6 +83,18 @@ data class LineagePayload(
      * Cleared on the next successful payload.
      */
     val warning: String? = null,
+    /**
+     * False while the sidecar is still streaming column-lineage edges
+     * for [selected]; flips to true on the final payload (success or
+     * failure). React uses this to keep the "computing column lineage…"
+     * hint visible while edges trickle in, and to clear it once the
+     * stream terminates.
+     *
+     * Defaults to true so non-streaming publish paths (full-payload
+     * refreshes, hop changes, etc.) don't accidentally signal "still
+     * computing" and leave the UI in a never-clears state.
+     */
+    @SerialName("column_lineage_done") val columnLineageDone: Boolean = true,
 )
 
 internal val LineageJson: Json = Json {
