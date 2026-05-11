@@ -14,6 +14,17 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.3.0</h3>
+        <ul>
+            <li><b>Hub-friendly layout.</b> Layout engine swapped from dagre to ELK with <code>layerUnzipping</code>: a hub model with 30+ parents/children no longer stacks into a tall wall — those siblings now spread across staggered sub-columns, halving the visual height.</li>
+            <li><b>Column lineage is ~6× faster.</b> Click-to-trace went from spawning one Python subprocess per (model, column) reached (~10-15s on deep chains) to a single subprocess that does the whole walk in-process (~2.5s with <code>sqlglot[c]</code>, ~5s without).</li>
+            <li><b>Progressive lineage rendering.</b> Yellow highlights now appear edge-by-edge as the sidecar finds them (debounced ~2Hz), instead of one big reveal at the end. The toolbar shows <code>N column edges (computing…)</code> until the walk completes.</li>
+            <li><b>Resilient to partial dbt state.</b> Lineage still works when <code>manifest.json</code> is missing <code>compiled_code</code>/<code>compiled_path</code> (common after <code>dbt parse</code> or <code>dbt deps</code>) — the sidecar falls back to reading SQL files directly from <code>target/compiled/</code>. Also tolerant to dev/prod target schema mismatches.</li>
+            <li><b>Wider, more readable cards.</b> Cards widened 280→320px, column names now wrap to multiple lines instead of being truncated with <code>…</code>, and data types right-align.</li>
+            <li><b>Race-free column clicks.</b> Clicking a column used to occasionally show "no lineage" the first time; clicking again worked. Fixed an internal race between the open-file callback and the lineage trace.</li>
+            <li><b>Better banners.</b> When the manifest has no compiled SQL anywhere, the toolbar now points specifically to the partial-compile scenario instead of a generic "run dbt compile" hint.</li>
+            <li><b>Sidecar timeout default raised 15s → 60s</b> to fit single-call walks on real-world dbt projects with deep multi-hop chains. Configurable via Settings → Tools → dbtree → "Sidecar timeout".</li>
+        </ul>
         <h3>0.1.3</h3>
         <ul>
             <li><b>Lazy column extraction from compiled SQL.</b> Models without yml docs or <code>catalog.json</code> now show columns on demand: expand a card → dbtree spawns the bundled Python sidecar to parse the compiled SQL via sqlglot → columns appear (~1s). Extracts from explicit <code>SELECT</code> lists; <code>SELECT *</code> still requires <code>catalog.json</code> for source schema.</li>
