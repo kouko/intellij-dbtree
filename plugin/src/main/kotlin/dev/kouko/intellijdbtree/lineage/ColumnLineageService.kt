@@ -9,7 +9,15 @@ import com.intellij.openapi.project.Project
 import dev.kouko.intellijdbtree.settings.DbtreeSettingsService
 import dev.kouko.intellijdbtree.sidecar.SidecarExtractor
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -54,6 +62,24 @@ class ColumnLineageService(private val project: Project) {
         data class Ok(val edges: List<ColumnEdge>) : Result
         data class Failed(val warning: String) : Result
     }
+
+    /**
+     * Terminal outcome of [computeForColumnStream]. Edges are delivered
+     * via the `onEdge` callback rather than returned here — callers
+     * accumulate / debounce / publish them as they prefer.
+     */
+    sealed interface StreamOutcome {
+        /** Sidecar finished cleanly. [notice] is the optional soft hint
+         *  emitted by the walker's `{"done": {"notice": ...}}` line. */
+        data class Ok(val notice: String?) : StreamOutcome
+
+        /** Sidecar didn't finish cleanly (timeout, non-zero exit,
+         *  resolver / extraction failure). [warning] is user-facing. */
+        data class Failed(val warning: String) : StreamOutcome
+    }
+
+    /** Internal: result of one reader-thread pass over sidecar stdout. */
+    private data class StreamReadResult(val edgeCount: Int, val notice: String?)
 
     /**
      * Trace [column] of model [modelUid] both upstream and downstream.
@@ -111,6 +137,170 @@ class ColumnLineageService(private val project: Project) {
             return Result.Failed(it)
         }
         return Result.Ok(edges)
+    }
+
+    /**
+     * Streaming variant of [computeForColumn]. The sidecar runs with
+     * `--full-walk --stream`, emitting one NDJSON line per discovered
+     * edge; this method reads stdout line-by-line and invokes [onEdge]
+     * synchronously as each edge arrives, then returns the final
+     * outcome when the sidecar emits its `{"done": ...}` line.
+     *
+     * Caller is expected to publish progressive UI updates from inside
+     * [onEdge] (debounced — every edge would publish-storm the React
+     * side). The sidecar's terminal notice (e.g. "Run dbt compile
+     * first") is surfaced via [StreamOutcome.Ok.notice] for callers to
+     * banner; non-fatal failures (timeout, crash) become
+     * [StreamOutcome.Failed].
+     *
+     * Reader thread + future-with-timeout is needed because Java's
+     * [java.io.BufferedReader.readLine] blocks indefinitely; cancelling
+     * the future + force-destroying the process is the only way to
+     * unblock when the sidecar hangs past the user-configured timeout.
+     */
+    fun computeForColumnStream(
+        modelUid: String,
+        column: String,
+        manifest: ParsedManifest,
+        onEdge: (ColumnEdge) -> Unit,
+    ): StreamOutcome {
+        val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
+        val (python, source) = when (resolution) {
+            is PythonInterpreterResolver.Resolution.Ok ->
+                resolution.pythonPath to resolution.source
+            is PythonInterpreterResolver.Resolution.None -> {
+                log.info("ColumnLineageService.stream: ${resolution.reason}")
+                return StreamOutcome.Failed(resolution.reason)
+            }
+        }
+        val sidecarDir = try {
+            SidecarExtractor.ensureExtracted()
+        } catch (e: Exception) {
+            log.warn("ColumnLineageService.stream: failed to extract sidecar", e)
+            return StreamOutcome.Failed(
+                "Failed to extract bundled Python sidecar: ${e.message}",
+            )
+        }
+
+        val cmd = sidecarCommand(
+            python,
+            sidecarDir.toString(),
+            manifest.dbtProjectDir.toString(),
+            modelUid,
+        ).apply { addParameters("--column", column, "--full-walk", "--stream") }
+
+        val timeoutMs = DbtreeSettingsService.getInstance().sidecarTimeoutMillis()
+        val label = "$modelUid.$column (stream)"
+
+        val process = try {
+            cmd.createProcess()
+        } catch (e: Exception) {
+            log.warn("ColumnLineageService.stream: failed to spawn sidecar for $label", e)
+            return StreamOutcome.Failed("Sidecar failed to start: ${e.message}")
+        }
+
+        val executor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "dbtree-sidecar-stream").apply { isDaemon = true }
+        }
+        try {
+            val future = executor.submit<StreamReadResult> {
+                readSidecarStream(process, onEdge)
+            }
+            val outcome = try {
+                future.get(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                process.destroyForcibly()
+                future.cancel(true)
+                val secs = timeoutMs / 1000
+                return StreamOutcome.Failed(
+                    "Sidecar timed out after ${secs}s while computing $label. " +
+                        "Raise \"Sidecar timeout\" in Settings → Tools → dbtree " +
+                        "if your project's column chains are deep, or see idea.log for partial output.",
+                )
+            } catch (e: ExecutionException) {
+                process.destroyForcibly()
+                val cause = e.cause ?: e
+                log.warn("ColumnLineageService.stream: reader thread crashed for $label", cause)
+                return StreamOutcome.Failed("Sidecar reader crashed: ${cause.message}")
+            }
+
+            // Drain process exit code; stdout reader hit EOF, so the
+            // sidecar has already finished or is about to.
+            val exitCode = if (process.waitFor(2, TimeUnit.SECONDS)) {
+                process.exitValue()
+            } else {
+                process.destroyForcibly()
+                log.warn("ColumnLineageService.stream: $label didn't exit after EOF; killed")
+                -1
+            }
+
+            if (exitCode != 0) {
+                val stderr = process.errorStream.bufferedReader(Charsets.UTF_8).readText().trim()
+                log.info(
+                    "ColumnLineageService.stream: $label exited $exitCode " +
+                        "(via $source / $python). stderr: $stderr",
+                )
+                return StreamOutcome.Failed(
+                    if (stderr.isNotBlank()) "Sidecar exited with code $exitCode: $stderr"
+                    else "Sidecar exited with code $exitCode while computing $label.",
+                )
+            }
+
+            log.info(
+                "ColumnLineageService.stream: $label via $source ($python) " +
+                    "-> streamed ${outcome.edgeCount} edges, notice=${outcome.notice != null}",
+            )
+            return StreamOutcome.Ok(outcome.notice)
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    private fun readSidecarStream(
+        process: Process,
+        onEdge: (ColumnEdge) -> Unit,
+    ): StreamReadResult {
+        var notice: String? = null
+        var edgeCount = 0
+        process.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            for (rawLine in lines) {
+                val line = rawLine.trim()
+                if (line.isEmpty()) continue
+                val obj = try {
+                    sidecarJson.parseToJsonElement(line).jsonObject
+                } catch (_: Exception) {
+                    // Tolerate junk lines (e.g. uv warning lines on stdout
+                    // when the user's interpreter happens to print there).
+                    continue
+                }
+                when {
+                    "edge" in obj -> {
+                        val edge = try {
+                            sidecarJson.decodeFromJsonElement(
+                                FullWalkEdge.serializer(),
+                                obj["edge"]!!,
+                            )
+                        } catch (e: Exception) {
+                            log.warn("dbtree stream: malformed edge line: $line", e)
+                            continue
+                        }
+                        onEdge(edge.toColumnEdge())
+                        edgeCount++
+                    }
+                    "done" in obj -> {
+                        notice = obj["done"]?.jsonObject?.get("notice")?.let { v ->
+                            when (v) {
+                                is JsonNull -> null
+                                is JsonPrimitive -> v.content.takeIf { it.isNotBlank() }
+                                else -> null
+                            }
+                        }
+                    }
+                    // "start" / unknown envelopes — ignore.
+                }
+            }
+        }
+        return StreamReadResult(edgeCount = edgeCount, notice = notice)
     }
 
     /**
