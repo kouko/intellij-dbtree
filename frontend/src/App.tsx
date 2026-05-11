@@ -26,15 +26,22 @@ import {
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
-const NODE_WIDTH = 280;
-// Empirical char-per-line estimate at NODE_WIDTH=280, font-weight 600 / 12px,
+const NODE_WIDTH = 320;
+// Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
-// to feed dagre an approximate per-node height; actual rendering is done
-// by the browser's wordBreak.
-const CHARS_PER_NAME_LINE = 18;
+// to feed the layout engine an approximate per-node height; actual rendering
+// is done by the browser's wordBreak.
+const CHARS_PER_NAME_LINE = 22;
 const NAME_LINE_HEIGHT = 16;
 const HEADER_BASE_HEIGHT = 32; // padding + first name line
-const ROW_HEIGHT = 22;
+// Column-row constants. Both name and type can wrap; the row's visible height
+// is the taller of the two columns. Char budgets are calibrated for the
+// 50/50 flex split (name flex:1 1 auto, type max-width:50%) at NODE_WIDTH=320,
+// font sizes 10px (name) / 9px (type).
+const COLUMN_NAME_CHARS_PER_LINE = 22; // monospace 10px in ~140px column
+const COLUMN_TYPE_CHARS_PER_LINE = 22; // monospace 9px in ~140px column
+const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
+const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
 
 const PLUGIN_HOST = "intellij-dbtree.local";
@@ -211,6 +218,43 @@ function App() {
       : null,
   );
 
+  // While the Python sidecar is computing column lineage, surface a
+  // "computing…" hint in the toolbar so a 5-second wait doesn't look
+  // like a hang. Cleared when the backend's response (new column_edges)
+  // touches the column we're waiting on, or after 15s as a safety net
+  // (matches the sidecar's own timeout).
+  const [computingFor, setComputingFor] = useState<{
+    unique_id: string;
+    column: string;
+  } | null>(null);
+
+  // Clear the "computing…" hint when the streaming sidecar signals
+  // it's done — payload.column_lineage_done flips to true on the
+  // final flush (success or failure) and stays false during
+  // intermediate batched publishes. With streaming we explicitly
+  // CAN'T treat "first edge arrived" as done, because more edges
+  // may follow.
+  //
+  // Safety net: 60s timeout matches the new default sidecar timeout
+  // so the hint never gets stuck if the plugin somehow forgets to
+  // emit a terminal payload.
+  useEffect(() => {
+    if (!computingFor) return;
+    if (
+      payload.column_lineage_done !== false &&
+      payload.selected?.unique_id === computingFor.unique_id &&
+      payload.selected?.column === computingFor.column
+    ) {
+      setComputingFor(null);
+    }
+  }, [computingFor, payload.column_lineage_done, payload.selected]);
+
+  useEffect(() => {
+    if (!computingFor) return;
+    const t = setTimeout(() => setComputingFor(null), 60_000);
+    return () => clearTimeout(t);
+  }, [computingFor]);
+
   // When a new full payload arrives, drop column selection if the column
   // no longer exists, and ensure the selected model is expanded.
   useEffect(() => {
@@ -297,6 +341,7 @@ function App() {
       window.kotlinCallback(
         JSON.stringify({ event: "COLUMN_CLICK", unique_id: uniqueId, column }),
       );
+      setComputingFor({ unique_id: uniqueId, column });
     }
   }, []);
 
@@ -383,28 +428,19 @@ function App() {
   );
 
   // ---- xyflow nodes/edges --------------------------------------------------
-  // `derivedNodes` is rebuilt whenever data changes. `liveNodes` is what
-  // ReactFlow actually renders — it's seeded from derivedNodes but accepts
-  // mid-drag position updates from onNodesChange so the card follows the
-  // cursor in real time. After drop, `onNodeDragStop` writes the final
-  // position into `manualPositions`, which feeds back into derivedNodes —
-  // so the position survives across re-renders without snapping back.
-  const derivedNodes: Node[] = useMemo(() => {
+  // Layout runs asynchronously, so node data and node positions are computed
+  // in two phases:
+  //   rawNodes:  pure data (sync, useMemo)
+  //   positions: layout output (async, useEffect → useState)
+  //   derivedNodes: rawNodes merged with positions and manualPositions (sync, useMemo)
+
+  const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = useMemo(() => {
     const isExpanded = (uid: string) => expanded.has(uid);
-    const heights: Record<string, number> = {};
-    for (const m of payload.models) {
-      const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
-      const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
-      const colsH = isExpanded(m.unique_id)
-        ? m.columns.length * ROW_HEIGHT + COLS_VERTICAL_PADDING
-        : 0;
-      heights[m.unique_id] = headerH + colsH;
-    }
 
     const onLineagePath = (uid: string) =>
       selectedColumn ? lineageTrace.models.has(uid) : modelTrace.all.has(uid);
 
-    const rawNodes: Array<Node<DbtModelNodeData, "dbtModel">> = payload.models.map((m) => ({
+    return payload.models.map((m) => ({
       id: m.unique_id,
       type: "dbtModel" as const,
       position: { x: 0, y: 0 },
@@ -428,18 +464,6 @@ function App() {
         onOpenFile,
       },
     }));
-
-    const positioned = layoutModelGraph(rawNodes, modelLevelEdges(payload), {
-      rankdir: "LR",
-      nodeWidth: NODE_WIDTH,
-      nodesepX: 60,
-      ranksepY: 100,
-      heights,
-    });
-    return positioned.map((n) => {
-      const manual = manualPositions[n.id];
-      return manual ? { ...n, position: manual } : n;
-    });
   }, [
     payload,
     expanded,
@@ -449,11 +473,88 @@ function App() {
     selectedColumn,
     theme,
     selectedModelUid,
-    manualPositions,
     toggleExpanded,
     onColumnClick,
     onOpenFile,
   ]);
+
+  const heights: Record<string, number> = useMemo(() => {
+    const h: Record<string, number> = {};
+    for (const m of payload.models) {
+      const nameLines = Math.max(1, Math.ceil(m.name.length / CHARS_PER_NAME_LINE));
+      const headerH = HEADER_BASE_HEIGHT + (nameLines - 1) * NAME_LINE_HEIGHT;
+      let colsH = 0;
+      if (expanded.has(m.unique_id)) {
+        for (const col of m.columns) {
+          const nameRowLines = Math.max(
+            1,
+            Math.ceil(col.name.length / COLUMN_NAME_CHARS_PER_LINE),
+          );
+          const typeRowLines = col.type
+            ? Math.max(1, Math.ceil(col.type.length / COLUMN_TYPE_CHARS_PER_LINE))
+            : 1;
+          const lines = Math.max(nameRowLines, typeRowLines);
+          colsH += lines * COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING;
+        }
+        colsH += COLS_VERTICAL_PADDING;
+      }
+      h[m.unique_id] = headerH + colsH;
+    }
+    return h;
+  }, [payload, expanded]);
+
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    // Layout only depends on topology (ids + edges) and per-node heights.
+    // Build a minimal Node[] for layout — node `data` (highlight, selection,
+    // expansion) is irrelevant to positioning. Re-running layout when only
+    // display state changes would shift coordinates on every column click.
+    const layoutNodes: Node[] = payload.models.map((m) => ({
+      id: m.unique_id,
+      position: { x: 0, y: 0 },
+      data: {},
+    }));
+    layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
+      rankdir: "LR",
+      nodeWidth: NODE_WIDTH,
+      nodesepX: 60,
+      ranksepY: 100,
+      heights,
+    }).then((positioned) => {
+      if (cancelled) return;
+      const next: Record<string, { x: number; y: number }> = {};
+      for (const n of positioned) next[n.id] = n.position;
+      setPositions(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [payload, heights]);
+
+  const derivedNodes: Node[] = useMemo(() => {
+    return rawNodes.map((n) => {
+      const manual = manualPositions[n.id];
+      const auto = positions[n.id];
+      // If a node has no position yet (fresh from a hop change, ELK still
+      // resolving), hide it rather than flashing it at the origin.
+      if (!manual && !auto) {
+        return {
+          ...n,
+          hidden: true,
+          width: NODE_WIDTH,
+          height: heights[n.id] ?? 60,
+        };
+      }
+      return {
+        ...n,
+        position: manual ?? auto!,
+        width: NODE_WIDTH,
+        height: heights[n.id] ?? 60,
+      };
+    });
+  }, [rawNodes, positions, manualPositions, heights]);
 
   // What ReactFlow actually renders: derivedNodes overlaid with any
   // in-flight drag positions. No separate state — derivedNodes is the
@@ -543,13 +644,34 @@ function App() {
   }, [payload.models, payload.model_edges]);
 
   const [fitKey, setFitKey] = useState(0);
+
+  // Reset manual / live positions on topology change — previous drag
+  // positions are not meaningful for the new node set.
   useEffect(() => {
-    setFitKey((k) => k + 1);
-    // New topology = previous drag positions are not meaningful for the
-    // new node set; reset so dagre can lay out cleanly.
     setManualPositions({});
     setLivePositions({});
   }, [topologyKey]);
+
+  // Detect when ELK has produced positions for every node in the current
+  // topology. Used to defer fitView until the layout actually has all
+  // nodes — bumping fitKey too early fits the viewport to a partial set
+  // and the nodes that arrive late fall outside the visible area.
+  const positionsCompleteForTopology = useMemo(() => {
+    if (payload.models.length === 0) return false;
+    return payload.models.every((m) => positions[m.unique_id] !== undefined);
+  }, [payload.models, positions]);
+
+  // Re-fit ONLY once per topology, and only after positions are ready.
+  // lastFittedTopology guards against re-firing on subsequent position
+  // updates within the same topology (e.g. height changes from column
+  // expand).
+  const [lastFittedTopology, setLastFittedTopology] = useState<string>("");
+  useEffect(() => {
+    if (positionsCompleteForTopology && topologyKey !== lastFittedTopology) {
+      setFitKey((k) => k + 1);
+      setLastFittedTopology(topologyKey);
+    }
+  }, [positionsCompleteForTopology, topologyKey, lastFittedTopology]);
 
   const isEmpty = payload.models.length === 0;
 
@@ -578,6 +700,12 @@ function App() {
         selected={selectedColumn}
         onClear={() => setSelectedColumn(null)}
         traceCount={lineageTrace.edges.size}
+        computing={
+          !!(computingFor &&
+             selectedColumn &&
+             computingFor.unique_id === selectedColumn.unique_id &&
+             computingFor.column === selectedColumn.column)
+        }
       />
       {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
       <div style={{ flex: 1, position: "relative" }}>
@@ -661,6 +789,7 @@ function Toolbar({
   selected,
   onClear,
   traceCount,
+  computing,
 }: {
   theme: Theme;
   upHops: number;
@@ -675,6 +804,7 @@ function Toolbar({
   selected: { unique_id: string; column: string } | null;
   onClear: () => void;
   traceCount: number;
+  computing: boolean;
 }) {
   const t = theme;
   const buttonStyle: React.CSSProperties = {
@@ -765,7 +895,26 @@ function Toolbar({
               {selected.unique_id.split(".").pop()}.{selected.column}
             </code>
             {" — "}
-            {traceCount} column edge{traceCount === 1 ? "" : "s"}
+            {computing && traceCount === 0 ? (
+              <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                computing column lineage…
+              </em>
+            ) : computing ? (
+              // Streaming sidecar emits edges progressively. Show the
+              // running count alongside an italic "(computing…)" suffix
+              // so the user sees forward motion without losing sight of
+              // the fact that more edges may still arrive.
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
+                <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                  (computing…)
+                </em>
+              </>
+            ) : (
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}
+              </>
+            )}
           </span>
           <button type="button" onClick={onClear} style={buttonStyle}>
             clear

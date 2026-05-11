@@ -192,21 +192,42 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
                   padding: "3px 12px",
                   display: "flex",
                   justifyContent: "space-between",
+                  alignItems: "flex-start",
                   gap: 8,
                   cursor: "pointer",
                   background: highlighted ? t.highlightBg : "transparent",
                   borderLeft: highlighted ? `3px solid ${t.edgeHighlight}` : "3px solid transparent",
                   fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                  fontSize: 11,
+                  fontSize: 10,
+                  lineHeight: 1.3,
                   color: highlighted ? t.highlightText : colors.text,
                   fontWeight: highlighted ? 600 : 400,
                 }}
               >
-                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span
+                  style={{
+                    flex: "1 1 auto",
+                    minWidth: 0,
+                    wordBreak: "break-all",
+                    textAlign: "left",
+                  }}
+                >
                   {col.name}
                 </span>
                 {col.type && (
-                  <span style={{ color: t.toolbarTextSubtle, fontSize: 10 }}>{col.type}</span>
+                  <span
+                    style={{
+                      flex: "0 1 auto",
+                      maxWidth: "50%",
+                      color: t.toolbarTextSubtle,
+                      fontSize: 9,
+                      lineHeight: 1.3,
+                      wordBreak: "break-all",
+                      textAlign: "right",
+                    }}
+                  >
+                    {col.type}
+                  </span>
                 )}
               </li>
             );

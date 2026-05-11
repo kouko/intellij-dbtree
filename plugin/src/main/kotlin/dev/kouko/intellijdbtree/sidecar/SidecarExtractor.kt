@@ -41,6 +41,7 @@ object SidecarExtractor {
         "cli.py",
         "lineage.py",
         "manifest.py",
+        "walker.py",
     )
 
     /**

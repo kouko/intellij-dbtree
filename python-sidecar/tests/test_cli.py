@@ -91,3 +91,56 @@ def test_cli_accepts_short_and_unique_id(dbt_project_inline: Path, model_ref: st
         "--column", "id",
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
+
+
+def test_cli_full_walk_stream_emits_ndjson(dbt_project_inline: Path) -> None:
+    """--stream emits start/edge*/done lines, one per line, JSON-parseable.
+    Plugin consumers read line-by-line to render progressive lineage."""
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--model", "fct_orders",
+        "--column", "id",
+        "--full-walk",
+        "--stream",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    assert len(lines) >= 2, f"expected at least start+done, got: {lines!r}"
+
+    # First line: start envelope with model + column metadata
+    head = json.loads(lines[0])
+    assert "start" in head
+    assert head["start"]["column"] == "id"
+    assert head["start"]["model"]["unique_id"] == "model.demo.fct_orders"
+
+    # Last line: done envelope (may or may not carry a notice)
+    tail = json.loads(lines[-1])
+    assert "done" in tail
+    assert "notice" in tail["done"]  # key always present, value may be null
+
+    # Everything between: edge envelopes with the wire-format keys the
+    # plugin's FullWalkEdge DTO expects.
+    edges = [json.loads(ln)["edge"] for ln in lines[1:-1]]
+    assert len(edges) >= 1
+    for e in edges:
+        assert set(e.keys()) >= {
+            "source_unique_id", "source_column",
+            "target_unique_id", "target_column",
+            "expression",
+        }
+
+
+def test_cli_full_walk_non_stream_still_returns_object(dbt_project_inline: Path) -> None:
+    """Backwards-compat: --full-walk without --stream returns one JSON
+    object (with edges list), same as before the streaming addition."""
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--model", "fct_orders",
+        "--column", "id",
+        "--full-walk",
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    assert "edges" in payload
+    assert isinstance(payload["edges"], list)

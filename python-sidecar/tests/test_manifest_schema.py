@@ -125,7 +125,13 @@ class TestListModelColumns:
 # ----- build_sqlglot_schema ----------------------------------------------
 
 class TestBuildSqlglotSchema:
-    def test_three_part_relation_builds_nested_dict(self) -> None:
+    """Behavior: returns a flat ``{table: {col: type}}`` dict.
+
+    Schema-agnostic by design — see DbtManifest.build_sqlglot_schema
+    docstring for the dbt-target-mismatch rationale.
+    """
+
+    def test_models_keyed_by_bare_name(self) -> None:
         manifest = {
             "nodes": {
                 "model.demo.orders": _model(
@@ -137,10 +143,10 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest)
-        schema = m.build_sqlglot_schema()
-        assert schema == {"warehouse": {"public": {"orders": {"id": "INTEGER"}}}}
+        assert m.build_sqlglot_schema() == {"orders": {"id": "INTEGER"}}
 
-    def test_two_part_relation_uses_empty_db_wrapper(self) -> None:
+    def test_ignores_db_schema_qualification(self) -> None:
+        """db/schema parts of relation_name are intentionally discarded."""
         manifest = {
             "nodes": {
                 "model.demo.orders": _model(
@@ -152,30 +158,8 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest)
-        schema = m.build_sqlglot_schema()
-        # 2-part: db part is empty string, schema = "public", table = "orders".
-        # The single-tier collapse below applies since only one outer entry.
-        # But the inner has "public" as a non-empty schema, so it doesn't
-        # fully collapse — we keep the empty-db wrapper.
-        assert schema == {"public": {"orders": {"id": "INTEGER"}}}
-
-    def test_one_part_relation_collapses_to_flat_table_map(self) -> None:
-        # Single-tier warehouses (e.g. duckdb without a schema) end up with
-        # only a table name. The function strips the empty-string outer
-        # wrappers so callers get a flat {table: {col: type}} dict.
-        manifest = {
-            "nodes": {
-                "model.demo.orders": _model(
-                    "model.demo.orders",
-                    name="orders",
-                    relation_name='"orders"',
-                    columns={"id": {"data_type": "INTEGER"}},
-                ),
-            },
-        }
-        m = DbtManifest(manifest)
-        schema = m.build_sqlglot_schema()
-        assert schema == {"orders": {"id": "INTEGER"}}
+        # Same flat output as the 3-part variant — schema mismatch tolerated.
+        assert m.build_sqlglot_schema() == {"orders": {"id": "INTEGER"}}
 
     def test_catalog_type_wins_over_manifest_data_type(self) -> None:
         manifest = {
@@ -195,13 +179,12 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest, catalog=catalog)
-        schema = m.build_sqlglot_schema()
         # id: catalog wins; amount: catalog has no entry, falls back to manifest
-        assert schema == {"db": {"schema": {"orders": {"id": "BIGINT", "amount": "FLOAT"}}}}
+        assert m.build_sqlglot_schema() == {"orders": {"id": "BIGINT", "amount": "FLOAT"}}
 
-    def test_skips_models_without_relation_name(self) -> None:
-        # An unbuilt model (never compiled / materialized) has no
-        # relation_name — skip it rather than crash.
+    def test_includes_models_without_relation_name(self) -> None:
+        """Unbuilt models without relation_name are still included — flat
+        schema doesn't need a relation to position them."""
         manifest = {
             "nodes": {
                 "model.demo.never_built": _model(
@@ -218,8 +201,10 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest)
-        schema = m.build_sqlglot_schema()
-        assert schema == {"db": {"s": {"orders": {"id": "INT"}}}}
+        assert m.build_sqlglot_schema() == {
+            "never_built": {"x": "INT"},
+            "orders": {"id": "INT"},
+        }
 
     def test_skips_models_with_empty_columns(self) -> None:
         # If we have neither catalog rows nor manifest data_type, the entry
@@ -255,10 +240,9 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest, catalog=catalog)
-        schema = m.build_sqlglot_schema()
-        assert schema == {"db": {"raw": {"users": {"id": "UUID"}}}}
+        assert m.build_sqlglot_schema() == {"users": {"id": "UUID"}}
 
-    def test_models_and_sources_coexist_in_same_db_schema(self) -> None:
+    def test_models_and_sources_coexist(self) -> None:
         manifest = {
             "nodes": {
                 "model.demo.orders": _model(
@@ -278,40 +262,37 @@ class TestBuildSqlglotSchema:
             },
         }
         m = DbtManifest(manifest)
-        schema = m.build_sqlglot_schema()
-        assert schema == {
-            "db": {
-                "public": {
-                    "orders": {"id": "INT"},
-                    "users": {"id": "TEXT"},
-                },
-            },
+        assert m.build_sqlglot_schema() == {
+            "orders": {"id": "INT"},
+            "users": {"id": "TEXT"},
         }
 
-    def test_strips_only_outer_wrapper_when_inner_schema_is_named(self) -> None:
-        # When 2-part identifiers leave db="" but schema is non-empty, we
-        # collapse the outer empty-db wrapper but keep the schema layer.
+    def test_model_wins_over_source_on_bare_name_collision(self) -> None:
+        """Rare but possible: a source and model share the bare name.
+        Model is added first; existing columns win on overlap."""
         manifest = {
             "nodes": {
-                "model.demo.a": _model(
-                    "model.demo.a",
-                    name="a",
-                    relation_name='"main"."a"',
-                    columns={"x": {"data_type": "INT"}},
+                "model.demo.events": _model(
+                    "model.demo.events",
+                    name="events",
+                    relation_name='"db"."s"."events"',
+                    columns={"id": {"data_type": "INT"}},
                 ),
-                "model.demo.b": _model(
-                    "model.demo.b",
-                    name="b",
-                    relation_name='"main"."b"',
-                    columns={"y": {"data_type": "INT"}},
+            },
+            "sources": {
+                "source.demo.raw.events": _source(
+                    "source.demo.raw.events",
+                    name="events",
+                    relation_name='"db"."raw"."events"',
+                    columns={"id": {"data_type": "TEXT"}, "raw_only": {"data_type": "JSON"}},
                 ),
             },
         }
         m = DbtManifest(manifest)
-        # Both have empty db, both share schema=main → collapse outer ""
-        # to expose {main: {a: ..., b: ...}}.
+        # Model added first; on collision, model's `id` wins, but the
+        # source's extra `raw_only` is merged in.
         assert m.build_sqlglot_schema() == {
-            "main": {"a": {"x": "INT"}, "b": {"y": "INT"}},
+            "events": {"id": "INT", "raw_only": "JSON"},
         }
 
 

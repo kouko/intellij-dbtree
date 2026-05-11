@@ -152,6 +152,24 @@ class PayloadSerializationTest {
     }
 
     @Test
+    fun `column_lineage_done serializes as snake_case and defaults true`() {
+        // Default: streaming flag is true so non-streaming publishers
+        // (full payloads, hop changes, etc.) don't trigger the React
+        // "computing…" hint by accident.
+        val defaultPayload = LineagePayload()
+        val defaultTree = json.parseToJsonElement(json.encodeToString(LineagePayload.serializer(), defaultPayload)).jsonObject
+        assertTrue("column_lineage_done" in defaultTree)
+        assertTrue(defaultTree["column_lineage_done"]!!.jsonPrimitive.boolean)
+        assertFalse("columnLineageDone" in defaultTree, "camelCase form must not appear")
+
+        // Setting false flows through unchanged — used by the streaming
+        // column-lineage publish path between start and final flush.
+        val streamingPayload = LineagePayload(columnLineageDone = false)
+        val streamingTree = json.parseToJsonElement(json.encodeToString(LineagePayload.serializer(), streamingPayload)).jsonObject
+        assertFalse(streamingTree["column_lineage_done"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test
     fun `round-trip of a full payload preserves all fields`() {
         val original = LineagePayload(
             models = listOf(

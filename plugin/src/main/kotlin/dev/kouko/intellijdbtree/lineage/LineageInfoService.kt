@@ -6,6 +6,7 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.util.messages.Topic
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -99,22 +100,42 @@ class LineageInfoService(private val project: Project) {
      */
     fun onActiveFileChanged(file: VirtualFile?) {
         if (file == null || file.extension != "sql") return
-        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
-            if (isSuperseded(myEpoch, cur)) return@executeOnPooledThread
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    // updateAndGet (not set) so we don't roll back fields a
-                    // newer racing task may have written between the epoch
-                    // check and here — including the epoch itself.
+                    // No epoch bump on this branch — selection within the
+                    // current DAG is a lightweight pointer update and must
+                    // NOT supersede pending long-running work like an
+                    // in-flight column-lineage trace.
+                    //
+                    // Real-world race fixed by this: clicking a column
+                    // triggers (a) a file-open callback that fires
+                    // onActiveFileChanged for the focal model, and (b) a
+                    // column-trace callback that spawns a multi-second
+                    // sidecar call. Both used to bump epoch; the
+                    // selection bump happening after the column-trace
+                    // bump caused the column result to be dropped as
+                    // "superseded". Symptom: first click on a column
+                    // shows no edges, second click works (file was
+                    // already open the second time, so no
+                    // onActiveFileChanged fired).
+                    //
+                    // updateAndGet (not set) so we don't roll back fields
+                    // a newer racing task may have written between here
+                    // and the state read above.
                     state.updateAndGet { it.copy(activeUid = decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
+                    // A real topology change — bump epoch HERE so older
+                    // rebuilds and older column traces are correctly
+                    // superseded by this newer focal-model switch.
+                    val myEpoch = bumpEpoch()
+                    if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
                     publishFull(manifest, decision.uid)
                 }
             }
@@ -177,8 +198,21 @@ class LineageInfoService(private val project: Project) {
 
     /**
      * The user clicked a column in the React UI. Spawn the Python sidecar
-     * to compute its full upstream column lineage, then re-publish the
-     * payload with `column_edges` populated. Layout doesn't change.
+     * in --stream mode and republish the payload progressively as edges
+     * are discovered:
+     *
+     *   1. Immediate publish: empty column_edges, columnLineageDone=false,
+     *      so the toolbar shows "computing column lineage…" without delay.
+     *   2. Debounced publish (every [STREAM_PUBLISH_INTERVAL_MS]ms or on
+     *      done): partial column_edges, columnLineageDone=false. React
+     *      paints edges incrementally so the user sees progress instead
+     *      of waiting in the dark.
+     *   3. Final publish: full column_edges, columnLineageDone=true,
+     *      warning (if any). Clears the "computing…" hint.
+     *
+     * Topology never changes here — the same DAG nodes / model edges
+     * are reused across all three publishes. React's topologyKey memo
+     * skips the re-fit.
      */
     fun onColumnClicked(modelUid: String, column: String) {
         val myEpoch = bumpEpoch()
@@ -187,32 +221,73 @@ class LineageInfoService(private val project: Project) {
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val cur = state.get()
             val activeUid = cur.activeUid ?: modelUid
-
             val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
-            val result = project.service<ColumnLineageService>()
-                .computeForColumn(modelUid, column, manifest)
+            val selected = Selected(uniqueId = modelUid, column = column)
+            val publishedUids = basePayload.models.map { it.uniqueId }.toSet()
+            state.updateAndGet { it.copy(publishedUids = publishedUids) }
 
-            // Sidecar takes ~1s — the user may have clicked another column,
-            // switched files, or closed the project in the meantime. Re-check
-            // both before publishing.
+            // Step 1: immediate "computing…" publish.
+            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
+            publisher.lineagePayloadChanged(
+                basePayload.copy(
+                    columnEdges = emptyList(),
+                    selected = selected,
+                    columnLineageDone = false,
+                ),
+            )
+
+            // Step 2: stream edges, debounced republish.
+            val edges = mutableListOf<ColumnEdge>()
+            var lastFlushNanos = System.nanoTime()
+            val flushIntervalNanos = TimeUnit.MILLISECONDS.toNanos(STREAM_PUBLISH_INTERVAL_MS)
+            val flushLock = Any()
+
+            val outcome = project.service<ColumnLineageService>().computeForColumnStream(
+                modelUid,
+                column,
+                manifest,
+                onEdge = { edge ->
+                    synchronized(flushLock) {
+                        edges.add(edge)
+                        val now = System.nanoTime()
+                        if (now - lastFlushNanos >= flushIntervalNanos) {
+                            lastFlushNanos = now
+                            if (!project.isDisposed && !isSuperseded(myEpoch, state.get())) {
+                                publisher.lineagePayloadChanged(
+                                    basePayload.copy(
+                                        columnEdges = edges.toList(),
+                                        selected = selected,
+                                        columnLineageDone = false,
+                                    ),
+                                )
+                            }
+                        }
+                    }
+                },
+            )
+
+            // Step 3: final publish (edges complete + done=true + warning).
             if (project.isDisposed) return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
 
-            val (edges, warning) = when (result) {
-                is ColumnLineageService.Result.Ok -> result.edges to null
-                is ColumnLineageService.Result.Failed -> emptyList<ColumnEdge>() to result.warning
+            val (finalEdges, warning) = synchronized(flushLock) {
+                val snapshot = edges.toList()
+                val w = when (outcome) {
+                    is ColumnLineageService.StreamOutcome.Ok ->
+                        outcome.notice?.takeIf { it.isNotBlank() && snapshot.isEmpty() }
+                    is ColumnLineageService.StreamOutcome.Failed -> outcome.warning
+                }
+                snapshot to w
             }
 
-            val payload = basePayload.copy(
-                columnEdges = edges,
-                selected = Selected(uniqueId = modelUid, column = column),
-                warning = warning,
+            publisher.lineagePayloadChanged(
+                basePayload.copy(
+                    columnEdges = finalEdges,
+                    selected = selected,
+                    warning = warning,
+                    columnLineageDone = true,
+                ),
             )
-            // Topology hasn't changed (same nodes / model edges); the
-            // frontend's topologyKey memo will skip the re-fit.
-            val publishedUids = payload.models.map { it.uniqueId }.toSet()
-            state.updateAndGet { it.copy(publishedUids = publishedUids) }
-            publisher.lineagePayloadChanged(payload)
         }
     }
 
@@ -238,6 +313,17 @@ class LineageInfoService(private val project: Project) {
     companion object {
         const val DEFAULT_UP_HOPS = 3
         const val DEFAULT_DOWN_HOPS = 3
+
+        /**
+         * Minimum interval between progressive `columnLineageDone=false`
+         * republishes during a streaming column-lineage trace. Each
+         * republish triggers a React re-render of the DAG; too frequent
+         * (per-edge) saturates JCEF's event loop, too rare defeats the
+         * "live progress" UX point. 500ms is the empirical sweet spot
+         * for the iCHEF-sized project: edges typically arrive in bursts
+         * and the user perceives ~2Hz updates as continuous.
+         */
+        const val STREAM_PUBLISH_INTERVAL_MS = 500L
 
         @JvmField
         val TOPIC: Topic<LineageInfoListener> = Topic.create(
