@@ -187,10 +187,28 @@ class DbtManifest:
             if path.is_file():
                 return path.read_text(encoding="utf-8")
 
+        # Fallback: subsequent `dbt parse` / `dbt deps` (or IDE-driven
+        # equivalents) regenerate manifest.json without compiled_code /
+        # compiled_path, but they don't delete the already-compiled SQL
+        # files under `target/compiled/<package>/<original_file_path>`.
+        # Derive that standard path from the manifest's metadata so a
+        # one-time `dbt compile` keeps benefiting the plugin even after
+        # the manifest gets rewritten.
+        derived = self._derived_compiled_path(node)
+        if derived is not None and derived.is_file():
+            return derived.read_text(encoding="utf-8")
+
         raise ManifestError(
             f"Model {node.get('unique_id')!r} has no compiled SQL. "
             "Run `dbt compile` first."
         )
+
+    def _derived_compiled_path(self, node: dict[str, Any]) -> Path | None:
+        package = node.get("package_name")
+        original = node.get("original_file_path")
+        if not (package and original and self._project_dir is not None):
+            return None
+        return self._project_dir / "target" / "compiled" / package / original
 
     def list_model_columns(self, unique_id: str) -> list[str]:
         """Return every known column name for a model.
@@ -310,3 +328,33 @@ class DbtManifest:
         if node is None:
             return None
         return node.get("name")
+
+    def compiled_model_stats(self) -> tuple[int, int]:
+        """Return ``(compiled_count, total_count)`` for models in the manifest.
+
+        A model counts as compiled when EITHER:
+          - it has a non-empty ``compiled_code`` field in the manifest, OR
+          - it has a non-null ``compiled_path`` field, OR
+          - the derived `target/compiled/<package>/<original_file_path>`
+            file exists on disk (handles the case where `dbt parse` wiped
+            compiled_code/compiled_path but left the SQL files behind).
+        Used by the walker to distinguish "no compile ever ran" from
+        "compile ran but partially failed".
+        """
+        compiled = 0
+        total = 0
+        for node in self._nodes.values():
+            if node.get("resource_type") != "model":
+                continue
+            total += 1
+            code = node.get("compiled_code")
+            if isinstance(code, str) and code.strip():
+                compiled += 1
+                continue
+            if node.get("compiled_path"):
+                compiled += 1
+                continue
+            derived = self._derived_compiled_path(node)
+            if derived is not None and derived.is_file():
+                compiled += 1
+        return compiled, total

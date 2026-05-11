@@ -145,6 +145,51 @@ def test_walk_emits_notice_when_no_model_has_compiled_sql(tmp_path: Path) -> Non
     assert edges == []
     assert notice is not None
     assert "dbt compile" in notice
+    # 0 of 2 models compiled — the "no compile ever" variant.
+    assert "0 of 2" in notice
+
+
+def test_walk_notice_distinguishes_partial_compile(tmp_path: Path) -> None:
+    """When SOME models have compiled SQL but the trace path doesn't
+    reach them, the notice should surface the partial-compile count
+    rather than the generic "dbt compile" hint — same actionable text
+    points the user to look for compile failures."""
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    # 3 models, 1 compiled, 0 of them on the trace path
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.a": {
+                "unique_id": "model.demo.a", "name": "a",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": None, "compiled_path": None,
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.b": {
+                "unique_id": "model.demo.b", "name": "b",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": None, "compiled_path": None,
+                "depends_on": {"nodes": ["model.demo.a"]},
+            },
+            "model.demo.c": {
+                "unique_id": "model.demo.c", "name": "c",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM unrelated",
+                "depends_on": {"nodes": []},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+    edges, notice = _walk(project, "a", "id")
+    assert edges == []
+    assert notice is not None
+    # Partial-compile variant surfaces the actual ratio.
+    assert "1 of 3" in notice
+    assert "failed models" in notice
 
 
 def test_walk_no_notice_when_some_edges_found(dbt_project_inline: Path) -> None:
@@ -152,6 +197,60 @@ def test_walk_no_notice_when_some_edges_found(dbt_project_inline: Path) -> None:
     are their own signal."""
     edges, notice = _walk(dbt_project_inline, "fct_orders", "id")
     assert edges, "fixture should produce at least one edge"
+    assert notice is None
+
+
+def test_walk_falls_back_to_compiled_files_on_disk(tmp_path: Path) -> None:
+    """When manifest lacks compiled_code AND compiled_path (because a
+    subsequent `dbt parse` overwrote them), but the previously-compiled
+    SQL files are still on disk, the walker should fall back to reading
+    them via the standard `target/compiled/<pkg>/<original_file_path>`
+    path. Reflects the iCHEF case where IDE-driven dbt commands kept
+    wiping the manifest compile metadata."""
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    # Lay the compiled SQL files on disk under the canonical path.
+    stg_dir = project / "target" / "compiled" / "demo" / "models"
+    stg_dir.mkdir(parents=True, exist_ok=True)
+    (stg_dir / "stg_orders.sql").write_text(
+        "SELECT id, customer_id, amount FROM raw.orders", encoding="utf-8",
+    )
+    (stg_dir / "fct_orders.sql").write_text(
+        "SELECT id, customer_id FROM analytics.stg_orders", encoding="utf-8",
+    )
+    # Manifest has the models registered but NO compiled_code / compiled_path —
+    # mimicking what dbt parse leaves behind.
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.stg_orders": {
+                "unique_id": "model.demo.stg_orders", "name": "stg_orders",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": None, "compiled_path": None,
+                "original_file_path": "models/stg_orders.sql",
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.fct_orders": {
+                "unique_id": "model.demo.fct_orders", "name": "fct_orders",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": None, "compiled_path": None,
+                "original_file_path": "models/fct_orders.sql",
+                "depends_on": {"nodes": ["model.demo.stg_orders"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+    edges, notice = _walk(project, "fct_orders", "id")
+    # Walker should successfully resolve compiled SQL from disk and trace
+    # the upstream edge — no notice should fire.
+    assert any(
+        e["source_unique_id"] == "model.demo.stg_orders"
+        and e["target_unique_id"] == "model.demo.fct_orders"
+        for e in edges
+    )
     assert notice is None
 
 

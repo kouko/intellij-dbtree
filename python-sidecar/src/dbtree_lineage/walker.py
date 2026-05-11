@@ -219,9 +219,34 @@ def walk_full_lineage(
     # children and no SQL — could also be "leaf source", which is a
     # legitimate empty result).
     if not edges and attempted_resolve and not saw_compiled_sql:
-        notice = (
-            "No compiled SQL found in the manifest. Run "
-            "`dbt compile` in the project root and re-open the model."
-        )
+        compiled, total = manifest.compiled_model_stats()
+        if total > 0 and compiled == 0:
+            # No model in the manifest is compiled — most likely the user
+            # ran `dbt parse` / `dbt deps` instead of `dbt compile`, or
+            # the compile never succeeded.
+            notice = (
+                "No compiled SQL found in the manifest "
+                "(0 of {} models compiled). Run `dbt compile` in the "
+                "project root and re-open the model."
+            ).format(total)
+        elif compiled < total:
+            # Partial compile — common when a few models have Jinja /
+            # ref / dependency errors that abort or skip them. Surface
+            # the count so the user knows it's not a "did I compile?"
+            # question, it's a "which models failed compile?" question.
+            notice = (
+                "Only {} of {} models have compiled SQL — this column's "
+                "lineage path doesn't reach any compiled model. Run "
+                "`dbt compile` in the project root and check the output "
+                "for failed models."
+            ).format(compiled, total)
+        else:
+            # Defensive: every model compiled but the walker still found
+            # no SQL on its path. Most likely a bug or a path that goes
+            # entirely through sources (which have no SQL by design).
+            notice = (
+                "No compiled SQL reachable from this column. The lineage "
+                "path may go entirely through dbt sources."
+            )
 
     return [asdict(e) for e in edges], notice
