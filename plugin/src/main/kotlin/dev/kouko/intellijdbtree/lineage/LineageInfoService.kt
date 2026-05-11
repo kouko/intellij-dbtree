@@ -99,22 +99,42 @@ class LineageInfoService(private val project: Project) {
      */
     fun onActiveFileChanged(file: VirtualFile?) {
         if (file == null || file.extension != "sql") return
-        val myEpoch = bumpEpoch()
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             val uid = manifest.resolveByOriginalPath(file.path) ?: return@executeOnPooledThread
             val cur = state.get()
-            if (isSuperseded(myEpoch, cur)) return@executeOnPooledThread
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    // updateAndGet (not set) so we don't roll back fields a
-                    // newer racing task may have written between the epoch
-                    // check and here — including the epoch itself.
+                    // No epoch bump on this branch — selection within the
+                    // current DAG is a lightweight pointer update and must
+                    // NOT supersede pending long-running work like an
+                    // in-flight column-lineage trace.
+                    //
+                    // Real-world race fixed by this: clicking a column
+                    // triggers (a) a file-open callback that fires
+                    // onActiveFileChanged for the focal model, and (b) a
+                    // column-trace callback that spawns a multi-second
+                    // sidecar call. Both used to bump epoch; the
+                    // selection bump happening after the column-trace
+                    // bump caused the column result to be dropped as
+                    // "superseded". Symptom: first click on a column
+                    // shows no edges, second click works (file was
+                    // already open the second time, so no
+                    // onActiveFileChanged fired).
+                    //
+                    // updateAndGet (not set) so we don't roll back fields
+                    // a newer racing task may have written between here
+                    // and the state read above.
                     state.updateAndGet { it.copy(activeUid = decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
+                    // A real topology change — bump epoch HERE so older
+                    // rebuilds and older column traces are correctly
+                    // superseded by this newer focal-model switch.
+                    val myEpoch = bumpEpoch()
+                    if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
                     publishFull(manifest, decision.uid)
                 }
             }
