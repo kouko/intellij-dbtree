@@ -254,6 +254,31 @@ def test_walk_falls_back_to_compiled_files_on_disk(tmp_path: Path) -> None:
     assert notice is None
 
 
+def test_walk_invokes_on_edge_callback_for_each_edge(dbt_project_inline: Path) -> None:
+    """The streaming walker variant: ``on_edge`` fires synchronously as
+    each edge is discovered. The final returned list is identical to
+    the non-streaming contract, so callers can compare incremental vs
+    batch output without divergence."""
+    manifest = DbtManifest.from_project(dbt_project_inline)
+    schema = manifest.build_sqlglot_schema() or None
+
+    streamed: list[dict] = []
+    edges, _ = walk_full_lineage(
+        manifest=manifest,
+        seed_uid=manifest.resolve_unique_id("fct_orders"),
+        seed_column="id",
+        dialect=manifest.dialect,
+        schema=schema,
+        on_edge=lambda e: streamed.append(e),
+    )
+
+    # Every edge in the final list was also emitted via on_edge.
+    assert streamed == edges
+    # At least one edge — regression guard that the callback was wired
+    # into the walker, not silently dropped.
+    assert len(streamed) >= 1
+
+
 def test_walk_returns_empty_for_unknown_column(dbt_project_inline: Path) -> None:
     # sqlglot will raise; walker swallows per-call failures and continues.
     edges = _edges(dbt_project_inline, "fct_orders", "nonexistent_column")

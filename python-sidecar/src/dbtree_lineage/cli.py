@@ -66,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
              "the plugin used to make. Requires --column.",
     )
     p.add_argument(
+        "--stream",
+        action="store_true",
+        help="With --full-walk, emit NDJSON (newline-delimited JSON) to "
+             "stdout as each edge is discovered, instead of buffering "
+             "the entire result. Lines are one of: "
+             "`{\"start\": {...}}`, `{\"edge\": {...}}`, "
+             "`{\"done\": {\"notice\": ...}}`. Used by the plugin to "
+             "show progressive lineage highlights while the walk runs.",
+    )
+    p.add_argument(
         "--dialect",
         default=None,
         help="Override sqlglot dialect (default: derived from manifest adapter_type).",
@@ -78,7 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def run(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Execute the requested mode. Returns a dict to be JSON-dumped on
+    stdout — or ``None`` for modes that handle their own stdout writes
+    (currently only ``--full-walk --stream``)."""
     if args.project_dir is not None:
         manifest = DbtManifest.from_project(args.project_dir)
     else:
@@ -106,6 +119,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             },
             "dialect": dialect,
         }
+
+        if args.stream:
+            # NDJSON: one JSON object per line, flushed on emit so the
+            # plugin reader sees edges as the walker finds them.
+            start_line = {"start": {**base, "column": args.column}}
+            print(json.dumps(start_line, ensure_ascii=False), flush=True)
+
+            def _emit_edge(edge_dict: dict[str, Any]) -> None:
+                print(
+                    json.dumps({"edge": edge_dict}, ensure_ascii=False),
+                    flush=True,
+                )
+
+            _, notice = walk_full_lineage(
+                manifest=manifest,
+                seed_uid=seed_uid,
+                seed_column=args.column,
+                dialect=dialect,
+                schema=schema_arg,
+                on_edge=_emit_edge,
+            )
+            done_line = {"done": {"notice": notice}}
+            print(json.dumps(done_line, ensure_ascii=False), flush=True)
+            # Streaming mode bypasses main()'s buffered JSON dump.
+            return None
+
         edges, notice = walk_full_lineage(
             manifest=manifest,
             seed_uid=seed_uid,
@@ -201,6 +240,10 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # noqa: BLE001 — surfaced to user via stderr
         print(f"lineage error: {e}", file=sys.stderr)
         return 3
+
+    # Streaming modes write their own stdout; nothing more to do here.
+    if result is None:
+        return 0
 
     indent = 2 if args.pretty else None
     json.dump(result, sys.stdout, indent=indent, ensure_ascii=False)
