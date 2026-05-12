@@ -8,11 +8,9 @@ import {
 import type { EdgeRoute } from "../lib/layout";
 
 /**
- * Custom React Flow edge that renders a SMOOTH curve through ELK's
- * computed route points (start + bendPoints + end). The curve follows
- * the same avoid-cards path ELK planned for orthogonal routing, but
- * smoothed via Catmull-Rom-to-Bezier conversion so the final visual is
- * a continuous arc instead of a sharp L-bend.
+ * Custom React Flow edge that follows ELK's avoid-cards orthogonal
+ * route but rounds each corner so the final visual is soft straight
+ * segments joined by short arcs, not sharp L-bends.
  *
  * Falls back to React Flow's default bezier when no ELK route is
  * available (sidecar-traced column edges, dagre engine, or the user
@@ -22,38 +20,59 @@ import type { EdgeRoute } from "../lib/layout";
 
 /**
  * Convert a polyline (array of points the curve passes through) to an
- * SVG path string that draws a smooth cubic-Bezier curve passing
- * through every point.
+ * SVG path that keeps the straight segments between corners but rounds
+ * each corner with a short quadratic arc.
  *
- * Algorithm: Catmull-Rom-to-Bezier conversion. For each segment
- * P_i → P_{i+1}, we derive cubic control points from the neighbors
- * (P_{i-1}, P_{i+2}). The resulting curve interpolates every input
- * point exactly while staying smooth (C1-continuous) across segments.
+ * Why not Catmull-Rom: ELK's ORTHOGONAL output places consecutive
+ * bendPoints at 90° corners. A through-every-point smoother
+ * (Catmull-Rom, basis splines, etc) overshoots at consecutive
+ * close-together corners and produces visible S-curves. Corner
+ * rounding never overshoots — between any two corners the path is
+ * literally a line segment, and at each corner we shorten both
+ * incoming and outgoing segments by `radius`, then connect with a
+ * quadratic Bezier whose control point is the corner itself.
  *
- * Tension of 1/6 (the standard Catmull-Rom factor) keeps the curve
- * close to the polyline — important here because ELK's bendPoints
- * are positioned to avoid cards, and we don't want the smoothing to
- * bow the curve back into a card body.
+ * Radius is capped to half the shorter adjacent segment so the
+ * rounding never invades the next corner.
  */
-function catmullRomPath(points: { x: number; y: number }[]): string {
+function roundedCornerPath(
+  points: { x: number; y: number }[],
+  radius: number,
+): string {
   if (points.length < 2) return "";
   if (points.length === 2) {
     return `M ${points[0].x} ${points[0].y} L ${points[1].x} ${points[1].y}`;
   }
   let path = `M ${points[0].x} ${points[0].y}`;
-  for (let i = 0; i < points.length - 1; i++) {
-    const p0 = points[i - 1] ?? points[i];
-    const p1 = points[i];
-    const p2 = points[i + 1];
-    const p3 = points[i + 2] ?? points[i + 1];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    path += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`;
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+    const inDx = curr.x - prev.x;
+    const inDy = curr.y - prev.y;
+    const inLen = Math.hypot(inDx, inDy);
+    const outDx = next.x - curr.x;
+    const outDy = next.y - curr.y;
+    const outLen = Math.hypot(outDx, outDy);
+    // Duplicate points (zero-length segment) — skip rounding,
+    // just emit a line to the corner itself.
+    if (inLen === 0 || outLen === 0) {
+      path += ` L ${curr.x} ${curr.y}`;
+      continue;
+    }
+    const r = Math.min(radius, inLen / 2, outLen / 2);
+    const stopX = curr.x - (inDx / inLen) * r;
+    const stopY = curr.y - (inDy / inLen) * r;
+    const resumeX = curr.x + (outDx / outLen) * r;
+    const resumeY = curr.y + (outDy / outLen) * r;
+    path += ` L ${stopX} ${stopY} Q ${curr.x} ${curr.y} ${resumeX} ${resumeY}`;
   }
+  const last = points[points.length - 1];
+  path += ` L ${last.x} ${last.y}`;
   return path;
 }
+
+const CORNER_RADIUS = 16;
 
 export function ElkRoutedEdge({
   id,
@@ -90,12 +109,12 @@ export function ElkRoutedEdge({
   let labelY: number;
 
   if (route && !isDragged) {
-    // Smooth curve through ELK's route. startPoint and endPoint are
-    // ELK's per-edge attachments on the card border (so parallel
-    // edges to the same card spread out instead of converging at one
-    // handle), bendPoints are the avoid-cards interior route.
+    // Rounded-corner path through ELK's route. startPoint and
+    // endPoint are ELK's per-edge attachments on the card border (so
+    // parallel edges to the same card spread out instead of converging
+    // at one handle), bendPoints are the avoid-cards interior route.
     const points = [route.startPoint, ...route.bendPoints, route.endPoint];
-    path = catmullRomPath(points);
+    path = roundedCornerPath(points, CORNER_RADIUS);
     if (route.bendPoints.length > 0) {
       const mid = route.bendPoints[Math.floor(route.bendPoints.length / 2)];
       labelX = mid.x;

@@ -52,14 +52,14 @@ export async function layoutModelGraph(
       "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
       "elk.layered.thoroughness": "10",
       // Orthogonal routing produces bendPoints that step around every
-      // unrelated node. We smooth those bendPoints in the render layer
-      // (see [ElkRoutedEdge]) so the final visual is a continuous arc
-      // that still respects ELK's avoid-cards path.
+      // unrelated node. The render layer ([ElkRoutedEdge]) rounds each
+      // corner so the final visual is straight segments joined by
+      // short arcs that still respect ELK's avoid-cards path.
       "elk.edgeRouting": "ORTHOGONAL",
-      // Spacing options chosen so the smoothing has room to curve
-      // without skimming card bodies. The orthogonal bend points sit
-      // 60px out from each card; the Catmull-Rom curve that connects
-      // them bows toward the cards but stays inside that buffer.
+      // Spacing chosen so the corner arcs at each bend don't bring the
+      // edge inside a neighbouring card. The orthogonal bend points
+      // sit 60px out from each card, and the rounding radius is
+      // far smaller than that buffer.
       "elk.spacing.edgeEdge": "30",
       "elk.layered.spacing.edgeEdgeBetweenLayers": "30",
       "elk.spacing.edgeNode": "60",
