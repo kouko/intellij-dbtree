@@ -14,6 +14,11 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.3.1</h3>
+        <ul>
+            <li><b>Smooth, card-avoiding edges.</b> Model edges now follow ELK's avoid-cards orthogonal route but render with rounded corners — no more straight lines crossing through unrelated cards, and no L-bend staircases.</li>
+            <li><b>Edges stay glued to cards on drag.</b> Previously, dragging a model card sometimes left the edge floating at the layout's predicted position. Edge endpoints now always track the live card position.</li>
+        </ul>
         <h3>0.3.0</h3>
         <ul>
             <li><b>Hub-friendly layout.</b> Layout engine swapped from dagre to ELK with <code>layerUnzipping</code>: a hub model with 30+ parents/children no longer stacks into a tall wall — those siblings now spread across staggered sub-columns, halving the visual height.</li>
