@@ -5,6 +5,7 @@ import {
   MiniMap,
   ReactFlow,
   type Edge,
+  type EdgeTypes,
   type Node,
   type NodeChange,
   type NodeTypes,
@@ -14,8 +15,9 @@ import "@xyflow/react/dist/style.css";
 import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnSpec, LineagePayload } from "./types";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
+import { ElkRoutedEdge } from "./components/ElkRoutedEdge";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
-import { layoutModelGraph } from "./lib/layout";
+import { layoutModelGraph, type EdgeRoute } from "./lib/layout";
 import {
   buildColumnLineageTrace,
   buildColumnTraceEdgePairs,
@@ -26,23 +28,31 @@ import {
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
+const EDGE_TYPES: EdgeTypes = { elkRouted: ElkRoutedEdge };
 const NODE_WIDTH = 320;
 // Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
 // to feed the layout engine an approximate per-node height; actual rendering
 // is done by the browser's wordBreak.
-const CHARS_PER_NAME_LINE = 22;
+const CHARS_PER_NAME_LINE = 19;
 const NAME_LINE_HEIGHT = 16;
 const HEADER_BASE_HEIGHT = 32; // padding + first name line
 // Column-row constants. Both name and type can wrap; the row's visible height
 // is the taller of the two columns. Char budgets are calibrated for the
 // 50/50 flex split (name flex:1 1 auto, type max-width:50%) at NODE_WIDTH=320,
 // font sizes 10px (name) / 9px (type).
-const COLUMN_NAME_CHARS_PER_LINE = 22; // monospace 10px in ~140px column
-const COLUMN_TYPE_CHARS_PER_LINE = 22; // monospace 9px in ~140px column
+const COLUMN_NAME_CHARS_PER_LINE = 18; // monospace 10px in ~140px column
+const COLUMN_TYPE_CHARS_PER_LINE = 18; // monospace 9px in ~140px column
 const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
 const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
+
+// Padding added to each node's height ONLY when handed to ELK. The actual
+// rendered card stays at its measured height; this fudge gives ELK extra
+// vertical breathing room around each card so its avoid-cards orthogonal
+// route — and the Catmull-Rom curve we smooth over it — clears the card
+// body even when our char-per-line height estimate slightly undershoots.
+const HEIGHT_FUDGE_FOR_LAYOUT = 40;
 
 const PLUGIN_HOST = "intellij-dbtree.local";
 const isInsidePlugin =
@@ -504,6 +514,13 @@ function App() {
   }, [payload, expanded]);
 
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+  // ELK-computed routes per model edge id. Empty when the dagre engine is
+  // in use (dagre doesn't expose per-edge routing). Consumed by the
+  // [ElkRoutedEdge] custom edge to draw a smooth curve through ELK's
+  // avoid-cards bend points.
+  const [edgeRoutes, setEdgeRoutes] = useState<Map<string, EdgeRoute>>(
+    () => new Map(),
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -516,17 +533,26 @@ function App() {
       position: { x: 0, y: 0 },
       data: {},
     }));
+    // Pad each node's height before passing to ELK so its avoid-cards
+    // routing leaves more vertical clearance around each card. The
+    // rendered card keeps its real height — only the layout engine sees
+    // the inflated number. See [HEIGHT_FUDGE_FOR_LAYOUT].
+    const fudgedHeights: Record<string, number> = {};
+    for (const [id, h] of Object.entries(heights)) {
+      fudgedHeights[id] = h + HEIGHT_FUDGE_FOR_LAYOUT;
+    }
     layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
       nodesepX: 60,
       ranksepY: 100,
-      heights,
-    }).then((positioned) => {
+      heights: fudgedHeights,
+    }).then((result) => {
       if (cancelled) return;
       const next: Record<string, { x: number; y: number }> = {};
-      for (const n of positioned) next[n.id] = n.position;
+      for (const n of result.nodes) next[n.id] = n.position;
       setPositions(next);
+      setEdgeRoutes(result.edgeRoutes);
     });
     return () => {
       cancelled = true;
@@ -595,29 +621,47 @@ function App() {
         ? onColumnTreePath(a, b)
         : isEdgeOnModelTreePath(a, b, selectedModelUid, modelTrace);
 
-    const modelEdges: Edge[] = payload.model_edges.map((me) => ({
-      id: `m:${me.source_unique_id}->${me.target_unique_id}`,
-      source: me.source_unique_id,
-      target: me.target_unique_id,
-      style: {
-        stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
-        strokeWidth: 1.5,
-      },
-    }));
+    const modelEdges: Edge[] = payload.model_edges.map((me) => {
+      const id = `m:${me.source_unique_id}->${me.target_unique_id}`;
+      const route = edgeRoutes.get(id);
+      return {
+        id,
+        source: me.source_unique_id,
+        target: me.target_unique_id,
+        // Custom edge that smooths ELK's bendPoints into a curve. The
+        // edge type is registered on every model edge regardless of
+        // whether ELK produced a route; [ElkRoutedEdge] falls back to
+        // React Flow's default bezier path when `route` is absent.
+        type: "elkRouted",
+        data: route ? { route } : undefined,
+        style: {
+          stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
+          strokeWidth: 1.5,
+        },
+      };
+    });
 
     const columnEdges: Edge[] = selectedColumn
       ? payload.column_edges
           .filter((ce) => lineageTrace.edges.has(edgeKey(ce)))
-          .map((ce) => ({
-            id: `c:${edgeKey(ce)}`,
-            source: ce.source_unique_id,
-            target: ce.target_unique_id,
-            label: ce.expression ? "ƒ" : undefined,
-            labelStyle: { fontSize: 10, fill: theme.highlightText },
-            labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },
-            style: { stroke: theme.edgeHighlight, strokeWidth: 2, strokeDasharray: "6 3" },
-            animated: true,
-          }))
+          .map((ce) => {
+            // Column edges aren't part of the ELK-laid graph (model-level
+            // only), so they never have a route — [ElkRoutedEdge] will
+            // render them with the default bezier fallback. Still routed
+            // through the custom edge type so they share the rendering
+            // pipeline.
+            return {
+              id: `c:${edgeKey(ce)}`,
+              source: ce.source_unique_id,
+              target: ce.target_unique_id,
+              type: "elkRouted",
+              label: ce.expression ? "ƒ" : undefined,
+              labelStyle: { fontSize: 10, fill: theme.highlightText },
+              labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },
+              style: { stroke: theme.edgeHighlight, strokeWidth: 2, strokeDasharray: "6 3" },
+              animated: true,
+            };
+          })
       : [];
 
     return [...modelEdges, ...columnEdges];
@@ -629,6 +673,7 @@ function App() {
     selectedColumn,
     selectedModelUid,
     theme,
+    edgeRoutes,
   ]);
 
   // Re-fit only on topology change (model set / edge set), not on selection
@@ -718,6 +763,7 @@ function App() {
             edges={edges}
             onNodesChange={onNodesChange}
             nodeTypes={NODE_TYPES}
+            edgeTypes={EDGE_TYPES}
             onNodeDragStop={onNodeDragStop}
             fitView
             minZoom={0.2}

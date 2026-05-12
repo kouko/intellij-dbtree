@@ -11,14 +11,15 @@ function makeEdge(id: string, source: string, target: string): Edge {
 }
 
 describe("layoutModelGraph (elk)", () => {
-  it("returns empty array for empty input", async () => {
+  it("returns empty result for empty input", async () => {
     const result = await layoutModelGraph([], [], {
       nodeWidth: 200,
       nodesepX: 60,
       ranksepY: 100,
       heights: {},
     });
-    expect(result).toEqual([]);
+    expect(result.nodes).toEqual([]);
+    expect(result.edgeRoutes.size).toBe(0);
   });
 });
 
@@ -42,7 +43,7 @@ describe("layoutModelGraph (elk) — linear chain", () => {
       heights,
     });
 
-    const byId = new Map(result.map((r) => [r.id, r.position.x]));
+    const byId = new Map(result.nodes.map((r) => [r.id, r.position.x]));
     expect(byId.get("a")! < byId.get("b")!).toBe(true);
     expect(byId.get("b")! < byId.get("c")!).toBe(true);
     expect(byId.get("c")! < byId.get("d")!).toBe(true);
@@ -71,7 +72,7 @@ describe("layoutModelGraph (elk) — variable heights", () => {
     // With layerUnzipping=ALTERNATING the three siblings may spread across
     // multiple sub-columns. Non-overlap only needs to hold *within* each x.
     const buckets = new Map<number, Array<{ top: number; bottom: number }>>();
-    for (const r of result) {
+    for (const r of result.nodes) {
       if (r.id === "sink") continue;
       const x = Math.round(r.position.x);
       const h = heights[r.id as keyof typeof heights];
@@ -105,11 +106,33 @@ describe("layoutModelGraph (elk) — hub case", () => {
       heights,
     });
 
-    // The 30 parents should occupy at least 2 distinct x-bands (sub-columns).
-    const parentXs = result
+    const parentXs = result.nodes
       .filter((n) => n.id.startsWith("p"))
       .map((n) => Math.round(n.position.x));
     const distinctX = new Set(parentXs);
     expect(distinctX.size).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("layoutModelGraph (elk) — edge routes", () => {
+  it("returns a route per edge with start, end, and bendPoints", async () => {
+    const nodes = [makeNode("a"), makeNode("b"), makeNode("c")];
+    const edges = [makeEdge("ab", "a", "b"), makeEdge("bc", "b", "c")];
+    const heights = { a: 60, b: 60, c: 60 };
+
+    const result = await layoutModelGraph(nodes, edges, {
+      rankdir: "LR",
+      nodeWidth: 200,
+      nodesepX: 60,
+      ranksepY: 100,
+      heights,
+    });
+
+    expect(result.edgeRoutes.size).toBe(edges.length);
+    const ab = result.edgeRoutes.get("ab");
+    expect(ab).toBeDefined();
+    expect(typeof ab!.startPoint.x).toBe("number");
+    expect(typeof ab!.endPoint.x).toBe("number");
+    expect(Array.isArray(ab!.bendPoints)).toBe(true);
   });
 });
