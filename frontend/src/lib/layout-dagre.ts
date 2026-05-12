@@ -1,13 +1,14 @@
 import dagre from "dagre";
 import type { Edge, Node } from "@xyflow/react";
+import type { EdgeRoute, LayoutResult } from "./layout-elk";
 
 /**
  * Run dagre on the model-level DAG and return positioned nodes.
  *
- * Nodes have a fixed width but a per-node height — the caller pre-computes
- * heights since they depend on (a) how many name lines wrap inside the
- * card header at the chosen width and (b) whether the card is expanded
- * with its column list.
+ * Returns the same [LayoutResult] shape as the ELK engine, with
+ * `edgeRoutes` always empty — dagre's edge routing data isn't exposed
+ * through dagre/graphlib's public API in a usable shape, so callers
+ * that want card-avoiding edge paths must use the ELK engine.
  */
 export interface LayoutOptions {
   rankdir?: "LR" | "TB";
@@ -22,7 +23,7 @@ export async function layoutModelGraph(
   nodes: Node[],
   edges: Edge[],
   opts: LayoutOptions,
-): Promise<Node[]> {
+): Promise<LayoutResult> {
   const g = new dagre.graphlib.Graph();
   g.setGraph({
     rankdir: opts.rankdir ?? "LR",
@@ -44,19 +45,16 @@ export async function layoutModelGraph(
 
   dagre.layout(g);
 
-  return nodes.map((n) => {
+  const positionedNodes: Node[] = nodes.map((n) => {
     const pos = g.node(n.id);
     return {
       ...n,
       position: { x: pos.x - opts.nodeWidth / 2, y: pos.y - pos.height / 2 },
-      // xyflow v12's MiniMap reads `width` / `height` (or measured dims) to
-      // draw each node's rectangle. Without them — because our `onNodesChange`
-      // callback only handles position events, never dimension events — the
-      // MiniMap would render empty. Threading dagre's known dimensions back
-      // onto the node fixes that without forcing a full controlled-changes
-      // refactor.
       width: opts.nodeWidth,
       height: pos.height,
     };
   });
+
+  const edgeRoutes = new Map<string, EdgeRoute>();
+  return { nodes: positionedNodes, edgeRoutes };
 }
