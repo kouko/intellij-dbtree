@@ -12,10 +12,17 @@ import type { EdgeRoute } from "../lib/layout";
  * route but rounds each corner so the final visual is soft straight
  * segments joined by short arcs, not sharp L-bends.
  *
+ * Endpoint anchoring: the path's start and end always come from
+ * React Flow's live sourceX/Y and targetX/Y (handle positions on
+ * the current node), not from ELK's anchored startPoint/endPoint.
+ * This way the edge always stays attached to the card the user
+ * just dragged. The trade-off is that we lose ELK's per-edge
+ * attachment spreading along the card border — parallel edges
+ * converge at the same handle. ELK's interior bendPoints still win
+ * for card avoidance.
+ *
  * Falls back to React Flow's default bezier when no ELK route is
- * available (sidecar-traced column edges, dagre engine, or the user
- * dragged an endpoint and the ELK route's anchored start/end no
- * longer match the live node position).
+ * available (sidecar-traced column edges, dagre engine).
  */
 
 /**
@@ -91,42 +98,31 @@ export function ElkRoutedEdge({
 }: EdgeProps) {
   const route = (data as { route?: EdgeRoute } | undefined)?.route;
 
-  // Detect drag: if the React-Flow-supplied handle position (which
-  // follows the live node) diverges from ELK's predicted attachment
-  // by more than a node-radius's worth, the user has dragged an
-  // endpoint and ELK's anchored route is stale. Fall back to default
-  // bezier so the curve tracks the dragged node in real time.
-  const DRAG_THRESHOLD = 60;
-  const isDragged =
-    route !== undefined &&
-    (Math.hypot(sourceX - route.startPoint.x, sourceY - route.startPoint.y) >
-      DRAG_THRESHOLD ||
-      Math.hypot(targetX - route.endPoint.x, targetY - route.endPoint.y) >
-        DRAG_THRESHOLD);
-
   let path: string;
   let labelX: number;
   let labelY: number;
 
-  if (route && !isDragged) {
-    // Rounded-corner path through ELK's route. startPoint and
-    // endPoint are ELK's per-edge attachments on the card border (so
-    // parallel edges to the same card spread out instead of converging
-    // at one handle), bendPoints are the avoid-cards interior route.
-    const points = [route.startPoint, ...route.bendPoints, route.endPoint];
+  if (route) {
+    // Anchor start/end at React Flow's live handle positions so the
+    // edge stays glued to the card after a drag; weave through ELK's
+    // bendPoints in between for the avoid-cards interior route.
+    const points = [
+      { x: sourceX, y: sourceY },
+      ...route.bendPoints,
+      { x: targetX, y: targetY },
+    ];
     path = roundedCornerPath(points, CORNER_RADIUS);
     if (route.bendPoints.length > 0) {
       const mid = route.bendPoints[Math.floor(route.bendPoints.length / 2)];
       labelX = mid.x;
       labelY = mid.y;
     } else {
-      labelX = (route.startPoint.x + route.endPoint.x) / 2;
-      labelY = (route.startPoint.y + route.endPoint.y) / 2;
+      labelX = (sourceX + targetX) / 2;
+      labelY = (sourceY + targetY) / 2;
     }
   } else {
     // Default bezier — same renderer React Flow uses when `type` is
-    // unset. Triggered when the edge has no ELK route or when the
-    // user has dragged either endpoint past the threshold.
+    // unset. Triggered when the edge has no ELK route at all.
     [path, labelX, labelY] = getBezierPath({
       sourceX,
       sourceY,
