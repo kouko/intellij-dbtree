@@ -110,8 +110,26 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
-      <Handle type="target" position={Position.Left} style={{ background: colors.chip }} />
-      <Handle type="source" position={Position.Right} style={{ background: colors.chip }} />
+      <Handle
+        type="target"
+        position={Position.Left}
+        style={{
+          background: colors.chip,
+          width: 18,
+          height: 18,
+          border: `2px solid ${t.toolbarBg}`,
+        }}
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        style={{
+          background: colors.chip,
+          width: 18,
+          height: 18,
+          border: `2px solid ${t.toolbarBg}`,
+        }}
+      />
 
       <header
         style={{
