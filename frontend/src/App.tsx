@@ -655,6 +655,14 @@ function App() {
         ? onColumnTreePath(a, b)
         : isEdgeOnModelTreePath(a, b, selectedModelUid, modelTrace);
 
+    // Halo colour used by [CurvedBezierEdge] at crossings to produce a
+    // rope-over-rope over/under look. The base is the canvas
+    // background so the halo blends with the panel; the `CC` 8-bit
+    // alpha suffix (≈ 80%) lets the underlying edge fade through
+    // instead of being hard-cut at the crossing, which reads as a
+    // softer hierarchy rather than a sharp gap.
+    const haloData = { haloColor: `${theme.background}CC` };
+
     const modelEdges: Edge[] = payload.model_edges.map((me) => ({
       id: `m:${me.source_unique_id}->${me.target_unique_id}`,
       source: me.source_unique_id,
@@ -665,6 +673,7 @@ function App() {
       // positions, so dragging a card and moving it back perfectly
       // restores the original shape.
       type: "curved",
+      data: haloData,
       style: {
         stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
         strokeWidth: 1.5,
@@ -679,6 +688,7 @@ function App() {
             source: ce.source_unique_id,
             target: ce.target_unique_id,
             type: "curved",
+            data: haloData,
             label: ce.expression ? "ƒ" : undefined,
             labelStyle: { fontSize: 10, fill: theme.highlightText },
             labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },

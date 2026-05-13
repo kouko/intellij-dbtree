@@ -16,12 +16,23 @@ import {
  * `curvature` parameter only kicks in for reverse edges. Bumping the
  * coefficient requires our own thin renderer.
  *
- * Behaviour is otherwise identical to `getBezierPath` — same control
- * arm direction from each handle's Position, same fallback to a
- * shorter curve when target is "behind" source.
+ * Over/under crossings: each edge renders as two stacked paths. The
+ * first ("halo") is wider and stroked in the canvas background
+ * colour passed via [CurvedBezierData.haloColor]; it visually
+ * erases any previously-drawn edge underneath. The second is the
+ * normal coloured stroke. Because React Flow renders edges in array
+ * order, later edges' halos cut a gap into earlier edges where they
+ * cross, producing a "rope-over-rope" look without filters.
  */
 
 const CURVATURE_FACTOR = 0.7;
+const HALO_EXTRA_WIDTH = 4;
+
+interface CurvedBezierData {
+  /** Canvas background colour — used to "erase" the underlying edge at
+   *  crossings, producing the over/under effect. */
+  haloColor?: string;
+}
 
 function controlOffset(distance: number, curvature: number): number {
   if (distance >= 0) return curvature * distance;
@@ -56,6 +67,7 @@ export function CurvedBezierEdge({
   targetY,
   sourcePosition,
   targetPosition,
+  data,
   style,
   markerEnd,
   label,
@@ -82,8 +94,23 @@ export function CurvedBezierEdge({
   const labelX = (sourceX + targetX) / 2;
   const labelY = (sourceY + targetY) / 2;
 
+  const haloColor = (data as CurvedBezierData | undefined)?.haloColor;
+  const strokeWidth =
+    typeof style?.strokeWidth === "number" ? style.strokeWidth : 1.5;
+  const haloStyle: React.CSSProperties | undefined = haloColor
+    ? {
+        stroke: haloColor,
+        strokeWidth: strokeWidth + HALO_EXTRA_WIDTH,
+        strokeLinecap: "round",
+        fill: "none",
+      }
+    : undefined;
+
   return (
     <>
+      {haloStyle && (
+        <BaseEdge id={`${id}-halo`} path={path} style={haloStyle} />
+      )}
       <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
       {label && (
         <EdgeLabelRenderer>
