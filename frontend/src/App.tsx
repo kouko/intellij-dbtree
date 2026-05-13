@@ -303,6 +303,34 @@ function App() {
     [payload.models, pendingColumns],
   );
 
+  // Prefetch column lists for every model in the current DAG as soon
+  // as the payload arrives. Without this, columns only fetch when the
+  // user expands a card, producing a visible ~1-second lag after
+  // expand. Prefetching means the column list is usually already in
+  // place by the time the user clicks. Fire-and-forget — the Kotlin
+  // side handles each REQUEST_COLUMNS independently (column requests
+  // don't bump the epoch, so concurrent prefetch requests don't
+  // supersede each other or the active column-trace work).
+  useEffect(() => {
+    if (!isInsidePlugin || !window.kotlinCallback) return;
+    const cb = window.kotlinCallback;
+    const toRequest: string[] = [];
+    for (const m of payload.models) {
+      if (m.columns.length > 0) continue;
+      if (pendingColumns.has(m.unique_id)) continue;
+      toRequest.push(m.unique_id);
+    }
+    if (toRequest.length === 0) return;
+    for (const uid of toRequest) {
+      cb(JSON.stringify({ event: "REQUEST_COLUMNS", unique_id: uid }));
+    }
+    setPendingColumns((prev) => {
+      const next = new Set(prev);
+      for (const uid of toRequest) next.add(uid);
+      return next;
+    });
+  }, [payload.models, pendingColumns]);
+
   const toggleExpanded = useCallback(
     (uniqueId: string) => {
       setExpanded((prev) => {
