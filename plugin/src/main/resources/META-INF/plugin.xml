@@ -14,6 +14,16 @@
     ]]></description>
 
     <change-notes><![CDATA[
+        <h3>0.3.2</h3>
+        <ul>
+            <li><b>Smoother edges.</b> Replaced the orthogonal / spline-based edge routing with a single cubic Bezier per edge (longer control arms, α = 0.7). The curve is now a pure function of the live source and target handle positions — dragging a model card moves the curve smoothly, and dragging back perfectly restores the original shape.</li>
+            <li><b>Over / under crossings.</b> Each edge renders with a semi-transparent halo underneath the colour stroke. Where edges cross, later edges fade into earlier ones, giving a "rope over rope" depth cue without SVG filters.</li>
+            <li><b>Stronger selected / hover highlight.</b> Selected and hovered cards now tint their background with the layer's own border colour (40% overlay), so the highlight stays readable when zoomed far out. Selected ring widened to a visual ~6px without shifting card layout.</li>
+            <li><b>Column prefetch.</b> Column lists now fetch in the background as soon as the DAG appears, so the column count is populated on every card without needing to click "expand" first. Also fixes a Kotlin race where concurrent column requests were superseding each other (Expand-all was effectively broken before).</li>
+            <li><b>Edge-attach handles 3× larger</b> so the connection points stay readable at the new wider zoom range.</li>
+            <li><b>Toolbar:</b> shortened the title from <code>intellij-dbtree</code> to <code>dbtree</code> with the build timestamp moved below in a smaller font; the right side now shows the hover-or-selected model name (selectable for copy).</li>
+            <li><b>UX fixes:</b> instant card selection on click (no IDE round-trip), pinch-zoom range widened to 0.05× – 4×, click no longer swallowed by 1-pixel hand jitter (drag threshold 1 → 4).</li>
+        </ul>
         <h3>0.3.1</h3>
         <ul>
             <li><b>Smooth, card-avoiding edges.</b> Model edges now follow ELK's avoid-cards orthogonal route but render with rounded corners — no more straight lines crossing through unrelated cards, and no L-bend staircases.</li>
