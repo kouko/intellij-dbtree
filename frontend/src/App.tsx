@@ -14,10 +14,10 @@ import "@xyflow/react/dist/style.css";
 
 import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnSpec, LineagePayload } from "./types";
+import { CurvedBezierEdge } from "./components/CurvedBezierEdge";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
-import { ElkRoutedEdge } from "./components/ElkRoutedEdge";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
-import { layoutModelGraph, type EdgeRoute } from "./lib/layout";
+import { layoutModelGraph } from "./lib/layout";
 import {
   buildColumnLineageTrace,
   buildColumnTraceEdgePairs,
@@ -28,7 +28,7 @@ import {
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
-const EDGE_TYPES: EdgeTypes = { elkRouted: ElkRoutedEdge };
+const EDGE_TYPES: EdgeTypes = { curved: CurvedBezierEdge };
 const NODE_WIDTH = 320;
 // Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
@@ -46,13 +46,6 @@ const COLUMN_TYPE_CHARS_PER_LINE = 18; // monospace 9px in ~140px column
 const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
 const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
-
-// Padding added to each node's height ONLY when handed to ELK. The actual
-// rendered card stays at its measured height; this fudge gives ELK extra
-// vertical breathing room around each card so its avoid-cards orthogonal
-// route — and the Catmull-Rom curve we smooth over it — clears the card
-// body even when our char-per-line height estimate slightly undershoots.
-const HEIGHT_FUDGE_FOR_LAYOUT = 40;
 
 const PLUGIN_HOST = "intellij-dbtree.local";
 const isInsidePlugin =
@@ -356,6 +349,12 @@ function App() {
   }, []);
 
   const onOpenFile = useCallback((uniqueId: string) => {
+    // Set the focus locally first so the orange ring shows up
+    // immediately. The IDE eventually echoes this back via
+    // setSelectedModel after it opens the file, but the round-trip
+    // takes a moment — without this local set the user has to click
+    // twice to see the selection.
+    setSelectedModelUid(uniqueId);
     if (!window.kotlinCallback) return;
     window.kotlinCallback(JSON.stringify({ event: "NODE_CLICK", unique_id: uniqueId }));
   }, []);
@@ -514,13 +513,6 @@ function App() {
   }, [payload, expanded]);
 
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
-  // ELK-computed routes per model edge id. Empty when the dagre engine is
-  // in use (dagre doesn't expose per-edge routing). Consumed by the
-  // [ElkRoutedEdge] custom edge to draw a smooth curve through ELK's
-  // avoid-cards bend points.
-  const [edgeRoutes, setEdgeRoutes] = useState<Map<string, EdgeRoute>>(
-    () => new Map(),
-  );
 
   useEffect(() => {
     let cancelled = false;
@@ -533,26 +525,17 @@ function App() {
       position: { x: 0, y: 0 },
       data: {},
     }));
-    // Pad each node's height before passing to ELK so its avoid-cards
-    // routing leaves more vertical clearance around each card. The
-    // rendered card keeps its real height — only the layout engine sees
-    // the inflated number. See [HEIGHT_FUDGE_FOR_LAYOUT].
-    const fudgedHeights: Record<string, number> = {};
-    for (const [id, h] of Object.entries(heights)) {
-      fudgedHeights[id] = h + HEIGHT_FUDGE_FOR_LAYOUT;
-    }
     layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
-      nodesepX: 60,
-      ranksepY: 100,
-      heights: fudgedHeights,
+      nodeSpacing: 60,
+      layerSpacing: 60,
+      heights,
     }).then((result) => {
       if (cancelled) return;
       const next: Record<string, { x: number; y: number }> = {};
       for (const n of result.nodes) next[n.id] = n.position;
       setPositions(next);
-      setEdgeRoutes(result.edgeRoutes);
     });
     return () => {
       cancelled = true;
@@ -612,6 +595,29 @@ function App() {
     }
   }, []);
 
+  // Pure-display state — which model the cursor is currently over.
+  // Distinct from `selectedModelUid` (orange-ring focus) and from
+  // DbtModelNode's local `hover` state (which drives the per-card
+  // visual). Used only to populate the toolbar's "focused model"
+  // readout. React Flow fires these handlers regardless of where the
+  // hover happens inside the node, so we don't have to thread a
+  // callback through node data.
+  const [hoveredModelUid, setHoveredModelUid] = useState<string | null>(null);
+  const onNodeMouseEnter = useCallback((_: React.MouseEvent, node: Node) => {
+    setHoveredModelUid(node.id);
+  }, []);
+  const onNodeMouseLeave = useCallback(() => {
+    setHoveredModelUid(null);
+  }, []);
+
+  // Name shown on the right of the toolbar: hover beats selection,
+  // selection beats nothing.
+  const focusedModelName = useMemo(() => {
+    const uid = hoveredModelUid ?? selectedModelUid;
+    if (!uid) return null;
+    return payload.models.find((m) => m.unique_id === uid)?.name ?? null;
+  }, [hoveredModelUid, selectedModelUid, payload.models]);
+
   const edges: Edge[] = useMemo(() => {
     const onColumnTreePath = (a: string, b: string): boolean =>
       columnTraceEdgePairs.has(`${a}|${b}`);
@@ -621,47 +627,36 @@ function App() {
         ? onColumnTreePath(a, b)
         : isEdgeOnModelTreePath(a, b, selectedModelUid, modelTrace);
 
-    const modelEdges: Edge[] = payload.model_edges.map((me) => {
-      const id = `m:${me.source_unique_id}->${me.target_unique_id}`;
-      const route = edgeRoutes.get(id);
-      return {
-        id,
-        source: me.source_unique_id,
-        target: me.target_unique_id,
-        // Custom edge that smooths ELK's bendPoints into a curve. The
-        // edge type is registered on every model edge regardless of
-        // whether ELK produced a route; [ElkRoutedEdge] falls back to
-        // React Flow's default bezier path when `route` is absent.
-        type: "elkRouted",
-        data: route ? { route } : undefined,
-        style: {
-          stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
-          strokeWidth: 1.5,
-        },
-      };
-    });
+    const modelEdges: Edge[] = payload.model_edges.map((me) => ({
+      id: `m:${me.source_unique_id}->${me.target_unique_id}`,
+      source: me.source_unique_id,
+      target: me.target_unique_id,
+      // [CurvedBezierEdge]: same form as React Flow's default bezier,
+      // longer control arms (α = 0.7 instead of 0.5) so the curve
+      // bows more. Pure function of live source/target handle
+      // positions, so dragging a card and moving it back perfectly
+      // restores the original shape.
+      type: "curved",
+      style: {
+        stroke: onPath(me.source_unique_id, me.target_unique_id) ? theme.edgeHighlight : theme.edge,
+        strokeWidth: 1.5,
+      },
+    }));
 
     const columnEdges: Edge[] = selectedColumn
       ? payload.column_edges
           .filter((ce) => lineageTrace.edges.has(edgeKey(ce)))
-          .map((ce) => {
-            // Column edges aren't part of the ELK-laid graph (model-level
-            // only), so they never have a route — [ElkRoutedEdge] will
-            // render them with the default bezier fallback. Still routed
-            // through the custom edge type so they share the rendering
-            // pipeline.
-            return {
-              id: `c:${edgeKey(ce)}`,
-              source: ce.source_unique_id,
-              target: ce.target_unique_id,
-              type: "elkRouted",
-              label: ce.expression ? "ƒ" : undefined,
-              labelStyle: { fontSize: 10, fill: theme.highlightText },
-              labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },
-              style: { stroke: theme.edgeHighlight, strokeWidth: 2, strokeDasharray: "6 3" },
-              animated: true,
-            };
-          })
+          .map((ce) => ({
+            id: `c:${edgeKey(ce)}`,
+            source: ce.source_unique_id,
+            target: ce.target_unique_id,
+            type: "curved",
+            label: ce.expression ? "ƒ" : undefined,
+            labelStyle: { fontSize: 10, fill: theme.highlightText },
+            labelBgStyle: { fill: theme.codeBg, fillOpacity: 0.9 },
+            style: { stroke: theme.edgeHighlight, strokeWidth: 2, strokeDasharray: "6 3" },
+            animated: true,
+          }))
       : [];
 
     return [...modelEdges, ...columnEdges];
@@ -673,7 +668,6 @@ function App() {
     selectedColumn,
     selectedModelUid,
     theme,
-    edgeRoutes,
   ]);
 
   // Re-fit only on topology change (model set / edge set), not on selection
@@ -751,6 +745,8 @@ function App() {
              computingFor.unique_id === selectedColumn.unique_id &&
              computingFor.column === selectedColumn.column)
         }
+        focusedModelName={focusedModelName}
+        focusedIsHover={hoveredModelUid !== null}
       />
       {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
       <div style={{ flex: 1, position: "relative" }}>
@@ -765,8 +761,16 @@ function App() {
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
             onNodeDragStop={onNodeDragStop}
+            onNodeMouseEnter={onNodeMouseEnter}
+            onNodeMouseLeave={onNodeMouseLeave}
+            // Default is 1px, which counts a click as a drag the moment
+            // the user's hand jitters by a single pixel — and React
+            // Flow swallows the click event in that case. Bumping the
+            // threshold lets a 4px wiggle still register as a click.
+            nodeDragThreshold={4}
             fitView
-            minZoom={0.2}
+            minZoom={0.05}
+            maxZoom={4}
             colorMode={theme.name}
             proOptions={{ hideAttribution: true }}
           >
@@ -836,6 +840,8 @@ function Toolbar({
   onClear,
   traceCount,
   computing,
+  focusedModelName,
+  focusedIsHover,
 }: {
   theme: Theme;
   upHops: number;
@@ -851,6 +857,10 @@ function Toolbar({
   onClear: () => void;
   traceCount: number;
   computing: boolean;
+  /** Model the user is currently hovering, or — if none — the selected model. */
+  focusedModelName: string | null;
+  /** True when [focusedModelName] is the hovered card (not just the selected one). */
+  focusedIsHover: boolean;
 }) {
   const t = theme;
   const buttonStyle: React.CSSProperties = {
@@ -884,12 +894,31 @@ function Toolbar({
         fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
         fontSize: 13,
         color: t.toolbarText,
+        // Fixed height tall enough for the focused-model name to wrap
+        // to two lines without growing the toolbar. Everything else
+        // (HopSteppers, hint text) centres vertically inside this
+        // taller bar. Names longer than two lines are clipped — the
+        // full text stays in the DOM for tooltip + select-copy.
+        minHeight: 44,
+        boxSizing: "border-box",
       }}
     >
-      <strong style={{ color: t.toolbarText }}>intellij-dbtree</strong>
-      <span style={{ color: t.toolbarTextSubtle, fontSize: 10 }} title="Build timestamp">
-        b{__DBTREE_BUILD_ID__}
-      </span>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "flex-start",
+          lineHeight: 1.1,
+        }}
+      >
+        <strong style={{ color: t.toolbarText }}>dbtree</strong>
+        <span
+          style={{ color: t.toolbarTextSubtle, fontSize: 8 }}
+          title="Build timestamp"
+        >
+          b{__DBTREE_BUILD_ID__}
+        </span>
+      </div>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <HopStepper label="↑" value={upHops} onChange={onUpHops} theme={t} />
         <HopStepper label="↓" value={downHops} onChange={onDownHops} theme={t} />
@@ -966,6 +995,31 @@ function Toolbar({
             clear
           </button>
         </>
+      ) : focusedModelName ? (
+        <span
+          style={{
+            color: focusedIsHover ? t.toolbarTextMuted : t.toolbarText,
+            fontFamily: "ui-monospace, SFMono-Regular, monospace",
+            fontSize: 12,
+            lineHeight: 1.3,
+            // Allow wrapping up to two lines; the parent toolbar's
+            // minHeight already reserves room for two lines so the
+            // height never jitters between one- and two-line names.
+            // Anything beyond two lines is clipped (full text in DOM
+            // via tooltip + selection).
+            maxWidth: 480,
+            maxHeight: "2.6em",
+            overflow: "hidden",
+            overflowWrap: "anywhere",
+            wordBreak: "break-all",
+            textAlign: "right",
+            userSelect: "text",
+            cursor: "text",
+          }}
+          title={focusedModelName}
+        >
+          {focusedModelName}
+        </span>
       ) : (
         <span style={{ color: t.toolbarTextSubtle }}>
           {(isUnlimited(upHops) ? "∞" : upHops)} up · {(isUnlimited(downHops) ? "∞" : downHops)} down · click model name to open

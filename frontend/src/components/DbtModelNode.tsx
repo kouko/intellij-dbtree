@@ -44,27 +44,57 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   const openable = !!data.onOpenFile;
   const [hover, setHover] = useState(false);
 
-  // Fixed card width — long names wrap to multiple header lines instead of
-  // being truncated. Matches the user's rule: a model name must always be
-  // fully visible.
-  //
-  // Hover state: thicker outline using the layer's bright chip color.
-  // `outline` doesn't affect layout, so the card doesn't shift on hover.
+  // Background tint: when the card is selected or hovered, mix the
+  // layer's own border tone on top of its pale bg so the card reads
+  // as highlighted even at low zoom (where the 2px border / outline
+  // would otherwise disappear). Both states use the *same* overlay
+  // (the layer's border color at ~40% alpha — `66` in 8-digit hex);
+  // selected vs hover is distinguished by the border / outline color
+  // (orange selectedBorder vs chip color), not by background, so
+  // white chip text stays readable in both states.
+  const tinted = data.isSelectedModel || (hover && openable);
+  const cardBackground = tinted
+    ? `linear-gradient(${colors.border}66, ${colors.border}66), ${colors.bg}`
+    : colors.bg;
+
+  // box-shadow stack (composed back-to-front, first item drawn on top):
+  //   - selected: 4px orange ring directly outside the 2px border, so
+  //     the visible "border" reads as ~6px thick (~3× the unselected
+  //     state). Doing this with box-shadow rather than a thicker
+  //     border keeps the card's layout size constant — bumping the
+  //     real border would shift every selected card by 4px and force
+  //     surrounding cards to reflow.
+  //   - on-lineage-path: highlight halo, extended when also selected
+  //     so it sits beyond the selected ring.
+  const shadowParts: string[] = [];
+  if (data.isSelectedModel) {
+    shadowParts.push(`0 0 0 4px ${t.selectedBorder}`);
+  }
+  if (data.onLineagePath) {
+    const haloSpread = data.isSelectedModel ? 7 : 3;
+    shadowParts.push(`0 0 0 ${haloSpread}px ${t.highlightBg}`);
+    shadowParts.push("0 4px 12px rgba(0,0,0,0.08)");
+  } else {
+    shadowParts.push("0 1px 3px rgba(0,0,0,0.06)");
+  }
+
   const cardStyle: React.CSSProperties = {
     borderRadius: 10,
     border: `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.border}`,
-    background: colors.bg,
+    background: cardBackground,
     width: data.cardWidth,
     fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
     fontSize: 12,
-    boxShadow: data.onLineagePath
-      ? `0 0 0 3px ${t.highlightBg}, 0 4px 12px rgba(0,0,0,0.08)`
-      : "0 1px 3px rgba(0,0,0,0.06)",
-    outline: hover && openable
-      ? `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.chip}`
-      : "none",
+    boxShadow: shadowParts.join(", "),
+    // Hover outline only when not selected — the 4px selected ring
+    // already dominates the visual, an additional outline would
+    // overlap it and look noisy.
+    outline:
+      hover && openable && !data.isSelectedModel
+        ? `2px solid ${colors.chip}`
+        : "none",
     outlineOffset: 0,
-    transition: "outline-color 80ms",
+    transition: "background 80ms, outline-color 80ms",
     cursor: openable ? "pointer" : "default",
   };
 

@@ -1,42 +1,38 @@
 import ELK from "elkjs/lib/elk.bundled.js";
-import type { ElkEdgeSection, ElkExtendedEdge } from "elkjs/lib/elk-api";
 import type { Edge, Node } from "@xyflow/react";
 
 export interface LayoutOptions {
   rankdir?: "LR" | "TB";
   nodeWidth: number;
-  nodesepX: number;
-  ranksepY: number;
+  /** Gap between adjacent nodes within the same layer. For LR this is
+   *  vertical, for TB horizontal. */
+  nodeSpacing: number;
+  /** Gap between adjacent layers. For LR this is horizontal, for TB
+   *  vertical. */
+  layerSpacing: number;
   heights: Record<string, number>;
-}
-
-/** ELK-computed route for one edge, in flow-coordinate space. */
-export interface EdgeRoute {
-  /** Where the edge attaches to the source node's boundary. */
-  startPoint: { x: number; y: number };
-  /** Intermediate bend points (corners), in order from source → target.
-   *  Empty when ELK chose a straight line. */
-  bendPoints: { x: number; y: number }[];
-  /** Where the edge attaches to the target node's boundary. */
-  endPoint: { x: number; y: number };
 }
 
 export interface LayoutResult {
   nodes: Node[];
-  /** Edge id → computed route. Edges not in this map (e.g. column-
-   *  lineage edges added after layout) should fall back to React
-   *  Flow's built-in routing. */
-  edgeRoutes: Map<string, EdgeRoute>;
 }
 
 const elk = new ELK();
 
+/**
+ * Run the ELK layered layout on the model-level DAG and return
+ * positioned nodes. Edge geometry is intentionally not extracted —
+ * the renderer draws every edge with React Flow's default bezier so
+ * the curve is parameterised purely by the live source/target
+ * handle positions and the same algorithm applies whether the user
+ * has dragged or not.
+ */
 export async function layoutModelGraph(
   nodes: Node[],
   edges: Edge[],
   opts: LayoutOptions,
 ): Promise<LayoutResult> {
-  if (nodes.length === 0) return { nodes: [], edgeRoutes: new Map() };
+  if (nodes.length === 0) return { nodes: [] };
 
   const direction = (opts.rankdir ?? "LR") === "LR" ? "RIGHT" : "DOWN";
   const graph = {
@@ -44,26 +40,24 @@ export async function layoutModelGraph(
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": direction,
-      "elk.layered.spacing.nodeNodeBetweenLayers": String(opts.ranksepY),
-      "elk.spacing.nodeNode": String(opts.nodesepX),
+      "elk.layered.spacing.nodeNodeBetweenLayers": String(opts.layerSpacing),
+      "elk.spacing.nodeNode": String(opts.nodeSpacing),
       "elk.layered.layerUnzipping.strategy": "ALTERNATING",
       "elk.layered.layerUnzipping.layerSplit": "2",
       "elk.layered.layerUnzipping.resetOnLongEdges": "true",
       "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
       "elk.layered.thoroughness": "10",
-      // Orthogonal routing produces bendPoints that step around every
-      // unrelated node. The render layer ([ElkRoutedEdge]) rounds each
-      // corner so the final visual is straight segments joined by
-      // short arcs that still respect ELK's avoid-cards path.
+      // Enable edge routing purely as a placement hint. We don't read
+      // ELK's edge geometry back — the renderer still draws cubic
+      // Beziers — but with these options set, BRANDES_KOEPF reserves
+      // edge channels and pushes unrelated nodes out of those
+      // channels, so the bezier between any two handles is unlikely
+      // to cross a third card.
       "elk.edgeRouting": "ORTHOGONAL",
-      // Spacing chosen so the corner arcs at each bend don't bring the
-      // edge inside a neighbouring card. The orthogonal bend points
-      // sit 60px out from each card, and the rounding radius is
-      // far smaller than that buffer.
-      "elk.spacing.edgeEdge": "30",
-      "elk.layered.spacing.edgeEdgeBetweenLayers": "30",
       "elk.spacing.edgeNode": "60",
       "elk.layered.spacing.edgeNodeBetweenLayers": "60",
+      "elk.spacing.edgeEdge": "30",
+      "elk.layered.spacing.edgeEdgeBetweenLayers": "30",
     },
     children: nodes.map((n) => ({
       id: n.id,
@@ -91,20 +85,5 @@ export async function layoutModelGraph(
     };
   });
 
-  const edgeRoutes = new Map<string, EdgeRoute>();
-  const resultEdges = (result.edges ?? []) as ElkExtendedEdge[];
-  for (const e of resultEdges) {
-    const section: ElkEdgeSection | undefined = e.sections?.[0];
-    if (!section?.startPoint || !section?.endPoint) continue;
-    edgeRoutes.set(e.id, {
-      startPoint: { x: section.startPoint.x, y: section.startPoint.y },
-      endPoint: { x: section.endPoint.x, y: section.endPoint.y },
-      bendPoints: (section.bendPoints ?? []).map((p: { x: number; y: number }) => ({
-        x: p.x,
-        y: p.y,
-      })),
-    });
-  }
-
-  return { nodes: positionedNodes, edgeRoutes };
+  return { nodes: positionedNodes };
 }
