@@ -177,12 +177,25 @@ class LineageInfoService(private val project: Project) {
     }
 
     /**
-     * The user expanded a model card whose column list was empty. Spawn
-     * the Python sidecar to extract output columns from the model's
-     * compiled SQL via sqlglot, then publish the per-model patch event.
+     * The user expanded a model card whose column list was empty, or
+     * the frontend's prefetch effect requested columns at DAG-load
+     * time. Spawn the Python sidecar to extract output columns from
+     * the model's compiled SQL via sqlglot, then publish the
+     * per-model patch event.
+     *
+     * Epoch handling: we *capture* the current epoch without bumping
+     * it. Column requests are independent of payload-changing events
+     * (active-file change, hop change, column-click trace) so they
+     * must not supersede those — and concurrent column requests
+     * (e.g. the frontend prefetching all cards' columns at once) must
+     * not supersede each other. The check only guards against the
+     * case where a newer entry-point has changed the payload while
+     * sqlglot was running; in that case we drop the stale per-model
+     * patch since the frontend's [applyModelColumns] would no-op
+     * anyway when the model is no longer in the active payload.
      */
     fun onRequestColumns(modelUid: String) {
-        val myEpoch = bumpEpoch()
+        val myEpoch = state.get().epoch
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread

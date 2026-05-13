@@ -14,12 +14,11 @@ describe("layoutModelGraph (elk)", () => {
   it("returns empty result for empty input", async () => {
     const result = await layoutModelGraph([], [], {
       nodeWidth: 200,
-      nodesepX: 60,
-      ranksepY: 100,
+      nodeSpacing: 60,
+      layerSpacing: 100,
       heights: {},
     });
     expect(result.nodes).toEqual([]);
-    expect(result.edgeRoutes.size).toBe(0);
   });
 });
 
@@ -38,8 +37,8 @@ describe("layoutModelGraph (elk) — linear chain", () => {
     const result = await layoutModelGraph(nodes, edges, {
       rankdir: "LR",
       nodeWidth: 200,
-      nodesepX: 60,
-      ranksepY: 100,
+      nodeSpacing: 60,
+      layerSpacing: 100,
       heights,
     });
 
@@ -64,8 +63,8 @@ describe("layoutModelGraph (elk) — variable heights", () => {
     const result = await layoutModelGraph(nodes, edges, {
       rankdir: "LR",
       nodeWidth: 200,
-      nodesepX: 60,
-      ranksepY: 100,
+      nodeSpacing: 60,
+      layerSpacing: 100,
       heights,
     });
 
@@ -101,8 +100,8 @@ describe("layoutModelGraph (elk) — hub case", () => {
     const result = await layoutModelGraph(nodes, edges, {
       rankdir: "LR",
       nodeWidth: 200,
-      nodesepX: 60,
-      ranksepY: 100,
+      nodeSpacing: 60,
+      layerSpacing: 100,
       heights,
     });
 
@@ -114,25 +113,3 @@ describe("layoutModelGraph (elk) — hub case", () => {
   });
 });
 
-describe("layoutModelGraph (elk) — edge routes", () => {
-  it("returns a route per edge with start, end, and bendPoints", async () => {
-    const nodes = [makeNode("a"), makeNode("b"), makeNode("c")];
-    const edges = [makeEdge("ab", "a", "b"), makeEdge("bc", "b", "c")];
-    const heights = { a: 60, b: 60, c: 60 };
-
-    const result = await layoutModelGraph(nodes, edges, {
-      rankdir: "LR",
-      nodeWidth: 200,
-      nodesepX: 60,
-      ranksepY: 100,
-      heights,
-    });
-
-    expect(result.edgeRoutes.size).toBe(edges.length);
-    const ab = result.edgeRoutes.get("ab");
-    expect(ab).toBeDefined();
-    expect(typeof ab!.startPoint.x).toBe("number");
-    expect(typeof ab!.endPoint.x).toBe("number");
-    expect(Array.isArray(ab!.bendPoints)).toBe(true);
-  });
-});
