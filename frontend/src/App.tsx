@@ -57,6 +57,16 @@ export const COLUMN_SCROLL_THRESHOLD = 15;
 export const COLUMN_LIST_MAX_HEIGHT =
   COLUMN_SCROLL_THRESHOLD * (COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING);
 
+/**
+ * Stable empty Set for nodes off the current column-lineage trace.
+ * `lineageTrace.columns.get(uid) ?? new Set()` would mint a fresh Set
+ * for every off-trace node on every render — and the resulting prop
+ * identity change punches through xyflow's shallow node-data memo,
+ * triggering needless DbtModelNode re-renders. One module-level value
+ * keeps the reference stable across renders.
+ */
+const EMPTY_HIGHLIGHTED_COLUMNS: Set<string> = new Set();
+
 const PLUGIN_HOST = "intellij-dbtree.local";
 const isInsidePlugin =
   typeof window !== "undefined" && window.location.hostname === PLUGIN_HOST;
@@ -501,7 +511,8 @@ function App() {
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
         columnsPending: pendingColumns.has(m.unique_id),
-        highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
+        highlightedColumns:
+          lineageTrace.columns.get(m.unique_id) ?? EMPTY_HIGHLIGHTED_COLUMNS,
         onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
         theme,
