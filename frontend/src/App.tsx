@@ -278,15 +278,25 @@ function App() {
     return () => clearTimeout(t);
   }, [computingFor]);
 
-  // When a new full payload arrives, drop column selection if the column
-  // no longer exists, and ensure the selected model is expanded.
+  // When a new full payload arrives, drop column selection only when
+  // the column is *truly* gone — i.e. the model is no longer in the
+  // payload, OR the model has a populated column list that no longer
+  // includes the selection.
+  //
+  // Empty column lists are NOT treated as "column gone" — they happen
+  // mid-prefetch (basePayload reflects manifest yml/catalog only; the
+  // sidecar's REQUEST_COLUMNS patches arrive separately via
+  // applyModelColumns). Clearing on an empty list caused clicking a
+  // sidecar-fetched column to flash the trace and then snap back as
+  // the next setLineageInfo overwrote payload.models with empty
+  // columns for that model.
   useEffect(() => {
     setSelectedColumn((prev) => {
       if (!prev) return prev;
-      const stillExists = payload.models.some(
-        (m) => m.unique_id === prev.unique_id && m.columns.some((c) => c.name === prev.column),
-      );
-      return stillExists ? prev : null;
+      const model = payload.models.find((m) => m.unique_id === prev.unique_id);
+      if (!model) return null;
+      if (model.columns.length === 0) return prev;
+      return model.columns.some((c) => c.name === prev.column) ? prev : null;
     });
   }, [payload]);
 
