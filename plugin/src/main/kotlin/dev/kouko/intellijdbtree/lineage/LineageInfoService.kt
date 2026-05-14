@@ -107,27 +107,32 @@ class LineageInfoService(private val project: Project) {
             val cur = state.get()
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    // No epoch bump on this branch — selection within the
-                    // current DAG is a lightweight pointer update and must
-                    // NOT supersede pending long-running work like an
-                    // in-flight column-lineage trace.
+                    // Pure broadcast — selection within the current DAG
+                    // is a UI-side concern. Frontend gets the new
+                    // selectedModelUid via selectedModelChanged and
+                    // paints the orange focus ring; nothing in the
+                    // payload itself needs to change.
                     //
-                    // Real-world race fixed by this: clicking a column
-                    // triggers (a) a file-open callback that fires
-                    // onActiveFileChanged for the focal model, and (b) a
-                    // column-trace callback that spawns a multi-second
-                    // sidecar call. Both used to bump epoch; the
-                    // selection bump happening after the column-trace
-                    // bump caused the column result to be dropped as
-                    // "superseded". Symptom: first click on a column
-                    // shows no edges, second click works (file was
-                    // already open the second time, so no
-                    // onActiveFileChanged fired).
+                    // Critically, we do NOT mutate state.activeUid here.
+                    // That field represents the DAG's centering seed
+                    // for publishFull (setHops, refreshFromDisk) and
+                    // for the column-trace's base topology, and must
+                    // stay anchored to the most recent topology-publish
+                    // seed. Letting in-view navigation drift activeUid
+                    // means the next column click builds its base
+                    // around a non-centering model — different hop
+                    // sphere → different model set → visible as the
+                    // DAG re-rendering with cards appearing /
+                    // disappearing mid-trace.
                     //
-                    // updateAndGet (not set) so we don't roll back fields
-                    // a newer racing task may have written between here
-                    // and the state read above.
-                    state.updateAndGet { it.copy(activeUid = decision.uid) }
+                    // We also skip bumping epoch here — selection is
+                    // not a topology-changing event, so it must not
+                    // supersede a long-running column-lineage trace.
+                    // (Symptom of the original bug: clicking a column,
+                    // then clicking the same column again, the second
+                    // click would show no edges because the
+                    // file-already-open path skipped onActiveFileChanged
+                    // entirely. Keeping epoch stable avoids that.)
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
