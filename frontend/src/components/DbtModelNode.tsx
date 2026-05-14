@@ -259,7 +259,7 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
           style={{
             listStyle: "none",
             margin: 0,
-            marginRight: isScrollable ? 4 : 0,
+            marginRight: isScrollable ? 2 : 0,
             padding: "4px 0",
             maxHeight: isScrollable ? COLUMN_LIST_MAX_HEIGHT : undefined,
             overflowY: isScrollable ? "auto" : "visible",

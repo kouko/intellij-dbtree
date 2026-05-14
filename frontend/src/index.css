@@ -44,7 +44,7 @@ body,
   scrollbar-color: rgba(127, 127, 127, 0.45) transparent;
 }
 .column-list::-webkit-scrollbar {
-  width: 8px;
+  width: 6px;
 }
 .column-list::-webkit-scrollbar-track {
   background: transparent;
