@@ -47,23 +47,15 @@ const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
 const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
 
-/**
- * When a model has more than this many columns, the expanded column list
- * becomes height-capped and scrollable inside the card. Models at or below
- * this threshold render as today, with no overflow handling.
- */
+/** Cap at this many column rows before scrolling. */
 export const COLUMN_SCROLL_THRESHOLD = 15;
 
 /**
- * Visible height (px) of the column list when scrolling kicks in. Derived
- * from the threshold so they stay in sync; one source of truth lets the
- * `heights` memo and `DbtModelNode`'s inline style agree.
- *
- * Approximation: 3px top padding + 13px line-height + 3px bottom padding
- * = 19px per row. Wrapped rows are taller, so this is the row-count cap
- * for the typical unwrapped case.
+ * Visible scroll-viewport height when capping kicks in. Derived from threshold
+ * so the heights memo and DbtModelNode's maxHeight stay in sync automatically.
  */
-export const COLUMN_LIST_MAX_HEIGHT = COLUMN_SCROLL_THRESHOLD * 19;
+export const COLUMN_LIST_MAX_HEIGHT =
+  COLUMN_SCROLL_THRESHOLD * (COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING);
 
 const PLUGIN_HOST = "intellij-dbtree.local";
 const isInsidePlugin =
