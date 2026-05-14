@@ -49,7 +49,21 @@ class LineageInfoService(private val project: Project) {
     private val state = AtomicReference(State())
 
     data class State(
+        /**
+         * Currently-selected model — drifts with editor selection
+         * (in-view navigation, file-open side effect of NODE_CLICK).
+         * Used by [setHops] and [refreshFromDisk] as the seed for
+         * `publishFull` so toolbar refresh / hop changes recenter on
+         * what the user is actually looking at.
+         */
         val activeUid: String? = null,
+        /**
+         * Anchored DAG center — only written by [publishFull]. Never
+         * drifts on in-view selection. Used by the column-lineage
+         * trace's snapshot so a column click doesn't churn topology
+         * (the bug fixed by `ce5e644` + this field's introduction).
+         */
+        val centerUid: String? = null,
         val upHops: Int = DEFAULT_UP_HOPS,
         val downHops: Int = DEFAULT_DOWN_HOPS,
         /** unique_ids in the most recently published full payload. */
@@ -107,32 +121,27 @@ class LineageInfoService(private val project: Project) {
             val cur = state.get()
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    // Pure broadcast — selection within the current DAG
-                    // is a UI-side concern. Frontend gets the new
-                    // selectedModelUid via selectedModelChanged and
-                    // paints the orange focus ring; nothing in the
-                    // payload itself needs to change.
+                    // Selection within the current DAG: track it in
+                    // activeUid so the toolbar refresh / hop slider
+                    // rebuild around whatever the user is actually
+                    // looking at. Do NOT touch centerUid — that's
+                    // anchored to the most recent publishFull seed and
+                    // is what the column-trace snapshot reads, so
+                    // tracing while navigating doesn't churn topology.
                     //
-                    // Critically, we do NOT mutate state.activeUid here.
-                    // That field represents the DAG's centering seed
-                    // for publishFull (setHops, refreshFromDisk) and
-                    // for the column-trace's base topology, and must
-                    // stay anchored to the most recent topology-publish
-                    // seed. Letting in-view navigation drift activeUid
-                    // means the next column click builds its base
-                    // around a non-centering model — different hop
-                    // sphere → different model set → visible as the
-                    // DAG re-rendering with cards appearing /
-                    // disappearing mid-trace.
+                    // No epoch bump here — selection is not a
+                    // topology-changing event and must not supersede a
+                    // long-running column-lineage trace. (Symptom of
+                    // the original bug: clicking a column, then
+                    // clicking the same column again, the second click
+                    // would show no edges because the file-already-open
+                    // path skipped onActiveFileChanged entirely;
+                    // keeping epoch stable avoids that.)
                     //
-                    // We also skip bumping epoch here — selection is
-                    // not a topology-changing event, so it must not
-                    // supersede a long-running column-lineage trace.
-                    // (Symptom of the original bug: clicking a column,
-                    // then clicking the same column again, the second
-                    // click would show no edges because the
-                    // file-already-open path skipped onActiveFileChanged
-                    // entirely. Keeping epoch stable avoids that.)
+                    // updateAndGet (not set) so we don't roll back
+                    // fields a newer racing task may have written
+                    // between here and the state read above.
+                    state.updateAndGet { it.copy(activeUid = decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
@@ -234,28 +243,31 @@ class LineageInfoService(private val project: Project) {
      */
     fun onColumnClicked(modelUid: String, column: String) {
         val myEpoch = bumpEpoch()
-        // Snapshot focal-model + hops on the calling (CEF) thread BEFORE
-        // the racing NODE_CLICK side-channel can land. NODE_CLICK opens
-        // the column's owner file → FileEditorManagerListener fires
-        // selectionChanged → onActiveFileChanged → state.activeUid
-        // gets stomped. If onColumnClicked's pooled thread reads
-        // state.activeUid after that stomp, it builds basePayload around
-        // a different focal model than the user was looking at, and the
-        // 3 streamed publishes ship a different topology — the user
+        // Snapshot center + hops on the calling (CEF) thread BEFORE the
+        // racing NODE_CLICK side-channel can land. NODE_CLICK opens the
+        // column's owner file → FileEditorManagerListener fires
+        // selectionChanged → onActiveFileChanged → state.activeUid gets
+        // updated to the clicked model. If onColumnClicked's pooled
+        // thread reads state after that update, it builds basePayload
+        // around a different model than the user's pre-click DAG and
+        // the 3 streamed publishes ship a different topology — user
         // sees cards appear / disappear mid-trace.
         //
         // Snapshotting on the CEF thread (sequential with JS callbacks)
-        // freezes the values before any of NODE_CLICK's downstream
-        // thread hops complete, so topology stays anchored to the
-        // pre-click view for the whole streaming trace.
+        // freezes values before any of NODE_CLICK's downstream thread
+        // hops complete. We anchor to centerUid (the last publishFull
+        // seed, never drifts on in-view selection), not activeUid
+        // (which does drift) — so even across multiple column clicks
+        // the trace stays centered on the DAG the user explicitly
+        // built via refresh / hop change.
         val snap = state.get()
-        val snapActiveUid = snap.activeUid ?: modelUid
+        val snapCenterUid = snap.centerUid ?: snap.activeUid ?: modelUid
         val snapUpHops = snap.upHops
         val snapDownHops = snap.downHops
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
-            val basePayload = manifest.buildLineage(snapActiveUid, snapUpHops, snapDownHops)
+            val basePayload = manifest.buildLineage(snapCenterUid, snapUpHops, snapDownHops)
             val selected = Selected(uniqueId = modelUid, column = column)
             val publishedUids = basePayload.models.map { it.uniqueId }.toSet()
             state.updateAndGet { it.copy(publishedUids = publishedUids) }
@@ -329,8 +341,8 @@ class LineageInfoService(private val project: Project) {
      * Build + publish a full lineage payload centered on [newActiveUid] (or
      * an empty payload when null). Reads the latest hops off [state] so it
      * always uses the freshest UI value, and writes back only the fields it
-     * owns ([State.activeUid] + [State.publishedUids]) to avoid clobbering
-     * concurrent updates from other entry points.
+     * owns ([State.activeUid] + [State.centerUid] + [State.publishedUids])
+     * to avoid clobbering concurrent updates from other entry points.
      */
     private fun publishFull(manifest: ParsedManifest, newActiveUid: String?) {
         val cur = state.get()
@@ -340,7 +352,13 @@ class LineageInfoService(private val project: Project) {
             LineagePayload()
         }
         val publishedUids = payload.models.map { it.uniqueId }.toSet()
-        state.updateAndGet { it.copy(activeUid = newActiveUid, publishedUids = publishedUids) }
+        state.updateAndGet {
+            it.copy(
+                activeUid = newActiveUid,
+                centerUid = newActiveUid,
+                publishedUids = publishedUids,
+            )
+        }
         publisher.lineagePayloadChanged(payload)
     }
 
