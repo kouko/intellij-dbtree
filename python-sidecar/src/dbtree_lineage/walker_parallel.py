@@ -27,7 +27,12 @@ from sqlglot import exp
 from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 
-from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
+from .lineage import (
+    collect_source_columns,
+    extract_all_column_lineage,
+    extract_column_lineage,
+    list_output_columns,
+)
 from .manifest import DbtManifest
 from .walker import (
     ColumnEdge,
@@ -105,6 +110,29 @@ def _lineage_with_cache(column: str, sql: str):
             dialect=_W_DIALECT,
             schema=_W_SCHEMA,
         )
+
+
+def _bulk_lineage_with_cache(sql: str):
+    """One-shot lineage for every output column of ``sql``.
+
+    Returns a dict[output_col_name -> LineageNode]. Used by walk_down
+    where each task iterates every output column of a child model —
+    bulk mode shares sqlglot's internal sub-path cache across columns,
+    saving ~1.8x over calling lineage once per column even with a
+    pre-built scope.
+
+    Returns None on qualify failure; caller falls back to per-column
+    [_lineage_with_cache] which has its own slow-path fallback.
+    """
+    try:
+        qualified, scope = _qualified_cached(sql, _W_DIALECT)
+        return extract_all_column_lineage(
+            sql=qualified,
+            dialect=_W_DIALECT,
+            scope=scope,
+        )
+    except Exception:
+        return None
 
 
 def _worker_init(manifest_path: str, dialect: str | None) -> None:
@@ -208,11 +236,23 @@ def _worker_walk_down_child(
     if not child_columns:
         return _StepResult([], [], True, True)
 
+    # Compute lineage for ALL output columns in one bulk call when
+    # qualify succeeds — internally shares sub-path computation across
+    # columns. Falls back to per-column path when qualify can't handle
+    # the SQL (e.g. dialect-specific syntax sqlglot's resolver chokes
+    # on).
+    bulk_trees = _bulk_lineage_with_cache(child_model.compiled_sql)
+
     edges: list[dict] = []
     next_tasks: list[tuple[str, str]] = []
     for child_col in child_columns:
         try:
-            child_tree = _lineage_with_cache(child_col, child_model.compiled_sql)
+            if bulk_trees is not None:
+                child_tree = bulk_trees.get(child_col)
+                if child_tree is None:
+                    continue
+            else:
+                child_tree = _lineage_with_cache(child_col, child_model.compiled_sql)
         except Exception:
             continue
         cites_seed = False

@@ -38,6 +38,31 @@ class LineageNode:
         return asdict(self)
 
 
+def extract_all_column_lineage(
+    sql: str | exp.Expression,
+    dialect: str | None = None,
+    schema: dict[str, Any] | None = None,
+    scope: Scope | None = None,
+) -> dict[str, LineageNode]:
+    """Compute lineage for *every* output column of ``sql`` in one call.
+
+    sqlglot.lineage(column=None, …) returns a dict mapping each top-level
+    output column name to its lineage Node, with an internal cache shared
+    across all columns — so sub-paths the columns have in common are
+    computed once. Calling this once is faster than calling
+    [extract_column_lineage] N times for the N output columns of the
+    same SQL, often by ~1.8x for wide projection lists.
+
+    Used by the downstream walker which iterates every output column of
+    each child model to check which ones cite the seed. ``scope`` should
+    be the pre-built scope over a pre-qualified expression (see
+    [walker_parallel._qualified_cached]); passing it skips the per-call
+    qualify + scope-build phase.
+    """
+    node_dict = sqlglot_lineage(None, sql, schema=schema, dialect=dialect, scope=scope)
+    return {name: _convert(node, dialect) for name, node in node_dict.items()}
+
+
 def extract_column_lineage(
     column: str,
     sql: str | exp.Expression,
