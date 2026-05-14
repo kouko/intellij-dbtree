@@ -4,6 +4,12 @@ body,
   margin: 0;
   padding: 0;
   height: 100%;
+  /* Document never scrolls — the React Flow viewport owns its own
+   * panning, and any vertical-overflow inside cards is handled by
+   * the inner .column-list scroller. Without this, sub-pixel
+   * layout drift (toolbar + warning banner + DAG flex math) can
+   * leak a JCEF document scrollbar at the outer edges. */
+  overflow: hidden;
   background: #f8fafc;
   color: #0f172a;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
