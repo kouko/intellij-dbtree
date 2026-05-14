@@ -229,12 +229,28 @@ class LineageInfoService(private val project: Project) {
      */
     fun onColumnClicked(modelUid: String, column: String) {
         val myEpoch = bumpEpoch()
+        // Snapshot focal-model + hops on the calling (CEF) thread BEFORE
+        // the racing NODE_CLICK side-channel can land. NODE_CLICK opens
+        // the column's owner file → FileEditorManagerListener fires
+        // selectionChanged → onActiveFileChanged → state.activeUid
+        // gets stomped. If onColumnClicked's pooled thread reads
+        // state.activeUid after that stomp, it builds basePayload around
+        // a different focal model than the user was looking at, and the
+        // 3 streamed publishes ship a different topology — the user
+        // sees cards appear / disappear mid-trace.
+        //
+        // Snapshotting on the CEF thread (sequential with JS callbacks)
+        // freezes the values before any of NODE_CLICK's downstream
+        // thread hops complete, so topology stays anchored to the
+        // pre-click view for the whole streaming trace.
+        val snap = state.get()
+        val snapActiveUid = snap.activeUid ?: modelUid
+        val snapUpHops = snap.upHops
+        val snapDownHops = snap.downHops
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
-            val cur = state.get()
-            val activeUid = cur.activeUid ?: modelUid
-            val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
+            val basePayload = manifest.buildLineage(snapActiveUid, snapUpHops, snapDownHops)
             val selected = Selected(uniqueId = modelUid, column = column)
             val publishedUids = basePayload.models.map { it.uniqueId }.toSet()
             state.updateAndGet { it.copy(publishedUids = publishedUids) }
