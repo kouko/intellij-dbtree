@@ -24,6 +24,8 @@ from pathlib import Path
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.qualify import qualify as sqlglot_qualify
+from sqlglot.optimizer.scope import Scope, build_scope
 
 from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
 from .manifest import DbtManifest
@@ -47,19 +49,62 @@ _W_SOURCES_BY_NAME: dict[str, str] = {}
 
 
 @functools.lru_cache(maxsize=512)
-def _parse_cached(sql: str, dialect: str | None) -> exp.Expression:
-    """Per-worker parsed-AST cache.
+def _qualified_cached(
+    sql: str, dialect: str | None
+) -> tuple[exp.Expression, Scope | None]:
+    """Per-worker (qualified expression, scope) cache.
 
-    The downstream walker queries lineage for *every* output column of
-    each child model, and each query calls sqlglot.parse_one(sql)
-    internally — that's a fresh O(50ms) parse per column on the same
-    SQL. Caching the parse keyed by (sql, dialect) drops this to one
-    parse per (child_uid, dialect) within a single worker process.
-    Upstream calls benefit transitively when the same model is reached
-    via multiple columns. Cache lives for the worker's lifetime,
-    bounded by maxsize to avoid unbounded growth on huge manifests.
+    sqlglot.lineage decomposes into ~3 phases per call: parse, qualify
+    + build-scope, walk. For dbt's CTE-heavy compiled SQL the first
+    two phases dominate (~70% of total call time on real benchmarks).
+    The walk phase is the only one that varies per column, so caching
+    the qualified expression and scope and passing them to every
+    lineage() call collapses the per-column cost to just the walk.
+
+    Cache key is (sql, dialect). The worker-local _W_SCHEMA is read
+    inside the function body — schema is immutable per worker process
+    (set in _worker_init), so it doesn't need to be in the key.
+
+    Safe to share the cached scope across lineage() calls — sqlglot's
+    lineage walker does not mutate scope or the qualified expression.
+    Verified by re-running the same column against the same cached
+    scope and comparing outputs.
+
+    qualify can raise OptimizeError on SQL the resolver can't handle
+    (unresolved columns, dialect-specific syntax). The caller catches
+    that and falls back to the slow `sql=str` path so we don't lose
+    coverage on models qualify can't handle.
     """
-    return sqlglot.parse_one(sql, dialect=dialect)
+    parsed = sqlglot.parse_one(sql, dialect=dialect)
+    qualified = sqlglot_qualify(parsed, schema=_W_SCHEMA, dialect=dialect)
+    scope = build_scope(qualified)
+    return qualified, scope
+
+
+def _lineage_with_cache(column: str, sql: str):
+    """Wrap extract_column_lineage with the qualified-scope cache.
+
+    Tries the fast path: parse + qualify + build_scope is cached per
+    (sql, dialect), then sqlglot.lineage reuses the shared scope.
+    If qualify raises (e.g. unresolvable column, dialect-specific
+    syntax it can't normalize), fall back to the slow `sql=str` path
+    so the caller still gets a lineage result on hard-to-qualify SQL.
+    """
+    try:
+        qualified, scope = _qualified_cached(sql, _W_DIALECT)
+        return extract_column_lineage(
+            column=column,
+            sql=qualified,
+            dialect=_W_DIALECT,
+            scope=scope,
+        )
+    except Exception:
+        return extract_column_lineage(
+            column=column,
+            sql=sql,
+            dialect=_W_DIALECT,
+            schema=_W_SCHEMA,
+        )
 
 
 def _worker_init(manifest_path: str, dialect: str | None) -> None:
@@ -71,7 +116,7 @@ def _worker_init(manifest_path: str, dialect: str | None) -> None:
     _W_SCHEMA = schema if schema else None
     _W_MODELS_BY_NAME = _W_MANIFEST.models_by_name()
     _W_SOURCES_BY_NAME = _W_MANIFEST.sources_by_name()
-    _parse_cached.cache_clear()
+    _qualified_cached.cache_clear()
 
 
 @dataclass
@@ -103,16 +148,7 @@ def _worker_walk_up_step(uid: str, col: str) -> _StepResult:
     if not model.compiled_sql:
         return _StepResult([], [], False, True)
     try:
-        parsed = _parse_cached(model.compiled_sql, _W_DIALECT)
-    except Exception:
-        return _StepResult([], [], True, True)
-    try:
-        tree = extract_column_lineage(
-            column=col,
-            sql=parsed.copy(),
-            dialect=_W_DIALECT,
-            schema=_W_SCHEMA,
-        )
+        tree = _lineage_with_cache(col, model.compiled_sql)
     except Exception:
         return _StepResult([], [], True, True)
 
@@ -172,27 +208,11 @@ def _worker_walk_down_child(
     if not child_columns:
         return _StepResult([], [], True, True)
 
-    # Parse the child's SQL ONCE for the whole column loop. Without
-    # this, each extract_column_lineage call re-parses internally —
-    # ~50ms × child_column_count, the dominant cost in downstream
-    # tasks. `.copy()` per iteration is mandatory: sqlglot.lineage
-    # qualifies the expression in-place and would carry mutations
-    # across calls otherwise.
-    try:
-        parsed_child = _parse_cached(child_model.compiled_sql, _W_DIALECT)
-    except Exception:
-        return _StepResult([], [], True, True)
-
     edges: list[dict] = []
     next_tasks: list[tuple[str, str]] = []
     for child_col in child_columns:
         try:
-            child_tree = extract_column_lineage(
-                column=child_col,
-                sql=parsed_child.copy(),
-                dialect=_W_DIALECT,
-                schema=_W_SCHEMA,
-            )
+            child_tree = _lineage_with_cache(child_col, child_model.compiled_sql)
         except Exception:
             continue
         cites_seed = False

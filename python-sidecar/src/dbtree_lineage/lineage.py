@@ -17,6 +17,7 @@ from sqlglot import exp
 from sqlglot.lineage import Node as SqlglotNode
 from sqlglot.lineage import lineage as sqlglot_lineage
 from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import Scope
 
 
 @dataclass
@@ -42,27 +43,32 @@ def extract_column_lineage(
     sql: str | exp.Expression,
     dialect: str | None = None,
     schema: dict[str, Any] | None = None,
+    scope: Scope | None = None,
 ) -> LineageNode:
     """Compute the column-lineage tree for ``column`` in ``sql``.
 
     Args:
         column: The output column to trace (e.g. ``"amount_with_tax"``).
         sql: The compiled SQL of the model. Accepts either a raw string
-            (sqlglot will parse it) or a pre-parsed ``exp.Expression``
-            — passing a pre-parsed expression lets callers that query
-            many columns of the same SQL pay the parse cost once
-            instead of once-per-column. The caller is responsible for
-            passing a *fresh copy* if the expression has been used in
-            a previous lineage call: sqlglot.lineage mutates the input
-            via in-place qualification.
+            (sqlglot will parse it) or a pre-parsed/pre-qualified
+            ``exp.Expression``.
         dialect: sqlglot dialect (e.g. ``"redshift"``, ``"postgres"``, ``"bigquery"``).
         schema: Optional column schema mapping for ``SELECT *`` resolution,
             in sqlglot's nested-dict form: ``{"db": {"table": {"col": "TYPE"}}}``.
+            Ignored when ``scope`` is supplied (the scope already encodes
+            the qualified column references).
+        scope: Optional pre-built scope from
+            ``sqlglot.optimizer.scope.build_scope`` over a pre-qualified
+            expression. When provided, sqlglot.lineage skips the per-call
+            qualify + scope-build phase (~70% of the per-call cost for
+            CTE-heavy dbt SQL) and reuses the shared scope. Safe to share
+            across multiple lineage() calls — sqlglot's lineage walker
+            doesn't mutate the scope or qualified expression.
 
     Returns:
         A ``LineageNode`` rooted at the requested column.
     """
-    root = sqlglot_lineage(column, sql, schema=schema, dialect=dialect)
+    root = sqlglot_lineage(column, sql, schema=schema, dialect=dialect, scope=scope)
     return _convert(root, dialect)
 
 
