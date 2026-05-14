@@ -21,6 +21,7 @@ from typing import Any
 from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
 from .manifest import DbtManifest, ManifestError
 from .walker import walk_full_lineage
+from .walker_parallel import default_worker_count, walk_full_lineage_parallel
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,6 +82,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override sqlglot dialect (default: derived from manifest adapter_type).",
     )
     p.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="With --full-walk, parallelise sqlglot parses across N worker "
+             "processes. Default: min(cpu_count, 4). Set 1 to force serial "
+             "(useful for debugging or tiny lineage trees where pool "
+             "startup outweighs the parallel speedup).",
+    )
+    p.add_argument(
         "--pretty",
         action="store_true",
         help="Pretty-print the JSON output.",
@@ -93,13 +103,16 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     stdout — or ``None`` for modes that handle their own stdout writes
     (currently only ``--full-walk --stream``)."""
     if args.project_dir is not None:
+        manifest_path = args.project_dir / "target" / "manifest.json"
         manifest = DbtManifest.from_project(args.project_dir)
     else:
+        manifest_path = args.manifest
         manifest = DbtManifest.load(args.manifest)
 
     dialect = args.dialect or manifest.dialect
     schema = manifest.build_sqlglot_schema()
     schema_arg = schema if schema else None
+    workers = args.workers if args.workers is not None else default_worker_count()
 
     # --full-walk only needs the seed unique_id; per-node SQL is loaded
     # lazily by the walker and missing-SQL nodes are skipped gracefully.
@@ -132,10 +145,12 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
                     flush=True,
                 )
 
-            _, notice = walk_full_lineage(
+            _, notice = walk_full_lineage_parallel(
                 manifest=manifest,
+                manifest_path=manifest_path,
                 seed_uid=seed_uid,
                 seed_column=args.column,
+                workers=workers,
                 dialect=dialect,
                 schema=schema_arg,
                 on_edge=_emit_edge,
@@ -145,10 +160,12 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
             # Streaming mode bypasses main()'s buffered JSON dump.
             return None
 
-        edges, notice = walk_full_lineage(
+        edges, notice = walk_full_lineage_parallel(
             manifest=manifest,
+            manifest_path=manifest_path,
             seed_uid=seed_uid,
             seed_column=args.column,
+            workers=workers,
             dialect=dialect,
             schema=schema_arg,
         )
