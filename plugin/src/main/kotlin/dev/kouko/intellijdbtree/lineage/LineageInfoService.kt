@@ -255,7 +255,15 @@ class LineageInfoService(private val project: Project) {
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
-            val basePayload = manifest.buildLineage(snapActiveUid, snapUpHops, snapDownHops)
+            val rawBasePayload = manifest.buildLineage(snapActiveUid, snapUpHops, snapDownHops)
+            // Always ensure the column's owner model is in the topology so its
+            // card stays visible across all 3 streaming publishes. If the user
+            // clicked a column on a model that's in the *previous* trace's
+            // augmented set but outside the current activeUid's hop sphere,
+            // rawBasePayload wouldn't include it — the card would flicker out
+            // until the Step 3 final augment. Including {modelUid} from Step 1
+            // pins the clicked card for the whole trace.
+            val basePayload = manifest.augmentWithExtras(rawBasePayload, setOf(modelUid))
             val selected = Selected(uniqueId = modelUid, column = column)
             val publishedUids = basePayload.models.map { it.uniqueId }.toSet()
             state.updateAndGet { it.copy(publishedUids = publishedUids) }
@@ -270,7 +278,13 @@ class LineageInfoService(private val project: Project) {
                 ),
             )
 
-            // Step 2: stream edges, debounced republish.
+            // Step 2: stream edges, debounced republish. We deliberately keep
+            // basePayload's topology constant across the streaming flushes —
+            // augmenting incrementally as new uids appear would change
+            // topologyKey every few hundred ms, clearing manual drags and
+            // refitting the viewport repeatedly. Some streamed edges with
+            // off-topology endpoints will be silently dropped by xyflow
+            // during this phase; they reappear at Step 3.
             val edges = mutableListOf<ColumnEdge>()
             var lastFlushNanos = System.nanoTime()
             val flushIntervalNanos = TimeUnit.MILLISECONDS.toNanos(STREAM_PUBLISH_INTERVAL_MS)
@@ -314,8 +328,28 @@ class LineageInfoService(private val project: Project) {
                 snapshot to w
             }
 
+            // Augment the topology with any models the column trace
+            // reached beyond the seed's hop sphere. Without this, the
+            // user sees "176 column edges" in the toolbar but only a
+            // handful of yellow lines on screen, because edges whose
+            // endpoints fall outside payload.models are silently
+            // dropped by xyflow (no node = no anchor).
+            //
+            // Only the final (Step 3) publish does this — the streaming
+            // intermediate publishes keep basePayload's topology so the
+            // frontend's topologyKey doesn't churn mid-trace (each
+            // topology change clears manual drags and refits viewport,
+            // which would be jarring on every flush).
+            val touchedUids = finalEdges.flatMap {
+                listOf(it.sourceUniqueId, it.targetUniqueId)
+            }.toSet()
+            val augmented = manifest.augmentWithExtras(basePayload, touchedUids)
+            val publishedUidsAugmented =
+                augmented.models.map { it.uniqueId }.toSet()
+            state.updateAndGet { it.copy(publishedUids = publishedUidsAugmented) }
+
             publisher.lineagePayloadChanged(
-                basePayload.copy(
+                augmented.copy(
                     columnEdges = finalEdges,
                     selected = selected,
                     warning = warning,

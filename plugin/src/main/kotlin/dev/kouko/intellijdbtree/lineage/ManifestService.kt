@@ -349,6 +349,45 @@ class ParsedManifest(
         )
     }
 
+    /**
+     * Add models touched by a column-lineage trace to an existing payload.
+     *
+     * A column trace can reach upstream / downstream beyond the seed's
+     * hop budget. Without this augmentation, the React side has no card
+     * to attach the highlighted-column to and no node for xyflow to
+     * terminate column-edges at — so the user sees an incomplete trace.
+     *
+     * Adds: model entries for every uid in [extraUids] that isn't already
+     * in [base], plus every manifest model_edge whose both endpoints are
+     * in the merged uid set (so newly-added cards visually connect to
+     * existing ones and to each other).
+     *
+     * No-op when [extraUids] is empty or already covered.
+     */
+    fun augmentWithExtras(base: LineagePayload, extraUids: Set<String>): LineagePayload {
+        val baseUids = base.models.map { it.uniqueId }.toSet()
+        val missing = (extraUids - baseUids).filter { isModelOrSource(it) }
+        if (missing.isEmpty()) return base
+
+        val extraModels = missing.mapNotNull { describe(it) }
+        if (extraModels.isEmpty()) return base
+
+        val mergedUids = baseUids + extraModels.map { it.uniqueId }
+        val mergedEdges = LinkedHashSet(base.modelEdges)
+        for (uid in mergedUids) {
+            childMap.getAsJsonArray(uid)?.forEach { c ->
+                val child = c.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString
+                    ?: return@forEach
+                if (child in mergedUids) mergedEdges += ModelEdge(uid, child)
+            }
+        }
+
+        return base.copy(
+            models = base.models + extraModels,
+            modelEdges = mergedEdges.toList(),
+        )
+    }
+
     private fun isModelOrSource(uid: String): Boolean {
         if (sources.has(uid)) return true
         val n = nodes.getAsJsonObject(uid) ?: return false
