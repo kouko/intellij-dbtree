@@ -197,19 +197,22 @@ class LineageInfoService(private val project: Project) {
      * the model's compiled SQL via sqlglot, then publish the
      * per-model patch event.
      *
-     * Epoch handling: we *capture* the current epoch without bumping
-     * it. Column requests are independent of payload-changing events
-     * (active-file change, hop change, column-click trace) so they
-     * must not supersede those — and concurrent column requests
-     * (e.g. the frontend prefetching all cards' columns at once) must
-     * not supersede each other. The check only guards against the
-     * case where a newer entry-point has changed the payload while
-     * sqlglot was running; in that case we drop the stale per-model
-     * patch since the frontend's [applyModelColumns] would no-op
-     * anyway when the model is no longer in the active payload.
+     * Epoch handling: column requests neither bump nor consult the
+     * epoch. Bumping would supersede in-flight payload-changing work
+     * (active-file change, hop change, column-click trace); consulting
+     * would let those events kill in-flight column requests — and
+     * since the frontend prefetches columns for every visible card
+     * shortly after a payload lands, a column click that arrives a few
+     * hundred ms later would stomp the entire prefetch batch, leaving
+     * the affected cards stuck on "Parsing SQL…" forever.
+     *
+     * Instead we gate the publish on `publishedUids` — if the model is
+     * no longer in the active payload, [applyModelColumns] would no-op
+     * anyway, so we save the IPC. Models that are still on screen
+     * get their column patch regardless of what other events happened
+     * while sqlglot was running.
      */
     fun onRequestColumns(modelUid: String) {
-        val myEpoch = state.get().epoch
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
@@ -217,7 +220,7 @@ class LineageInfoService(private val project: Project) {
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
             if (project.isDisposed) return@executeOnPooledThread
-            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
+            if (modelUid !in state.get().publishedUids) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
         }
