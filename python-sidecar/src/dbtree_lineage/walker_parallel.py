@@ -15,11 +15,15 @@ Falls back to the serial [walker.walk_full_lineage] when `workers <= 1`.
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+import sqlglot
+from sqlglot import exp
 
 from .lineage import collect_source_columns, extract_column_lineage, list_output_columns
 from .manifest import DbtManifest
@@ -42,6 +46,22 @@ _W_MODELS_BY_NAME: dict[str, str] = {}
 _W_SOURCES_BY_NAME: dict[str, str] = {}
 
 
+@functools.lru_cache(maxsize=512)
+def _parse_cached(sql: str, dialect: str | None) -> exp.Expression:
+    """Per-worker parsed-AST cache.
+
+    The downstream walker queries lineage for *every* output column of
+    each child model, and each query calls sqlglot.parse_one(sql)
+    internally — that's a fresh O(50ms) parse per column on the same
+    SQL. Caching the parse keyed by (sql, dialect) drops this to one
+    parse per (child_uid, dialect) within a single worker process.
+    Upstream calls benefit transitively when the same model is reached
+    via multiple columns. Cache lives for the worker's lifetime,
+    bounded by maxsize to avoid unbounded growth on huge manifests.
+    """
+    return sqlglot.parse_one(sql, dialect=dialect)
+
+
 def _worker_init(manifest_path: str, dialect: str | None) -> None:
     global _W_MANIFEST, _W_DIALECT, _W_SCHEMA
     global _W_MODELS_BY_NAME, _W_SOURCES_BY_NAME
@@ -51,6 +71,7 @@ def _worker_init(manifest_path: str, dialect: str | None) -> None:
     _W_SCHEMA = schema if schema else None
     _W_MODELS_BY_NAME = _W_MANIFEST.models_by_name()
     _W_SOURCES_BY_NAME = _W_MANIFEST.sources_by_name()
+    _parse_cached.cache_clear()
 
 
 @dataclass
@@ -82,9 +103,13 @@ def _worker_walk_up_step(uid: str, col: str) -> _StepResult:
     if not model.compiled_sql:
         return _StepResult([], [], False, True)
     try:
+        parsed = _parse_cached(model.compiled_sql, _W_DIALECT)
+    except Exception:
+        return _StepResult([], [], True, True)
+    try:
         tree = extract_column_lineage(
             column=col,
-            sql=model.compiled_sql,
+            sql=parsed.copy(),
             dialect=_W_DIALECT,
             schema=_W_SCHEMA,
         )
@@ -147,13 +172,24 @@ def _worker_walk_down_child(
     if not child_columns:
         return _StepResult([], [], True, True)
 
+    # Parse the child's SQL ONCE for the whole column loop. Without
+    # this, each extract_column_lineage call re-parses internally —
+    # ~50ms × child_column_count, the dominant cost in downstream
+    # tasks. `.copy()` per iteration is mandatory: sqlglot.lineage
+    # qualifies the expression in-place and would carry mutations
+    # across calls otherwise.
+    try:
+        parsed_child = _parse_cached(child_model.compiled_sql, _W_DIALECT)
+    except Exception:
+        return _StepResult([], [], True, True)
+
     edges: list[dict] = []
     next_tasks: list[tuple[str, str]] = []
     for child_col in child_columns:
         try:
             child_tree = extract_column_lineage(
                 column=child_col,
-                sql=child_model.compiled_sql,
+                sql=parsed_child.copy(),
                 dialect=_W_DIALECT,
                 schema=_W_SCHEMA,
             )

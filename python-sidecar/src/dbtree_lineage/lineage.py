@@ -39,7 +39,7 @@ class LineageNode:
 
 def extract_column_lineage(
     column: str,
-    sql: str,
+    sql: str | exp.Expression,
     dialect: str | None = None,
     schema: dict[str, Any] | None = None,
 ) -> LineageNode:
@@ -47,7 +47,14 @@ def extract_column_lineage(
 
     Args:
         column: The output column to trace (e.g. ``"amount_with_tax"``).
-        sql: The compiled SQL of the model.
+        sql: The compiled SQL of the model. Accepts either a raw string
+            (sqlglot will parse it) or a pre-parsed ``exp.Expression``
+            — passing a pre-parsed expression lets callers that query
+            many columns of the same SQL pay the parse cost once
+            instead of once-per-column. The caller is responsible for
+            passing a *fresh copy* if the expression has been used in
+            a previous lineage call: sqlglot.lineage mutates the input
+            via in-place qualification.
         dialect: sqlglot dialect (e.g. ``"redshift"``, ``"postgres"``, ``"bigquery"``).
         schema: Optional column schema mapping for ``SELECT *`` resolution,
             in sqlglot's nested-dict form: ``{"db": {"table": {"col": "TYPE"}}}``.
