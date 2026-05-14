@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
 import { normalizeLayer, type Theme } from "../lib/theme";
+import { COLUMN_LIST_MAX_HEIGHT, COLUMN_SCROLL_THRESHOLD } from "../App";
 
 export interface DbtModelNodeData extends Record<string, unknown> {
   unique_id: string;
@@ -43,6 +44,8 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   const t = data.theme;
   const openable = !!data.onOpenFile;
   const [hover, setHover] = useState(false);
+  const columnListRef = useRef<HTMLUListElement>(null);
+  const isScrollable = data.columns.length > COLUMN_SCROLL_THRESHOLD;
 
   // Background tint: when the card is selected or hovered, mix the
   // layer's own border tone on top of its pale bg so the card reads
@@ -225,12 +228,22 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
         </div>
       )}
       {data.expanded && data.columns.length > 0 && (
-        <ul style={{ listStyle: "none", margin: 0, padding: "4px 0" }}>
+        <ul
+          ref={columnListRef}
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: "4px 0",
+            maxHeight: isScrollable ? COLUMN_LIST_MAX_HEIGHT : undefined,
+            overflowY: isScrollable ? "auto" : "visible",
+          }}
+        >
           {data.columns.map((col) => {
             const highlighted = data.highlightedColumns.has(col.name);
             return (
               <li
                 key={col.name}
+                data-highlighted={highlighted ? "true" : undefined}
                 onClick={(e) => {
                   e.stopPropagation();
                   data.onColumnClick(data.unique_id, col.name);
