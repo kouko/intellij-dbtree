@@ -555,6 +555,27 @@ function App() {
 
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
 
+  // Content-derived layout key. The 3 streamed payloads from a single
+  // column click each have a new identity (kotlin pushes basePayload.copy
+  // with only column_edges differing), but their topology + heights are
+  // identical across the trio. Depending on payload/heights *identity*
+  // would re-run ELK 3 times per click for no benefit; depending on this
+  // content key short-circuits the trailing 2 runs.
+  const layoutInputKey = useMemo(() => {
+    const topo =
+      payload.models.map((m) => m.unique_id).sort().join("|") +
+      ";" +
+      payload.model_edges
+        .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
+        .sort()
+        .join("|");
+    const heightVals = Object.keys(heights)
+      .sort()
+      .map((k) => `${k}=${heights[k]}`)
+      .join(",");
+    return `${topo}/${heightVals}`;
+  }, [payload.models, payload.model_edges, heights]);
+
   useEffect(() => {
     let cancelled = false;
     // Layout only depends on topology (ids + edges) and per-node heights.
@@ -581,7 +602,10 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [payload, heights]);
+    // payload and heights are read from closure; layoutInputKey captures
+    // their content so we re-run only on content change, not identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutInputKey]);
 
   const derivedNodes: Node[] = useMemo(() => {
     return rawNodes.map((n) => {
