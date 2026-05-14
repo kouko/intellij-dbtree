@@ -72,28 +72,6 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
     ul.scrollTo({ top, behavior: "smooth" });
   }, [data.highlightedColumns, isScrollable, data.expanded]);
 
-  useEffect(() => {
-    if (!isScrollable) return;
-    const ul = columnListRef.current;
-    if (!ul) return;
-
-    // xyflow attaches a native wheel listener on the React Flow viewport
-    // for canvas pan/zoom; React's synthetic onWheel runs too late to
-    // intercept. We attach a native handler here and stop propagation
-    // only when the list can absorb the wheel in that direction, so
-    // overscroll falls through to xyflow's zoom.
-    const handler = (e: WheelEvent) => {
-      const atTop = ul.scrollTop <= 0;
-      const atBottom = ul.scrollTop + ul.clientHeight >= ul.scrollHeight - 1;
-      if ((e.deltaY > 0 && !atBottom) || (e.deltaY < 0 && !atTop)) {
-        e.stopPropagation();
-      }
-    };
-
-    ul.addEventListener("wheel", handler, { passive: true });
-    return () => ul.removeEventListener("wheel", handler);
-  }, [isScrollable]);
-
   // Background tint: when the card is selected or hovered, mix the
   // layer's own border tone on top of its pale bg so the card reads
   // as highlighted even at low zoom (where the 2px border / outline
@@ -277,7 +255,7 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
       {data.expanded && data.columns.length > 0 && (
         <ul
           ref={columnListRef}
-          className="column-list"
+          className="nowheel column-list"
           style={{
             listStyle: "none",
             margin: 0,
