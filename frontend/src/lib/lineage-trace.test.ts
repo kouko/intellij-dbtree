@@ -229,6 +229,105 @@ describe("buildColumnLineageTrace", () => {
   });
 });
 
+describe("buildColumnLineageTrace + modelEdges (source augmentation)", () => {
+  // Base column edges: a.x → b.x → c.x
+  const columnEdges = [ce("a", "x", "b", "x"), ce("b", "x", "c", "x")];
+
+  it("adds source uid when its target is already in trace.models", () => {
+    const modelEdges = [me("source.proj.db.raw", "c")];
+    const t = buildColumnLineageTrace({ unique_id: "b", column: "x" }, columnEdges, modelEdges);
+    // a, b, c are in trace via column BFS; source.proj.db.raw targets c → should be added
+    expect(t.models.has("source.proj.db.raw")).toBe(true);
+  });
+
+  it("does NOT add source uid when its target is NOT in trace.models", () => {
+    // d is not visited by the BFS, so source → d should not pull source in
+    const modelEdges = [me("source.proj.db.raw", "d")];
+    const t = buildColumnLineageTrace({ unique_id: "b", column: "x" }, columnEdges, modelEdges);
+    expect(t.models.has("source.proj.db.raw")).toBe(false);
+  });
+
+  it("backward compat: calling without 3rd arg works (no augmentation, no crash)", () => {
+    const t = buildColumnLineageTrace({ unique_id: "b", column: "x" }, columnEdges);
+    expect(t.models).toEqual(new Set(["a", "b", "c"]));
+  });
+
+  it("adds multiple sources that all target the same in-trace model", () => {
+    const modelEdges = [
+      me("source.proj.db.raw1", "c"),
+      me("source.proj.db.raw2", "c"),
+    ];
+    const t = buildColumnLineageTrace({ unique_id: "b", column: "x" }, columnEdges, modelEdges);
+    expect(t.models.has("source.proj.db.raw1")).toBe(true);
+    expect(t.models.has("source.proj.db.raw2")).toBe(true);
+  });
+
+  it("does NOT add non-source.* uids even when both endpoints are present", () => {
+    // model.proj.something → c is a model→model edge, not a source edge;
+    // the augmentation pass is source-specific and must skip it.
+    const modelEdges = [me("model.proj.something", "c")];
+    const t = buildColumnLineageTrace({ unique_id: "b", column: "x" }, columnEdges, modelEdges);
+    expect(t.models.has("model.proj.something")).toBe(false);
+  });
+});
+
+describe("buildColumnTraceEdgePairs + modelEdges + traceModels (source→model promotion)", () => {
+  const columnEdges = [ce("a", "x", "b", "x")];
+  const traceEdges = new Set([edgeKey(ce("a", "x", "b", "x"))]);
+
+  it("adds source→model pair when both endpoints are in traceModels", () => {
+    const modelEdges = [me("source.proj.db.src", "b")];
+    const traceModels = new Set(["source.proj.db.src", "a", "b"]);
+    const pairs = buildColumnTraceEdgePairs(
+      { unique_id: "a", column: "x" },
+      columnEdges,
+      traceEdges,
+      modelEdges,
+      traceModels,
+    );
+    expect(pairs.has("source.proj.db.src|b")).toBe(true);
+    // column edge pair is still present
+    expect(pairs.has("a|b")).toBe(true);
+  });
+
+  it("does NOT add source→model pair when source is NOT in traceModels", () => {
+    const modelEdges = [me("source.proj.db.src", "b")];
+    // source uid intentionally absent from traceModels
+    const traceModels = new Set(["a", "b"]);
+    const pairs = buildColumnTraceEdgePairs(
+      { unique_id: "a", column: "x" },
+      columnEdges,
+      traceEdges,
+      modelEdges,
+      traceModels,
+    );
+    expect(pairs.has("source.proj.db.src|b")).toBe(false);
+  });
+
+  it("does NOT add source→model pair when target is NOT in traceModels (defensive)", () => {
+    const modelEdges = [me("source.proj.db.src", "b")];
+    // target b is intentionally absent from traceModels
+    const traceModels = new Set(["source.proj.db.src", "a"]);
+    const pairs = buildColumnTraceEdgePairs(
+      { unique_id: "a", column: "x" },
+      columnEdges,
+      traceEdges,
+      modelEdges,
+      traceModels,
+    );
+    expect(pairs.has("source.proj.db.src|b")).toBe(false);
+  });
+
+  it("backward compat: 3-arg call works (no source augmentation)", () => {
+    const pairs = buildColumnTraceEdgePairs(
+      { unique_id: "a", column: "x" },
+      columnEdges,
+      traceEdges,
+    );
+    expect(pairs).toEqual(new Set(["a|b"]));
+  });
+});
+
 describe("buildColumnTraceEdgePairs", () => {
   it("returns empty when no column is selected", () => {
     expect(
