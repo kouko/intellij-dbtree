@@ -475,8 +475,12 @@ function App() {
   // passes — bidirectional BFS would overreach into sibling columns that
   // share an upstream/downstream node with the seed.
   const lineageTrace = useMemo(
-    () => buildColumnLineageTrace(selectedColumn, payload.column_edges),
-    [selectedColumn, payload.column_edges],
+    () => buildColumnLineageTrace(
+      selectedColumn,
+      payload.column_edges,
+      payload.model_edges,
+    ),
+    [selectedColumn, payload.column_edges, payload.model_edges],
   );
 
   useEffect(() => {
@@ -500,8 +504,14 @@ function App() {
   );
 
   const columnTraceEdgePairs = useMemo(
-    () => buildColumnTraceEdgePairs(selectedColumn, payload.column_edges, lineageTrace.edges),
-    [selectedColumn, payload.column_edges, lineageTrace.edges],
+    () => buildColumnTraceEdgePairs(
+      selectedColumn,
+      payload.column_edges,
+      lineageTrace.edges,
+      payload.model_edges,
+      lineageTrace.models,
+    ),
+    [selectedColumn, payload.column_edges, lineageTrace.edges, payload.model_edges, lineageTrace.models],
   );
 
   // ---- xyflow nodes/edges --------------------------------------------------

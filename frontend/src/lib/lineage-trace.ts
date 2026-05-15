@@ -66,6 +66,7 @@ export function edgeKey(ce: ColumnEdge): string {
 export function buildColumnLineageTrace(
   selectedColumn: SelectedColumn | null,
   columnEdges: readonly ColumnEdge[],
+  modelEdges: readonly ModelEdge[] = [],
 ): ColumnLineageTrace {
   const trace: ColumnLineageTrace = {
     columns: new Map(),
@@ -134,6 +135,22 @@ export function buildColumnLineageTrace(
           }
         }
       }
+    }
+  }
+
+  // Source-augmentation pass: dbt sources frequently lack column docs,
+  // so sqlglot's lineage walker drops their `SELECT *` references as
+  // Placeholder leaves and the column trace never reaches them — even
+  // though the model graph (model_edges) clearly knows the dependency.
+  // Pull every source uid that is a direct upstream of an already-
+  // visited model into trace.models so source cards still highlight
+  // when the trace passes through their downstream consumer.
+  for (const me of modelEdges) {
+    if (
+      me.source_unique_id.startsWith("source.") &&
+      trace.models.has(me.target_unique_id)
+    ) {
+      trace.models.add(me.source_unique_id);
     }
   }
 
@@ -217,12 +234,27 @@ export function buildColumnTraceEdgePairs(
   selectedColumn: SelectedColumn | null,
   columnEdges: readonly ColumnEdge[],
   traceEdges: ReadonlySet<string>,
+  modelEdges: readonly ModelEdge[] = [],
+  traceModels: ReadonlySet<string> = new Set(),
 ): Set<string> {
   const pairs = new Set<string>();
   if (!selectedColumn) return pairs;
   for (const ce of columnEdges) {
     if (traceEdges.has(edgeKey(ce))) {
       pairs.add(`${ce.source_unique_id}|${ce.target_unique_id}`);
+    }
+  }
+  // Source-to-model model edges where the source was added to the
+  // trace via the augmentation pass in buildColumnLineageTrace —
+  // promote them so the source→model line lights up too, not just
+  // the source card halo.
+  for (const me of modelEdges) {
+    if (
+      me.source_unique_id.startsWith("source.") &&
+      traceModels.has(me.source_unique_id) &&
+      traceModels.has(me.target_unique_id)
+    ) {
+      pairs.add(`${me.source_unique_id}|${me.target_unique_id}`);
     }
   }
   return pairs;
