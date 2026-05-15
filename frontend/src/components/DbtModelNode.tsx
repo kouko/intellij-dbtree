@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { computeScrollTopForCentering } from "../lib/column-scroll";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
 import { normalizeLayer, type Theme } from "../lib/theme";
+import { COLUMN_LIST_MAX_HEIGHT, COLUMN_SCROLL_THRESHOLD } from "../App";
 
 export interface DbtModelNodeData extends Record<string, unknown> {
   unique_id: string;
@@ -43,6 +45,32 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   const t = data.theme;
   const openable = !!data.onOpenFile;
   const [hover, setHover] = useState(false);
+  const columnListRef = useRef<HTMLUListElement>(null);
+  const isScrollable = data.columns.length > COLUMN_SCROLL_THRESHOLD;
+
+  useEffect(() => {
+    if (!isScrollable) return;
+    if (data.highlightedColumns.size === 0) return;
+    const ul = columnListRef.current;
+    if (!ul) return;
+
+    const items = ul.querySelectorAll<HTMLLIElement>('li[data-highlighted="true"]');
+    if (items.length === 0) return;
+
+    const first = items[0];
+    const last = items[items.length - 1];
+    const firstTop = first.offsetTop;
+    const lastBottom = last.offsetTop + last.offsetHeight;
+
+    const top = computeScrollTopForCentering({
+      firstTop,
+      lastBottom,
+      clientHeight: ul.clientHeight,
+      scrollHeight: ul.scrollHeight,
+    });
+
+    ul.scrollTo({ top, behavior: "smooth" });
+  }, [data.highlightedColumns, isScrollable, data.expanded]);
 
   // Background tint: when the card is selected or hovered, mix the
   // layer's own border tone on top of its pale bg so the card reads
@@ -225,12 +253,24 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
         </div>
       )}
       {data.expanded && data.columns.length > 0 && (
-        <ul style={{ listStyle: "none", margin: 0, padding: "4px 0" }}>
+        <ul
+          ref={columnListRef}
+          className="nowheel column-list"
+          style={{
+            listStyle: "none",
+            margin: 0,
+            marginRight: isScrollable ? 2 : 0,
+            padding: "4px 0",
+            maxHeight: isScrollable ? COLUMN_LIST_MAX_HEIGHT : undefined,
+            overflowY: isScrollable ? "auto" : "visible",
+          }}
+        >
           {data.columns.map((col) => {
             const highlighted = data.highlightedColumns.has(col.name);
             return (
               <li
                 key={col.name}
+                data-highlighted={highlighted ? "true" : undefined}
                 onClick={(e) => {
                   e.stopPropagation();
                   data.onColumnClick(data.unique_id, col.name);

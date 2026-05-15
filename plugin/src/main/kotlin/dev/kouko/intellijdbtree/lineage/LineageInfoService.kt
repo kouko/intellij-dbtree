@@ -49,7 +49,21 @@ class LineageInfoService(private val project: Project) {
     private val state = AtomicReference(State())
 
     data class State(
+        /**
+         * Currently-selected model — drifts with editor selection
+         * (in-view navigation, file-open side effect of NODE_CLICK).
+         * Used by [setHops] and [refreshFromDisk] as the seed for
+         * `publishFull` so toolbar refresh / hop changes recenter on
+         * what the user is actually looking at.
+         */
         val activeUid: String? = null,
+        /**
+         * Anchored DAG center — only written by [publishFull]. Never
+         * drifts on in-view selection. Used by the column-lineage
+         * trace's snapshot so a column click doesn't churn topology
+         * (the bug fixed by `ce5e644` + this field's introduction).
+         */
+        val centerUid: String? = null,
         val upHops: Int = DEFAULT_UP_HOPS,
         val downHops: Int = DEFAULT_DOWN_HOPS,
         /** unique_ids in the most recently published full payload. */
@@ -107,26 +121,26 @@ class LineageInfoService(private val project: Project) {
             val cur = state.get()
             when (val decision = decideFocusEvent(uid, cur.publishedUids)) {
                 is FocusDecision.SelectionOnly -> {
-                    // No epoch bump on this branch — selection within the
-                    // current DAG is a lightweight pointer update and must
-                    // NOT supersede pending long-running work like an
-                    // in-flight column-lineage trace.
+                    // Selection within the current DAG: track it in
+                    // activeUid so the toolbar refresh / hop slider
+                    // rebuild around whatever the user is actually
+                    // looking at. Do NOT touch centerUid — that's
+                    // anchored to the most recent publishFull seed and
+                    // is what the column-trace snapshot reads, so
+                    // tracing while navigating doesn't churn topology.
                     //
-                    // Real-world race fixed by this: clicking a column
-                    // triggers (a) a file-open callback that fires
-                    // onActiveFileChanged for the focal model, and (b) a
-                    // column-trace callback that spawns a multi-second
-                    // sidecar call. Both used to bump epoch; the
-                    // selection bump happening after the column-trace
-                    // bump caused the column result to be dropped as
-                    // "superseded". Symptom: first click on a column
-                    // shows no edges, second click works (file was
-                    // already open the second time, so no
-                    // onActiveFileChanged fired).
+                    // No epoch bump here — selection is not a
+                    // topology-changing event and must not supersede a
+                    // long-running column-lineage trace. (Symptom of
+                    // the original bug: clicking a column, then
+                    // clicking the same column again, the second click
+                    // would show no edges because the file-already-open
+                    // path skipped onActiveFileChanged entirely;
+                    // keeping epoch stable avoids that.)
                     //
-                    // updateAndGet (not set) so we don't roll back fields
-                    // a newer racing task may have written between here
-                    // and the state read above.
+                    // updateAndGet (not set) so we don't roll back
+                    // fields a newer racing task may have written
+                    // between here and the state read above.
                     state.updateAndGet { it.copy(activeUid = decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
@@ -183,19 +197,22 @@ class LineageInfoService(private val project: Project) {
      * the model's compiled SQL via sqlglot, then publish the
      * per-model patch event.
      *
-     * Epoch handling: we *capture* the current epoch without bumping
-     * it. Column requests are independent of payload-changing events
-     * (active-file change, hop change, column-click trace) so they
-     * must not supersede those — and concurrent column requests
-     * (e.g. the frontend prefetching all cards' columns at once) must
-     * not supersede each other. The check only guards against the
-     * case where a newer entry-point has changed the payload while
-     * sqlglot was running; in that case we drop the stale per-model
-     * patch since the frontend's [applyModelColumns] would no-op
-     * anyway when the model is no longer in the active payload.
+     * Epoch handling: column requests neither bump nor consult the
+     * epoch. Bumping would supersede in-flight payload-changing work
+     * (active-file change, hop change, column-click trace); consulting
+     * would let those events kill in-flight column requests — and
+     * since the frontend prefetches columns for every visible card
+     * shortly after a payload lands, a column click that arrives a few
+     * hundred ms later would stomp the entire prefetch batch, leaving
+     * the affected cards stuck on "Parsing SQL…" forever.
+     *
+     * Instead we gate the publish on `publishedUids` — if the model is
+     * no longer in the active payload, [applyModelColumns] would no-op
+     * anyway, so we save the IPC. Models that are still on screen
+     * get their column patch regardless of what other events happened
+     * while sqlglot was running.
      */
     fun onRequestColumns(modelUid: String) {
-        val myEpoch = state.get().epoch
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
@@ -203,7 +220,7 @@ class LineageInfoService(private val project: Project) {
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
             if (project.isDisposed) return@executeOnPooledThread
-            if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
+            if (modelUid !in state.get().publishedUids) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
         }
@@ -229,12 +246,31 @@ class LineageInfoService(private val project: Project) {
      */
     fun onColumnClicked(modelUid: String, column: String) {
         val myEpoch = bumpEpoch()
+        // Snapshot center + hops on the calling (CEF) thread BEFORE the
+        // racing NODE_CLICK side-channel can land. NODE_CLICK opens the
+        // column's owner file → FileEditorManagerListener fires
+        // selectionChanged → onActiveFileChanged → state.activeUid gets
+        // updated to the clicked model. If onColumnClicked's pooled
+        // thread reads state after that update, it builds basePayload
+        // around a different model than the user's pre-click DAG and
+        // the 3 streamed publishes ship a different topology — user
+        // sees cards appear / disappear mid-trace.
+        //
+        // Snapshotting on the CEF thread (sequential with JS callbacks)
+        // freezes values before any of NODE_CLICK's downstream thread
+        // hops complete. We anchor to centerUid (the last publishFull
+        // seed, never drifts on in-view selection), not activeUid
+        // (which does drift) — so even across multiple column clicks
+        // the trace stays centered on the DAG the user explicitly
+        // built via refresh / hop change.
+        val snap = state.get()
+        val snapCenterUid = snap.centerUid ?: snap.activeUid ?: modelUid
+        val snapUpHops = snap.upHops
+        val snapDownHops = snap.downHops
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
-            val cur = state.get()
-            val activeUid = cur.activeUid ?: modelUid
-            val basePayload = manifest.buildLineage(activeUid, cur.upHops, cur.downHops)
+            val basePayload = manifest.buildLineage(snapCenterUid, snapUpHops, snapDownHops)
             val selected = Selected(uniqueId = modelUid, column = column)
             val publishedUids = basePayload.models.map { it.uniqueId }.toSet()
             state.updateAndGet { it.copy(publishedUids = publishedUids) }
@@ -308,8 +344,8 @@ class LineageInfoService(private val project: Project) {
      * Build + publish a full lineage payload centered on [newActiveUid] (or
      * an empty payload when null). Reads the latest hops off [state] so it
      * always uses the freshest UI value, and writes back only the fields it
-     * owns ([State.activeUid] + [State.publishedUids]) to avoid clobbering
-     * concurrent updates from other entry points.
+     * owns ([State.activeUid] + [State.centerUid] + [State.publishedUids])
+     * to avoid clobbering concurrent updates from other entry points.
      */
     private fun publishFull(manifest: ParsedManifest, newActiveUid: String?) {
         val cur = state.get()
@@ -319,7 +355,13 @@ class LineageInfoService(private val project: Project) {
             LineagePayload()
         }
         val publishedUids = payload.models.map { it.uniqueId }.toSet()
-        state.updateAndGet { it.copy(activeUid = newActiveUid, publishedUids = publishedUids) }
+        state.updateAndGet {
+            it.copy(
+                activeUid = newActiveUid,
+                centerUid = newActiveUid,
+                publishedUids = publishedUids,
+            )
+        }
         publisher.lineagePayloadChanged(payload)
     }
 

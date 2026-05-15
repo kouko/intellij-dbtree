@@ -16,6 +16,11 @@ import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnSpec, LineagePayload } from "./types";
 import { CurvedBezierEdge } from "./components/CurvedBezierEdge";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
+import {
+  HIDDEN_GHOST_HEIGHT,
+  HiddenNeighboursGhost,
+  type HiddenNeighboursGhostData,
+} from "./components/HiddenNeighboursGhost";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
 import { layoutModelGraph } from "./lib/layout";
 import {
@@ -27,7 +32,12 @@ import {
 } from "./lib/lineage-trace";
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
-const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
+const NODE_TYPES: NodeTypes = {
+  dbtModel: DbtModelNode,
+  dbtGhost: HiddenNeighboursGhost,
+};
+const ghostId = (uid: string, side: "upstream" | "downstream") =>
+  `__hidden__${uid}__${side}`;
 const EDGE_TYPES: EdgeTypes = { curved: CurvedBezierEdge };
 const NODE_WIDTH = 320;
 // Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
@@ -46,6 +56,26 @@ const COLUMN_TYPE_CHARS_PER_LINE = 18; // monospace 9px in ~140px column
 const COLUMN_LINE_HEIGHT = 13; // matches CSS lineHeight 1.3 × 10px
 const COLUMN_ROW_PADDING = 6; // CSS "3px 12px" → 3+3 vertical padding
 const COLS_VERTICAL_PADDING = 12;
+
+/** Cap at this many column rows before scrolling. */
+export const COLUMN_SCROLL_THRESHOLD = 15;
+
+/**
+ * Visible scroll-viewport height when capping kicks in. Derived from threshold
+ * so the heights memo and DbtModelNode's maxHeight stay in sync automatically.
+ */
+export const COLUMN_LIST_MAX_HEIGHT =
+  COLUMN_SCROLL_THRESHOLD * (COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING);
+
+/**
+ * Stable empty Set for nodes off the current column-lineage trace.
+ * `lineageTrace.columns.get(uid) ?? new Set()` would mint a fresh Set
+ * for every off-trace node on every render — and the resulting prop
+ * identity change punches through xyflow's shallow node-data memo,
+ * triggering needless DbtModelNode re-renders. One module-level value
+ * keeps the reference stable across renders.
+ */
+const EMPTY_HIGHLIGHTED_COLUMNS: Set<string> = new Set();
 
 const PLUGIN_HOST = "intellij-dbtree.local";
 const isInsidePlugin =
@@ -258,15 +288,25 @@ function App() {
     return () => clearTimeout(t);
   }, [computingFor]);
 
-  // When a new full payload arrives, drop column selection if the column
-  // no longer exists, and ensure the selected model is expanded.
+  // When a new full payload arrives, drop column selection only when
+  // the column is *truly* gone — i.e. the model is no longer in the
+  // payload, OR the model has a populated column list that no longer
+  // includes the selection.
+  //
+  // Empty column lists are NOT treated as "column gone" — they happen
+  // mid-prefetch (basePayload reflects manifest yml/catalog only; the
+  // sidecar's REQUEST_COLUMNS patches arrive separately via
+  // applyModelColumns). Clearing on an empty list caused clicking a
+  // sidecar-fetched column to flash the trace and then snap back as
+  // the next setLineageInfo overwrote payload.models with empty
+  // columns for that model.
   useEffect(() => {
     setSelectedColumn((prev) => {
       if (!prev) return prev;
-      const stillExists = payload.models.some(
-        (m) => m.unique_id === prev.unique_id && m.columns.some((c) => c.name === prev.column),
-      );
-      return stillExists ? prev : null;
+      const model = payload.models.find((m) => m.unique_id === prev.unique_id);
+      if (!model) return null;
+      if (model.columns.length === 0) return prev;
+      return model.columns.some((c) => c.name === prev.column) ? prev : null;
     });
   }, [payload]);
 
@@ -435,8 +475,12 @@ function App() {
   // passes — bidirectional BFS would overreach into sibling columns that
   // share an upstream/downstream node with the seed.
   const lineageTrace = useMemo(
-    () => buildColumnLineageTrace(selectedColumn, payload.column_edges),
-    [selectedColumn, payload.column_edges],
+    () => buildColumnLineageTrace(
+      selectedColumn,
+      payload.column_edges,
+      payload.model_edges,
+    ),
+    [selectedColumn, payload.column_edges, payload.model_edges],
   );
 
   useEffect(() => {
@@ -460,8 +504,14 @@ function App() {
   );
 
   const columnTraceEdgePairs = useMemo(
-    () => buildColumnTraceEdgePairs(selectedColumn, payload.column_edges, lineageTrace.edges),
-    [selectedColumn, payload.column_edges, lineageTrace.edges],
+    () => buildColumnTraceEdgePairs(
+      selectedColumn,
+      payload.column_edges,
+      lineageTrace.edges,
+      payload.model_edges,
+      lineageTrace.models,
+    ),
+    [selectedColumn, payload.column_edges, lineageTrace.edges, payload.model_edges, lineageTrace.models],
   );
 
   // ---- xyflow nodes/edges --------------------------------------------------
@@ -491,7 +541,8 @@ function App() {
         columns: m.columns,
         expanded: isExpanded(m.unique_id),
         columnsPending: pendingColumns.has(m.unique_id),
-        highlightedColumns: lineageTrace.columns.get(m.unique_id) ?? new Set<string>(),
+        highlightedColumns:
+          lineageTrace.columns.get(m.unique_id) ?? EMPTY_HIGHLIGHTED_COLUMNS,
         onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
         theme,
@@ -515,6 +566,139 @@ function App() {
     onOpenFile,
   ]);
 
+  // Per-(uid, side) flag: does the active trace continue *through*
+  // this visible model into a hidden neighbour on this side? Drives
+  // the ghost card's highlight + the dashed edge's colour so "the
+  // trace continues into hidden territory" reads as continuation,
+  // not just decoration.
+  //
+  // Column-trace (selectedColumn): on-trace iff a column edge in
+  //   lineageTrace.edges has one endpoint on this model and the
+  //   other endpoint outside payload.models.
+  // Model-trace (selectedModelUid only): on-trace iff this model is
+  //   on the seed's lineage tree on the same side as the ghost —
+  //   the seed's own hidden parents/children, an ancestor's hidden
+  //   parents (further upstream), and a descendant's hidden children
+  //   (further downstream) all continue the trace.
+  // Column takes precedence (mirrors the model-edge `onPath` logic).
+  const traceTouchesHidden = useMemo(() => {
+    const map = new Map<string, { upstream: boolean; downstream: boolean }>();
+    if (selectedColumn) {
+      const visible = new Set(payload.models.map((m) => m.unique_id));
+      const get = (uid: string) => {
+        let entry = map.get(uid);
+        if (!entry) {
+          entry = { upstream: false, downstream: false };
+          map.set(uid, entry);
+        }
+        return entry;
+      };
+      for (const ce of payload.column_edges) {
+        if (!lineageTrace.edges.has(edgeKey(ce))) continue;
+        const srcVisible = visible.has(ce.source_unique_id);
+        const tgtVisible = visible.has(ce.target_unique_id);
+        if (srcVisible && !tgtVisible) {
+          get(ce.source_unique_id).downstream = true;
+        } else if (!srcVisible && tgtVisible) {
+          get(ce.target_unique_id).upstream = true;
+        }
+      }
+      return map;
+    }
+    if (selectedModelUid) {
+      for (const m of payload.models) {
+        const isSeed = m.unique_id === selectedModelUid;
+        const isAncestor = modelTrace.ancestors.has(m.unique_id);
+        const isDescendant = modelTrace.descendants.has(m.unique_id);
+        const upstreamOnPath = isSeed || isAncestor;
+        const downstreamOnPath = isSeed || isDescendant;
+        if (upstreamOnPath || downstreamOnPath) {
+          map.set(m.unique_id, {
+            upstream: upstreamOnPath,
+            downstream: downstreamOnPath,
+          });
+        }
+      }
+      return map;
+    }
+    return map;
+  }, [
+    selectedColumn,
+    payload.column_edges,
+    payload.models,
+    lineageTrace.edges,
+    selectedModelUid,
+    modelTrace,
+  ]);
+
+  // Synthetic placeholder cards for "+N hidden upstream / downstream
+  // models" — every visible model with a non-zero hidden_upstream
+  // (or _downstream) gets a small dashed ghost card placed on the
+  // matching side, connected by a dashed model edge. Lets the user
+  // tell "no lineage in this direction" apart from "lineage exists
+  // but is hidden by hops" without clicking anything.
+  const ghostNodes: Array<Node<HiddenNeighboursGhostData, "dbtGhost">> = useMemo(() => {
+    const ghosts: Array<Node<HiddenNeighboursGhostData, "dbtGhost">> = [];
+    for (const m of payload.models) {
+      const up = m.hidden_upstream ?? 0;
+      const down = m.hidden_downstream ?? 0;
+      const touched = traceTouchesHidden.get(m.unique_id);
+      if (up > 0) {
+        ghosts.push({
+          id: ghostId(m.unique_id, "upstream"),
+          type: "dbtGhost" as const,
+          position: { x: 0, y: 0 },
+          // zIndex: -1 puts ghost cards behind real cards so a ghost
+          // landing near a real card never visually competes for the
+          // foreground. xyflow defaults real nodes to 0.
+          zIndex: -1,
+          data: {
+            count: up,
+            side: "upstream",
+            onTracePath: touched?.upstream ?? false,
+            theme,
+            cardWidth: NODE_WIDTH,
+          },
+        });
+      }
+      if (down > 0) {
+        ghosts.push({
+          id: ghostId(m.unique_id, "downstream"),
+          type: "dbtGhost" as const,
+          position: { x: 0, y: 0 },
+          zIndex: -1,
+          data: {
+            count: down,
+            side: "downstream",
+            onTracePath: touched?.downstream ?? false,
+            theme,
+            cardWidth: NODE_WIDTH,
+          },
+        });
+      }
+    }
+    return ghosts;
+  }, [payload.models, traceTouchesHidden, theme]);
+
+  const ghostEdgesForLayout = useMemo(() => {
+    const out: Array<{ source_unique_id: string; target_unique_id: string }> = [];
+    for (const m of payload.models) {
+      if ((m.hidden_upstream ?? 0) > 0) {
+        out.push({
+          source_unique_id: ghostId(m.unique_id, "upstream"),
+          target_unique_id: m.unique_id,
+        });
+      }
+      if ((m.hidden_downstream ?? 0) > 0) {
+        out.push({
+          source_unique_id: m.unique_id,
+          target_unique_id: ghostId(m.unique_id, "downstream"),
+        });
+      }
+    }
+    return out;
+  }, [payload.models]);
+
   const heights: Record<string, number> = useMemo(() => {
     const h: Record<string, number> = {};
     for (const m of payload.models) {
@@ -534,13 +718,45 @@ function App() {
           colsH += lines * COLUMN_LINE_HEIGHT + COLUMN_ROW_PADDING;
         }
         colsH += COLS_VERTICAL_PADDING;
+        if (m.columns.length > COLUMN_SCROLL_THRESHOLD) {
+          colsH = Math.min(colsH, COLUMN_LIST_MAX_HEIGHT + COLS_VERTICAL_PADDING);
+        }
       }
       h[m.unique_id] = headerH + colsH;
     }
+    for (const g of ghostNodes) {
+      h[g.id] = HIDDEN_GHOST_HEIGHT;
+    }
     return h;
-  }, [payload, expanded]);
+  }, [payload, expanded, ghostNodes]);
 
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+
+  // Content-derived layout key. The 3 streamed payloads from a single
+  // column click each have a new identity (kotlin pushes basePayload.copy
+  // with only column_edges differing), but their topology + heights are
+  // identical across the trio. Depending on payload/heights *identity*
+  // would re-run ELK 3 times per click for no benefit; depending on this
+  // content key short-circuits the trailing 2 runs.
+  const layoutInputKey = useMemo(() => {
+    const topo =
+      payload.models.map((m) => m.unique_id).sort().join("|") +
+      ";" +
+      payload.model_edges
+        .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
+        .sort()
+        .join("|") +
+      ";" +
+      ghostEdgesForLayout
+        .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
+        .sort()
+        .join("|");
+    const heightVals = Object.keys(heights)
+      .sort()
+      .map((k) => `${k}=${heights[k]}`)
+      .join(",");
+    return `${topo}/${heightVals}`;
+  }, [payload.models, payload.model_edges, ghostEdgesForLayout, heights]);
 
   useEffect(() => {
     let cancelled = false;
@@ -548,12 +764,27 @@ function App() {
     // Build a minimal Node[] for layout — node `data` (highlight, selection,
     // expansion) is irrelevant to positioning. Re-running layout when only
     // display state changes would shift coordinates on every column click.
-    const layoutNodes: Node[] = payload.models.map((m) => ({
-      id: m.unique_id,
-      position: { x: 0, y: 0 },
-      data: {},
-    }));
-    layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
+    const layoutNodes: Node[] = [
+      ...payload.models.map((m) => ({
+        id: m.unique_id,
+        position: { x: 0, y: 0 },
+        data: {},
+      })),
+      ...ghostNodes.map((g) => ({
+        id: g.id,
+        position: { x: 0, y: 0 },
+        data: {},
+      })),
+    ];
+    const layoutEdges: Edge[] = [
+      ...modelLevelEdges(payload),
+      ...ghostEdgesForLayout.map((e) => ({
+        id: `m:${e.source_unique_id}->${e.target_unique_id}`,
+        source: e.source_unique_id,
+        target: e.target_unique_id,
+      })),
+    ];
+    layoutModelGraph(layoutNodes, layoutEdges, {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
       nodeSpacing: 60,
@@ -568,10 +799,17 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [payload, heights]);
+    // payload and heights are read from closure; layoutInputKey captures
+    // their content so we re-run only on content change, not identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutInputKey]);
 
   const derivedNodes: Node[] = useMemo(() => {
-    return rawNodes.map((n) => {
+    const all: Array<Node<DbtModelNodeData, "dbtModel"> | Node<HiddenNeighboursGhostData, "dbtGhost">> = [
+      ...rawNodes,
+      ...ghostNodes,
+    ];
+    return all.map((n) => {
       const manual = manualPositions[n.id];
       const auto = positions[n.id];
       // If a node has no position yet (fresh from a hop change, ELK still
@@ -591,7 +829,7 @@ function App() {
         height: heights[n.id] ?? 60,
       };
     });
-  }, [rawNodes, positions, manualPositions, heights]);
+  }, [rawNodes, ghostNodes, positions, manualPositions, heights]);
 
   // What ReactFlow actually renders: derivedNodes overlaid with any
   // in-flight drag positions. No separate state — derivedNodes is the
@@ -697,7 +935,42 @@ function App() {
           }))
       : [];
 
-    return [...modelEdges, ...columnEdges];
+    // Dashed edge from each ghost placeholder to its real model.
+    // Reuses the curved edge type so it follows the same bezier
+    // shape as model edges and behaves consistently when cards get
+    // dragged. Goes yellow + opaque when the active column trace
+    // actually crosses into a hidden neighbour on this side, so
+    // the dashed line reads as continuation rather than decoration.
+    const ghostEdgeList: Edge[] = ghostEdgesForLayout.map((e) => {
+      // Determine which real model + side this ghost edge belongs to.
+      // Upstream ghost: source is the ghost (id starts with __hidden__),
+      //                 target is the real uid → highlight when target
+      //                 has trace touching upstream side.
+      // Downstream ghost: source is the real uid, target is the ghost.
+      const ghostIsSource = e.source_unique_id.startsWith("__hidden__");
+      const realUid = ghostIsSource ? e.target_unique_id : e.source_unique_id;
+      const side: "upstream" | "downstream" = ghostIsSource ? "upstream" : "downstream";
+      const onTrace = traceTouchesHidden.get(realUid)?.[side] ?? false;
+      return {
+        id: `gh:${e.source_unique_id}->${e.target_unique_id}`,
+        source: e.source_unique_id,
+        target: e.target_unique_id,
+        type: "curved",
+        data: haloData,
+        // zIndex: -1 keeps ghost edges under real model + column
+        // edges so they never visually obscure live trace lines, even
+        // when an on-trace ghost edge crosses a busy area of the DAG.
+        zIndex: -1,
+        style: {
+          stroke: onTrace ? theme.edgeHighlight : theme.edge,
+          strokeWidth: onTrace ? 2 : 1.5,
+          strokeDasharray: "4 4",
+          opacity: onTrace ? 0.95 : 0.5,
+        },
+      };
+    });
+
+    return [...modelEdges, ...ghostEdgeList, ...columnEdges];
   }, [
     payload,
     lineageTrace,
@@ -705,6 +978,8 @@ function App() {
     columnTraceEdgePairs,
     selectedColumn,
     selectedModelUid,
+    ghostEdgesForLayout,
+    traceTouchesHidden,
     theme,
   ]);
 

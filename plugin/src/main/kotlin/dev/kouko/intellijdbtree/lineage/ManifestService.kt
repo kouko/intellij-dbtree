@@ -336,7 +336,17 @@ class ParsedManifest(
         val interesting = visited.filter { isModelOrSource(it) }.toSet()
         val keptEdges = edges.filter { it.sourceUniqueId in interesting && it.targetUniqueId in interesting }
 
-        val models = interesting.mapNotNull { uid -> describe(uid) }
+        val baseModels = interesting.mapNotNull { uid -> describe(uid) }
+        // Annotate each model with the count of its dbt-graph neighbours
+        // that fell outside this hop sphere, so the React side can show
+        // a "+N hidden" chip on the corresponding handle. Lets the user
+        // distinguish "no lineage" from "lineage cropped by hops" at a
+        // glance, even when nothing is selected.
+        val visibleUids = interesting
+        val models = baseModels.map { m ->
+            val (hiddenUp, hiddenDown) = countHiddenNeighbours(m.uniqueId, visibleUids)
+            m.copy(hiddenUpstream = hiddenUp, hiddenDownstream = hiddenDown)
+        }
         val selected = if (seed != null && seed in interesting) {
             Selected(uniqueId = seed, column = null)
         } else null
@@ -347,6 +357,28 @@ class ParsedManifest(
             columnEdges = emptyList(),
             selected = selected,
         )
+    }
+
+    /**
+     * For [uid], count its full-graph parent / child uids (model + source
+     * only — tests / snapshots / seeds excluded) that are NOT in
+     * [visibleUids]. Used to drive the "+N hidden" chip on the model
+     * card's left / right handle.
+     */
+    private fun countHiddenNeighbours(uid: String, visibleUids: Set<String>): Pair<Int, Int> {
+        val parents = parentMap.getAsJsonArray(uid)
+        val children = childMap.getAsJsonArray(uid)
+        var hiddenUp = 0
+        parents?.forEach { e ->
+            val p = e.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString ?: return@forEach
+            if (p !in visibleUids && isModelOrSource(p)) hiddenUp++
+        }
+        var hiddenDown = 0
+        children?.forEach { e ->
+            val c = e.takeIf { !it.isJsonNull && it.isJsonPrimitive }?.asString ?: return@forEach
+            if (c !in visibleUids && isModelOrSource(c)) hiddenDown++
+        }
+        return hiddenUp to hiddenDown
     }
 
     private fun isModelOrSource(uid: String): Boolean {
