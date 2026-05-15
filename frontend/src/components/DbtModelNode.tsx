@@ -27,13 +27,11 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   onLineagePath: boolean;
   isSelectedModel: boolean;
   /**
-   * Counts of trace neighbours that exist in the column-lineage trace
-   * but lie outside the current visible payload (so xyflow has no
-   * node to anchor those edges to). Rendered as small chips next to
-   * the corresponding handle so the user can tell "there are 4 more
-   * upstream models on this column's lineage that the current hop
-   * budget didn't pull in" instead of silently seeing nothing.
-   * Both fields are 0 when no column is selected.
+   * Counts of upstream / downstream neighbours in the FULL dbt graph
+   * that fall outside this payload (their uids weren't included by
+   * the seed's hop budget). Rendered as small "+N" chips next to the
+   * left / right handle. Always meaningful — driven by manifest
+   * structure, not by a column-trace selection.
    */
   hiddenUpstreamCount: number;
   hiddenDownstreamCount: number;
@@ -383,11 +381,11 @@ export function materializationLetter(value: string | undefined): string | null 
 
 /**
  * "+N" chip rendered just outside the left or right card edge, telling
- * the user there are N more models on the active column-lineage trace
- * that aren't in the current view (their hop sphere falls outside
- * up_hops / down_hops, so xyflow has no node to terminate the trace
- * edges at). Pure indicator — no click action — purely to distinguish
- * "no upstream/downstream lineage" from "lineage exists but is hidden."
+ * the user there are N more upstream / downstream models in the full
+ * dbt graph that fell outside this payload's hop sphere. Always shown
+ * (independent of column selection) so the user can tell "no lineage
+ * in this direction" apart from "lineage exists but is hidden by
+ * hops" at any time. Pure indicator — no click action.
  */
 function HiddenNeighbourChip({
   theme,
@@ -402,8 +400,8 @@ function HiddenNeighbourChip({
     <div
       title={
         side === "left"
-          ? `${count} more upstream model${count === 1 ? "" : "s"} on this column's lineage are outside the current up_hops range`
-          : `${count} more downstream model${count === 1 ? "" : "s"} on this column's lineage are outside the current down_hops range`
+          ? `${count} more upstream model${count === 1 ? "" : "s"} exist in the dbt graph but are outside the current up_hops range`
+          : `${count} more downstream model${count === 1 ? "" : "s"} exist in the dbt graph but are outside the current down_hops range`
       }
       onClick={(e) => e.stopPropagation()}
       style={{

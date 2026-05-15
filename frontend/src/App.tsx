@@ -494,42 +494,6 @@ function App() {
     [selectedColumn, payload.column_edges, lineageTrace.edges],
   );
 
-  // Per-visible-model count of trace neighbours that lie OUTSIDE the
-  // currently published payload — i.e. the column-lineage trace
-  // reaches them but the seed's hop sphere doesn't include them, so
-  // their cards aren't rendered. The DbtModelNode shows these as
-  // small "+N" chips on the corresponding handle so the user can tell
-  // "lineage exists but is hidden by hop budget" apart from "no
-  // lineage in this direction." Empty when no column is selected.
-  const hiddenTraceNeighbours = useMemo(() => {
-    const map = new Map<string, { upstream: Set<string>; downstream: Set<string> }>();
-    if (!selectedColumn) return map;
-    const visible = new Set(payload.models.map((m) => m.unique_id));
-    const ensure = (uid: string) => {
-      let entry = map.get(uid);
-      if (!entry) {
-        entry = { upstream: new Set(), downstream: new Set() };
-        map.set(uid, entry);
-      }
-      return entry;
-    };
-    for (const ce of payload.column_edges) {
-      if (!lineageTrace.edges.has(edgeKey(ce))) continue;
-      const srcVisible = visible.has(ce.source_unique_id);
-      const tgtVisible = visible.has(ce.target_unique_id);
-      // edge between visible model and hidden one — record on the
-      // visible side. (both-visible: ordinary trace edge, no chip;
-      // both-hidden: xyflow drops the edge anyway, no anchor to hint
-      // from.)
-      if (srcVisible && !tgtVisible) {
-        ensure(ce.source_unique_id).downstream.add(ce.target_unique_id);
-      } else if (!srcVisible && tgtVisible) {
-        ensure(ce.target_unique_id).upstream.add(ce.source_unique_id);
-      }
-    }
-    return map;
-  }, [selectedColumn, payload.column_edges, payload.models, lineageTrace.edges]);
-
   // ---- xyflow nodes/edges --------------------------------------------------
   // Layout runs asynchronously, so node data and node positions are computed
   // in two phases:
@@ -561,8 +525,8 @@ function App() {
           lineageTrace.columns.get(m.unique_id) ?? EMPTY_HIGHLIGHTED_COLUMNS,
         onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
-        hiddenUpstreamCount: hiddenTraceNeighbours.get(m.unique_id)?.upstream.size ?? 0,
-        hiddenDownstreamCount: hiddenTraceNeighbours.get(m.unique_id)?.downstream.size ?? 0,
+        hiddenUpstreamCount: m.hidden_upstream ?? 0,
+        hiddenDownstreamCount: m.hidden_downstream ?? 0,
         theme,
         cardWidth: NODE_WIDTH,
         onToggleExpanded: toggleExpanded,
@@ -579,7 +543,6 @@ function App() {
     selectedColumn,
     theme,
     selectedModelUid,
-    hiddenTraceNeighbours,
     toggleExpanded,
     onColumnClick,
     onOpenFile,

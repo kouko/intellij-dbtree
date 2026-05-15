@@ -48,6 +48,17 @@ data class DbtModel(
      */
     val materialization: String? = null,
     val columns: List<ColumnSpec> = emptyList(),
+    /**
+     * Count of this model's upstream / downstream neighbours in the
+     * FULL dbt graph that aren't included in the current payload (their
+     * uids fell outside the seed's hop budget). The frontend renders
+     * these as "+N" chips on the corresponding handle so the user can
+     * tell "no lineage in this direction" apart from "lineage exists
+     * but is hidden by hops". Default 0 keeps older payload consumers
+     * (and pre-feature payloads) rendering normally.
+     */
+    @SerialName("hidden_upstream") val hiddenUpstream: Int = 0,
+    @SerialName("hidden_downstream") val hiddenDownstream: Int = 0,
 )
 
 @Serializable

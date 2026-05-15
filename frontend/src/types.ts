@@ -42,6 +42,15 @@ export interface DbtModel {
    */
   materialization?: string;
   columns: ColumnSpec[];
+  /**
+   * Counts of upstream / downstream neighbours in the FULL dbt graph
+   * that fall outside this payload's hop sphere. The card renders
+   * these as "+N" chips next to the corresponding handle to signal
+   * "lineage exists in this direction but is hidden by hops".
+   * Default 0 — older Kotlin payloads omit them.
+   */
+  hidden_upstream?: number;
+  hidden_downstream?: number;
 }
 
 export type ModelLayer = "staging" | "intermediate" | "marts" | "source";
