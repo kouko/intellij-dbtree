@@ -384,3 +384,57 @@ describe("buildColumnTraceEdgePairs", () => {
     expect(pairs.has("c|d")).toBe(false);
   });
 });
+
+// Pins the algorithmic complexity of the two BFS builders: on a graph
+// the size of a real medium-large dbt project (~1000 models, ~6k model
+// edges, ~60k column edges), a single trace must finish well under the
+// JCEF stream-publish interval (500ms). The earlier O(V×E) implementation
+// took ~170ms PER CALL on this fixture and was re-invoked on every
+// streaming publish during a column trace, cascading the dbtree panel
+// into a frozen state on the iCHEF project. New adjacency-map BFS runs in
+// single-digit ms, so 50ms is comfortably above noise without being
+// loose enough to let O(V×E) creep back in.
+describe("buildColumnLineageTrace / buildModelTrace at scale (perf gate)", () => {
+  function buildLargeGraph(layers: number, perLayer: number, fanout: number, cols: number) {
+    const modelEdges: ModelEdge[] = [];
+    const columnEdges: ColumnEdge[] = [];
+    for (let L = 0; L < layers - 1; L++) {
+      for (let n = 0; n < perLayer; n++) {
+        const src = `m${L * perLayer + n}`;
+        for (let k = 0; k < fanout; k++) {
+          const dst = `m${(L + 1) * perLayer + ((n + k * 7) % perLayer)}`;
+          modelEdges.push(me(src, dst));
+          for (let c = 0; c < cols; c++) {
+            columnEdges.push(ce(src, `c${c}`, dst, `c${c}`));
+          }
+        }
+      }
+    }
+    return { modelEdges, columnEdges };
+  }
+
+  // Sized to match a medium-large dbt project: 1000 models, ~6k model
+  // edges, ~60k column edges. Matches the iCHEF-dbt-pipeline observed
+  // scale within ~20%.
+  const { modelEdges, columnEdges } = buildLargeGraph(100, 10, 6, 10);
+
+  it("buildColumnLineageTrace finishes under 50ms on a 1000-model graph", () => {
+    const t0 = performance.now();
+    const trace = buildColumnLineageTrace(
+      { unique_id: "m0", column: "c0" },
+      columnEdges,
+      modelEdges,
+    );
+    const ms = performance.now() - t0;
+    expect(trace.models.size).toBeGreaterThan(0);
+    expect(ms).toBeLessThan(50);
+  });
+
+  it("buildModelTrace finishes under 30ms on a 1000-model graph", () => {
+    const t0 = performance.now();
+    const trace = buildModelTrace("m0", modelEdges);
+    const ms = performance.now() - t0;
+    expect(trace.all.size).toBeGreaterThan(0);
+    expect(ms).toBeLessThan(30);
+  });
+});
