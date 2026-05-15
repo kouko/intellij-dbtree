@@ -556,6 +556,36 @@ function App() {
     onOpenFile,
   ]);
 
+  // Per-(uid, side) flag: does the active column trace actually cross
+  // into a hidden neighbour on this side of this visible model?
+  // Drives the ghost card's highlight + the dashed edge's colour so
+  // "the trace continues into hidden territory" reads as
+  // continuation, not just decoration.
+  const traceTouchesHidden = useMemo(() => {
+    const map = new Map<string, { upstream: boolean; downstream: boolean }>();
+    if (!selectedColumn) return map;
+    const visible = new Set(payload.models.map((m) => m.unique_id));
+    const get = (uid: string) => {
+      let entry = map.get(uid);
+      if (!entry) {
+        entry = { upstream: false, downstream: false };
+        map.set(uid, entry);
+      }
+      return entry;
+    };
+    for (const ce of payload.column_edges) {
+      if (!lineageTrace.edges.has(edgeKey(ce))) continue;
+      const srcVisible = visible.has(ce.source_unique_id);
+      const tgtVisible = visible.has(ce.target_unique_id);
+      if (srcVisible && !tgtVisible) {
+        get(ce.source_unique_id).downstream = true;
+      } else if (!srcVisible && tgtVisible) {
+        get(ce.target_unique_id).upstream = true;
+      }
+    }
+    return map;
+  }, [selectedColumn, payload.column_edges, payload.models, lineageTrace.edges]);
+
   // Synthetic placeholder cards for "+N hidden upstream / downstream
   // models" — every visible model with a non-zero hidden_upstream
   // (or _downstream) gets a small dashed ghost card placed on the
@@ -567,12 +597,19 @@ function App() {
     for (const m of payload.models) {
       const up = m.hidden_upstream ?? 0;
       const down = m.hidden_downstream ?? 0;
+      const touched = traceTouchesHidden.get(m.unique_id);
       if (up > 0) {
         ghosts.push({
           id: ghostId(m.unique_id, "upstream"),
           type: "dbtGhost" as const,
           position: { x: 0, y: 0 },
-          data: { count: up, side: "upstream", theme, cardWidth: NODE_WIDTH },
+          data: {
+            count: up,
+            side: "upstream",
+            onTracePath: touched?.upstream ?? false,
+            theme,
+            cardWidth: NODE_WIDTH,
+          },
         });
       }
       if (down > 0) {
@@ -580,12 +617,18 @@ function App() {
           id: ghostId(m.unique_id, "downstream"),
           type: "dbtGhost" as const,
           position: { x: 0, y: 0 },
-          data: { count: down, side: "downstream", theme, cardWidth: NODE_WIDTH },
+          data: {
+            count: down,
+            side: "downstream",
+            onTracePath: touched?.downstream ?? false,
+            theme,
+            cardWidth: NODE_WIDTH,
+          },
         });
       }
     }
     return ghosts;
-  }, [payload.models, theme]);
+  }, [payload.models, traceTouchesHidden, theme]);
 
   const ghostEdgesForLayout = useMemo(() => {
     const out: Array<{ source_unique_id: string; target_unique_id: string }> = [];
@@ -842,23 +885,36 @@ function App() {
           }))
       : [];
 
-    // Dashed, low-opacity edge from each ghost placeholder to its real
-    // model. Reuses the curved edge type so it follows the same
-    // bezier shape as model edges and behaves consistently when cards
-    // get dragged.
-    const ghostEdgeList: Edge[] = ghostEdgesForLayout.map((e) => ({
-      id: `gh:${e.source_unique_id}->${e.target_unique_id}`,
-      source: e.source_unique_id,
-      target: e.target_unique_id,
-      type: "curved",
-      data: haloData,
-      style: {
-        stroke: theme.edge,
-        strokeWidth: 1.5,
-        strokeDasharray: "4 4",
-        opacity: 0.5,
-      },
-    }));
+    // Dashed edge from each ghost placeholder to its real model.
+    // Reuses the curved edge type so it follows the same bezier
+    // shape as model edges and behaves consistently when cards get
+    // dragged. Goes yellow + opaque when the active column trace
+    // actually crosses into a hidden neighbour on this side, so
+    // the dashed line reads as continuation rather than decoration.
+    const ghostEdgeList: Edge[] = ghostEdgesForLayout.map((e) => {
+      // Determine which real model + side this ghost edge belongs to.
+      // Upstream ghost: source is the ghost (id starts with __hidden__),
+      //                 target is the real uid → highlight when target
+      //                 has trace touching upstream side.
+      // Downstream ghost: source is the real uid, target is the ghost.
+      const ghostIsSource = e.source_unique_id.startsWith("__hidden__");
+      const realUid = ghostIsSource ? e.target_unique_id : e.source_unique_id;
+      const side: "upstream" | "downstream" = ghostIsSource ? "upstream" : "downstream";
+      const onTrace = traceTouchesHidden.get(realUid)?.[side] ?? false;
+      return {
+        id: `gh:${e.source_unique_id}->${e.target_unique_id}`,
+        source: e.source_unique_id,
+        target: e.target_unique_id,
+        type: "curved",
+        data: haloData,
+        style: {
+          stroke: onTrace ? theme.edgeHighlight : theme.edge,
+          strokeWidth: onTrace ? 2 : 1.5,
+          strokeDasharray: "4 4",
+          opacity: onTrace ? 0.95 : 0.5,
+        },
+      };
+    });
 
     return [...modelEdges, ...ghostEdgeList, ...columnEdges];
   }, [
@@ -869,6 +925,7 @@ function App() {
     selectedColumn,
     selectedModelUid,
     ghostEdgesForLayout,
+    traceTouchesHidden,
     theme,
   ]);
 

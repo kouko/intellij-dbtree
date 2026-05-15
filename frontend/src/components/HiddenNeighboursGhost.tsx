@@ -13,6 +13,13 @@ import type { Theme } from "../lib/theme";
 export interface HiddenNeighboursGhostData extends Record<string, unknown> {
   count: number;
   side: "upstream" | "downstream";
+  /**
+   * True when the active column-lineage trace actually crosses into
+   * a hidden neighbour on this side. Drives a yellow border + brighter
+   * text so the user can read "the trace continues through these
+   * hidden models" instead of a muted "just hidden context".
+   */
+  onTracePath: boolean;
   theme: Theme;
   cardWidth: number;
 }
@@ -32,6 +39,8 @@ export function HiddenNeighboursGhost({
   // *source* of an edge going RIGHT into the real card. Downstream
   // ghost mirrors. Either way, only one handle is needed per ghost
   // (the other side never connects to anything).
+  const borderColor = data.onTracePath ? t.edgeHighlight : t.toolbarTextSubtle;
+  const textColor = data.onTracePath ? t.highlightText : t.toolbarTextSubtle;
   return (
     <div
       title={
@@ -45,14 +54,15 @@ export function HiddenNeighboursGhost({
         boxSizing: "border-box",
         padding: "10px 14px",
         borderRadius: 10,
-        border: `2px dashed ${t.toolbarTextSubtle}`,
+        border: `2px dashed ${borderColor}`,
         background: "transparent",
-        color: t.toolbarTextSubtle,
+        color: textColor,
         fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
         fontSize: 12,
         fontStyle: "italic",
+        fontWeight: data.onTracePath ? 600 : 400,
         textAlign: "center",
-        opacity: 0.8,
+        opacity: data.onTracePath ? 1 : 0.8,
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -65,11 +75,11 @@ export function HiddenNeighboursGhost({
           type="source"
           position={Position.Right}
           style={{
-            background: t.toolbarTextSubtle,
+            background: borderColor,
             width: 12,
             height: 12,
             border: `2px solid ${t.toolbarBg}`,
-            opacity: 0.6,
+            opacity: data.onTracePath ? 1 : 0.6,
           }}
         />
       ) : (
@@ -77,11 +87,11 @@ export function HiddenNeighboursGhost({
           type="target"
           position={Position.Left}
           style={{
-            background: t.toolbarTextSubtle,
+            background: borderColor,
             width: 12,
             height: 12,
             border: `2px solid ${t.toolbarBg}`,
-            opacity: 0.6,
+            opacity: data.onTracePath ? 1 : 0.6,
           }}
         />
       )}
