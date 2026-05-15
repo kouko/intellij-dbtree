@@ -194,4 +194,128 @@ class LineageInfoPolicyTest {
             return ParsedManifest(raw, null, Path.of("/dbt"))
         }
     }
+
+    /**
+     * Pins the activeUid-vs-centerUid split that fixes two bugs at once:
+     *  - Toolbar refresh must rebuild around what the user is currently
+     *    looking at (uses activeUid, which drifts on selection)
+     *  - Column trace must NOT churn topology when selection drifts
+     *    across in-view clicks (uses centerUid, anchored)
+     */
+    @Nested
+    inner class StateTransitionTests {
+
+        @Test
+        fun `publishFull moves activeUid and centerUid together`() {
+            val before = LineageInfoService.State(
+                activeUid = "old.focal",
+                centerUid = "old.focal",
+                publishedUids = setOf("old.focal", "old.up"),
+            )
+            val after = stateAfterPublishFull(
+                before,
+                newActiveUid = "new.focal",
+                publishedUids = setOf("new.focal", "new.up", "new.down"),
+            )
+            assertEquals("new.focal", after.activeUid)
+            assertEquals("new.focal", after.centerUid)
+            assertEquals(setOf("new.focal", "new.up", "new.down"), after.publishedUids)
+        }
+
+        @Test
+        fun `publishFull with null seed clears both activeUid and centerUid`() {
+            val before = LineageInfoService.State(activeUid = "x", centerUid = "x")
+            val after = stateAfterPublishFull(before, newActiveUid = null, publishedUids = emptySet())
+            assertNull(after.activeUid)
+            assertNull(after.centerUid)
+        }
+
+        @Test
+        fun `selectionOnly drifts activeUid but anchors centerUid`() {
+            val before = LineageInfoService.State(
+                activeUid = "A",
+                centerUid = "A",
+                publishedUids = setOf("A", "B", "C"),
+            )
+            val after = stateAfterSelectionOnly(before, "B")
+            assertEquals("B", after.activeUid)
+            assertEquals("A", after.centerUid) // ← the load-bearing assertion
+            assertEquals(setOf("A", "B", "C"), after.publishedUids)
+        }
+
+        @Test
+        fun `selectionOnly preserves centerUid across multiple drifts`() {
+            // Models the real-world bug: user clicks card B then card C;
+            // centerUid must stay anchored to the original publishFull seed
+            // so the next column trace still bases topology on the user's
+            // explicit DAG view, not the latest in-view click.
+            val initial = LineageInfoService.State(
+                activeUid = "ORIGINAL_FOCAL",
+                centerUid = "ORIGINAL_FOCAL",
+                publishedUids = setOf("ORIGINAL_FOCAL", "B", "C"),
+            )
+            val afterClickB = stateAfterSelectionOnly(initial, "B")
+            val afterClickC = stateAfterSelectionOnly(afterClickB, "C")
+            assertEquals("C", afterClickC.activeUid)
+            assertEquals("ORIGINAL_FOCAL", afterClickC.centerUid)
+        }
+
+        @Test
+        fun `selectionOnly does not touch hops, epoch, or publishedUids`() {
+            val before = LineageInfoService.State(
+                activeUid = "A",
+                centerUid = "A",
+                upHops = 5,
+                downHops = 7,
+                epoch = 42L,
+                publishedUids = setOf("A"),
+            )
+            val after = stateAfterSelectionOnly(before, "B")
+            assertEquals(5, after.upHops)
+            assertEquals(7, after.downHops)
+            assertEquals(42L, after.epoch)
+            assertEquals(setOf("A"), after.publishedUids)
+        }
+    }
+
+    /**
+     * Pins the column-request publish gate. Replacing epoch supersession
+     * with a publishedUids check fixed the regression where any unrelated
+     * payload-changing event (column click, hop change) would kill in-flight
+     * column-list prefetches and leave cards stuck on "Parsing SQL…".
+     */
+    @Nested
+    inner class ShouldPublishModelColumnsTests {
+
+        @Test
+        fun `publishes when model is in publishedUids`() {
+            val state = LineageInfoService.State(publishedUids = setOf("model.foo", "model.bar"))
+            assertTrue(shouldPublishModelColumns("model.foo", state))
+        }
+
+        @Test
+        fun `drops when model is not in publishedUids`() {
+            val state = LineageInfoService.State(publishedUids = setOf("model.foo"))
+            assertFalse(shouldPublishModelColumns("model.bar", state))
+        }
+
+        @Test
+        fun `drops when publishedUids is empty`() {
+            val state = LineageInfoService.State(publishedUids = emptySet())
+            assertFalse(shouldPublishModelColumns("model.foo", state))
+        }
+
+        @Test
+        fun `does not consult epoch — epoch differences are irrelevant to the gate`() {
+            // The original bug: column-prefetch tasks were keyed by epoch
+            // and any unrelated bump would supersede them. The fix gates
+            // strictly on publishedUids, so even a wildly different epoch
+            // shouldn't change the decision.
+            val state = LineageInfoService.State(
+                publishedUids = setOf("model.foo"),
+                epoch = 999L,
+            )
+            assertTrue(shouldPublishModelColumns("model.foo", state))
+        }
+    }
 }

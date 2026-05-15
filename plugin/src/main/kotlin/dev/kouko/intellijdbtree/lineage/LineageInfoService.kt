@@ -141,7 +141,7 @@ class LineageInfoService(private val project: Project) {
                     // updateAndGet (not set) so we don't roll back
                     // fields a newer racing task may have written
                     // between here and the state read above.
-                    state.updateAndGet { it.copy(activeUid = decision.uid) }
+                    state.updateAndGet { stateAfterSelectionOnly(it, decision.uid) }
                     publisher.selectedModelChanged(decision.uid)
                 }
                 is FocusDecision.Rebuild -> {
@@ -220,7 +220,7 @@ class LineageInfoService(private val project: Project) {
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: return@executeOnPooledThread
             if (project.isDisposed) return@executeOnPooledThread
-            if (modelUid !in state.get().publishedUids) return@executeOnPooledThread
+            if (!shouldPublishModelColumns(modelUid, state.get())) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
         }
@@ -355,13 +355,7 @@ class LineageInfoService(private val project: Project) {
             LineagePayload()
         }
         val publishedUids = payload.models.map { it.uniqueId }.toSet()
-        state.updateAndGet {
-            it.copy(
-                activeUid = newActiveUid,
-                centerUid = newActiveUid,
-                publishedUids = publishedUids,
-            )
-        }
+        state.updateAndGet { stateAfterPublishFull(it, newActiveUid, publishedUids) }
         publisher.lineagePayloadChanged(payload)
     }
 
