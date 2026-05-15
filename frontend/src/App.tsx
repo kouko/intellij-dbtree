@@ -556,35 +556,70 @@ function App() {
     onOpenFile,
   ]);
 
-  // Per-(uid, side) flag: does the active column trace actually cross
-  // into a hidden neighbour on this side of this visible model?
-  // Drives the ghost card's highlight + the dashed edge's colour so
-  // "the trace continues into hidden territory" reads as
-  // continuation, not just decoration.
+  // Per-(uid, side) flag: does the active trace continue *through*
+  // this visible model into a hidden neighbour on this side? Drives
+  // the ghost card's highlight + the dashed edge's colour so "the
+  // trace continues into hidden territory" reads as continuation,
+  // not just decoration.
+  //
+  // Column-trace (selectedColumn): on-trace iff a column edge in
+  //   lineageTrace.edges has one endpoint on this model and the
+  //   other endpoint outside payload.models.
+  // Model-trace (selectedModelUid only): on-trace iff this model is
+  //   on the seed's lineage tree on the same side as the ghost —
+  //   the seed's own hidden parents/children, an ancestor's hidden
+  //   parents (further upstream), and a descendant's hidden children
+  //   (further downstream) all continue the trace.
+  // Column takes precedence (mirrors the model-edge `onPath` logic).
   const traceTouchesHidden = useMemo(() => {
     const map = new Map<string, { upstream: boolean; downstream: boolean }>();
-    if (!selectedColumn) return map;
-    const visible = new Set(payload.models.map((m) => m.unique_id));
-    const get = (uid: string) => {
-      let entry = map.get(uid);
-      if (!entry) {
-        entry = { upstream: false, downstream: false };
-        map.set(uid, entry);
+    if (selectedColumn) {
+      const visible = new Set(payload.models.map((m) => m.unique_id));
+      const get = (uid: string) => {
+        let entry = map.get(uid);
+        if (!entry) {
+          entry = { upstream: false, downstream: false };
+          map.set(uid, entry);
+        }
+        return entry;
+      };
+      for (const ce of payload.column_edges) {
+        if (!lineageTrace.edges.has(edgeKey(ce))) continue;
+        const srcVisible = visible.has(ce.source_unique_id);
+        const tgtVisible = visible.has(ce.target_unique_id);
+        if (srcVisible && !tgtVisible) {
+          get(ce.source_unique_id).downstream = true;
+        } else if (!srcVisible && tgtVisible) {
+          get(ce.target_unique_id).upstream = true;
+        }
       }
-      return entry;
-    };
-    for (const ce of payload.column_edges) {
-      if (!lineageTrace.edges.has(edgeKey(ce))) continue;
-      const srcVisible = visible.has(ce.source_unique_id);
-      const tgtVisible = visible.has(ce.target_unique_id);
-      if (srcVisible && !tgtVisible) {
-        get(ce.source_unique_id).downstream = true;
-      } else if (!srcVisible && tgtVisible) {
-        get(ce.target_unique_id).upstream = true;
+      return map;
+    }
+    if (selectedModelUid) {
+      for (const m of payload.models) {
+        const isSeed = m.unique_id === selectedModelUid;
+        const isAncestor = modelTrace.ancestors.has(m.unique_id);
+        const isDescendant = modelTrace.descendants.has(m.unique_id);
+        const upstreamOnPath = isSeed || isAncestor;
+        const downstreamOnPath = isSeed || isDescendant;
+        if (upstreamOnPath || downstreamOnPath) {
+          map.set(m.unique_id, {
+            upstream: upstreamOnPath,
+            downstream: downstreamOnPath,
+          });
+        }
       }
+      return map;
     }
     return map;
-  }, [selectedColumn, payload.column_edges, payload.models, lineageTrace.edges]);
+  }, [
+    selectedColumn,
+    payload.column_edges,
+    payload.models,
+    lineageTrace.edges,
+    selectedModelUid,
+    modelTrace,
+  ]);
 
   // Synthetic placeholder cards for "+N hidden upstream / downstream
   // models" — every visible model with a non-zero hidden_upstream
