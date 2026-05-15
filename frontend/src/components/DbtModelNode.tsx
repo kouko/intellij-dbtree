@@ -26,6 +26,17 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   highlightedColumns: Set<string>;
   onLineagePath: boolean;
   isSelectedModel: boolean;
+  /**
+   * Counts of trace neighbours that exist in the column-lineage trace
+   * but lie outside the current visible payload (so xyflow has no
+   * node to anchor those edges to). Rendered as small chips next to
+   * the corresponding handle so the user can tell "there are 4 more
+   * upstream models on this column's lineage that the current hop
+   * budget didn't pull in" instead of silently seeing nothing.
+   * Both fields are 0 when no column is selected.
+   */
+  hiddenUpstreamCount: number;
+  hiddenDownstreamCount: number;
   theme: Theme;
   cardWidth: number;
   onToggleExpanded: (uniqueId: string) => void;
@@ -107,6 +118,9 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   }
 
   const cardStyle: React.CSSProperties = {
+    // Anchors the absolute-positioned hidden-neighbour chips that
+    // stick out past the left/right card edges next to the handles.
+    position: "relative",
     borderRadius: 10,
     border: `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.border}`,
     background: cardBackground,
@@ -158,6 +172,21 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
           border: `2px solid ${t.toolbarBg}`,
         }}
       />
+
+      {data.hiddenUpstreamCount > 0 && (
+        <HiddenNeighbourChip
+          theme={t}
+          side="left"
+          count={data.hiddenUpstreamCount}
+        />
+      )}
+      {data.hiddenDownstreamCount > 0 && (
+        <HiddenNeighbourChip
+          theme={t}
+          side="right"
+          count={data.hiddenDownstreamCount}
+        />
+      )}
 
       <header
         style={{
@@ -350,6 +379,59 @@ export function materializationLetter(value: string | undefined): string | null 
     default:
       return null;
   }
+}
+
+/**
+ * "+N" chip rendered just outside the left or right card edge, telling
+ * the user there are N more models on the active column-lineage trace
+ * that aren't in the current view (their hop sphere falls outside
+ * up_hops / down_hops, so xyflow has no node to terminate the trace
+ * edges at). Pure indicator — no click action — purely to distinguish
+ * "no upstream/downstream lineage" from "lineage exists but is hidden."
+ */
+function HiddenNeighbourChip({
+  theme,
+  side,
+  count,
+}: {
+  theme: Theme;
+  side: "left" | "right";
+  count: number;
+}) {
+  return (
+    <div
+      title={
+        side === "left"
+          ? `${count} more upstream model${count === 1 ? "" : "s"} on this column's lineage are outside the current up_hops range`
+          : `${count} more downstream model${count === 1 ? "" : "s"} on this column's lineage are outside the current down_hops range`
+      }
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        position: "absolute",
+        top: "50%",
+        [side]: -32,
+        transform: "translateY(-50%)",
+        minWidth: 22,
+        height: 18,
+        padding: "0 5px",
+        borderRadius: 9,
+        background: theme.edgeHighlight,
+        color: theme.toolbarBg,
+        fontSize: 10,
+        fontWeight: 700,
+        fontFamily: "ui-monospace, SFMono-Regular, monospace",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
+        cursor: "help",
+        userSelect: "none",
+        whiteSpace: "nowrap",
+      }}
+    >
+      +{count}
+    </div>
+  );
 }
 
 function MaterializationBadge({
