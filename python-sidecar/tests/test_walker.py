@@ -286,3 +286,140 @@ def test_walk_returns_empty_for_unknown_column(dbt_project_inline: Path) -> None
     # sqlglot succeeded for downstream-only branches. For a leaf model
     # (fct_orders has no downstream in the fixture), we expect empty.
     assert edges == []
+
+
+# ---------------------------------------------------------------------------
+# New behaviour 3: walker caches + relaxed qualify
+# ---------------------------------------------------------------------------
+
+
+def test_walk_is_idempotent_with_cache(dbt_project_inline: Path) -> None:
+    """Two successive walk_full_lineage calls on the same project produce
+    identical edges — each call builds its own closure caches and they
+    don't bleed into each other."""
+    edges_a = _edges(dbt_project_inline, "fct_orders", "id")
+    edges_b = _edges(dbt_project_inline, "fct_orders", "id")
+
+    # Both runs must be non-empty (regression guard)
+    assert edges_a, "first walk produced no edges"
+
+    # Edge lists must be identical (same dicts, same order is not required
+    # since walk order is deterministic — but identical set is required)
+    def _edge_key(e: dict) -> tuple:
+        return (
+            e["source_unique_id"],
+            e["source_column"],
+            e["target_unique_id"],
+            e["target_column"],
+        )
+
+    assert sorted(edges_a, key=_edge_key) == sorted(edges_b, key=_edge_key), (
+        "second walk returned different edges — caches leaked state"
+    )
+
+
+def test_walk_cache_does_not_taint_different_column(dbt_project_inline: Path) -> None:
+    """Walking column A then column B must give the same result for B as
+    walking B standalone (the per-walk caches must not confuse columns)."""
+    edges_id_first = _edges(dbt_project_inline, "fct_orders", "id")
+    edges_tax_after_id = _edges(dbt_project_inline, "fct_orders", "amount_with_tax")
+    edges_tax_standalone = _edges(dbt_project_inline, "fct_orders", "amount_with_tax")
+
+    def _edge_key(e: dict) -> tuple:
+        return (
+            e["source_unique_id"],
+            e["source_column"],
+            e["target_unique_id"],
+            e["target_column"],
+        )
+
+    # amount_with_tax result must be the same regardless of prior id walk
+    assert sorted(edges_tax_after_id, key=_edge_key) == sorted(
+        edges_tax_standalone, key=_edge_key
+    ), "walking 'id' first tainted the 'amount_with_tax' result"
+
+    # Sanity: id and amount_with_tax are different columns — edges differ
+    assert edges_id_first != edges_tax_standalone, (
+        "fixture unexpectedly returned the same edges for two distinct columns"
+    )
+
+
+def test_walk_tolerates_redshift_dateadd_syntax(tmp_path: Path) -> None:
+    """Walker must not crash and must produce upstream/downstream edges when
+    a model's WHERE clause uses Redshift-specific DATEADD(day, -30, …).
+
+    The strict qualify pass raised UnexpectedTokenError on 'day' as an
+    unresolved column reference; the relaxed qualify (validate_qualify_columns
+    =False, identify=False) accepts it, allowing lineage extraction to succeed.
+    """
+    import json
+
+    project = tmp_path / "redshift_demo"
+    (project / "target").mkdir(parents=True)
+
+    stg_sql = "SELECT id, customer_id, amount FROM raw.orders"
+    # DATEADD(day, …) is Redshift dialect-specific and would crash strict qualify
+    fct_sql = """\
+SELECT
+  id,
+  customer_id,
+  amount
+FROM analytics.stg_orders
+WHERE created_at > DATEADD(day, -30, CURRENT_DATE)
+"""
+    manifest_dict = {
+        "metadata": {"adapter_type": "redshift"},
+        "nodes": {
+            "model.demo.stg_orders": {
+                "unique_id": "model.demo.stg_orders",
+                "name": "stg_orders",
+                "package_name": "demo",
+                "resource_type": "model",
+                "compiled_code": stg_sql,
+                "compiled_path": None,
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.fct_orders": {
+                "unique_id": "model.demo.fct_orders",
+                "name": "fct_orders",
+                "package_name": "demo",
+                "resource_type": "model",
+                "compiled_code": fct_sql,
+                "compiled_path": None,
+                "depends_on": {"nodes": ["model.demo.stg_orders"]},
+            },
+        },
+        "child_map": {
+            "model.demo.stg_orders": ["model.demo.fct_orders"],
+            "model.demo.fct_orders": [],
+        },
+        "parent_map": {
+            "model.demo.stg_orders": [],
+            "model.demo.fct_orders": ["model.demo.stg_orders"],
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8"
+    )
+
+    manifest = DbtManifest.from_project(project)
+    schema = manifest.build_sqlglot_schema() or None
+
+    # Must not raise; must produce at least the downstream edge
+    # stg_orders.id → fct_orders.id
+    edges, notice = walk_full_lineage(
+        manifest=manifest,
+        seed_uid=manifest.resolve_unique_id("stg_orders"),
+        seed_column="id",
+        dialect="redshift",
+        schema=schema,
+    )
+
+    assert notice is None, f"unexpected notice: {notice}"
+    assert any(
+        e["source_unique_id"] == "model.demo.stg_orders"
+        and e["source_column"] == "id"
+        and e["target_unique_id"] == "model.demo.fct_orders"
+        and e["target_column"] == "id"
+        for e in edges
+    ), f"expected downstream edge not found; got: {edges}"
