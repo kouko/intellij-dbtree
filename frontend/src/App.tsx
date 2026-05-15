@@ -638,6 +638,10 @@ function App() {
           id: ghostId(m.unique_id, "upstream"),
           type: "dbtGhost" as const,
           position: { x: 0, y: 0 },
+          // zIndex: -1 puts ghost cards behind real cards so a ghost
+          // landing near a real card never visually competes for the
+          // foreground. xyflow defaults real nodes to 0.
+          zIndex: -1,
           data: {
             count: up,
             side: "upstream",
@@ -652,6 +656,7 @@ function App() {
           id: ghostId(m.unique_id, "downstream"),
           type: "dbtGhost" as const,
           position: { x: 0, y: 0 },
+          zIndex: -1,
           data: {
             count: down,
             side: "downstream",
@@ -942,6 +947,10 @@ function App() {
         target: e.target_unique_id,
         type: "curved",
         data: haloData,
+        // zIndex: -1 keeps ghost edges under real model + column
+        // edges so they never visually obscure live trace lines, even
+        // when an on-trace ghost edge crosses a busy area of the DAG.
+        zIndex: -1,
         style: {
           stroke: onTrace ? theme.edgeHighlight : theme.edge,
           strokeWidth: onTrace ? 2 : 1.5,
