@@ -19,6 +19,7 @@ import com.intellij.ui.jcef.JBCefBrowserBuilder
 import com.intellij.ui.jcef.JBCefJSQuery
 import dev.kouko.intellijdbtree.jcef.CefLocalRequestHandler
 import dev.kouko.intellijdbtree.jcef.CefStreamResourceHandler
+import dev.kouko.intellijdbtree.lineage.ColumnEdgesDelta
 import dev.kouko.intellijdbtree.lineage.ColumnSpec
 import dev.kouko.intellijdbtree.lineage.LineageInfoListener
 import dev.kouko.intellijdbtree.lineage.LineageInfoService
@@ -177,6 +178,10 @@ class LineagePanel(private val project: Project) : Disposable {
                 override fun modelColumnsUpdated(uniqueId: String, columns: List<ColumnSpec>) {
                     if (pageReady.get()) pushModelColumns(uniqueId, columns)
                 }
+
+                override fun columnEdgesAppended(delta: ColumnEdgesDelta) {
+                    if (pageReady.get()) pushColumnEdgesDelta(delta)
+                }
             },
         )
     }
@@ -231,6 +236,16 @@ class LineagePanel(private val project: Project) : Disposable {
         )
         val script = "window.applyModelColumns && window.applyModelColumns(" +
             "${jsStringLiteral(uniqueId)}, JSON.parse(${jsStringLiteral(json)}));"
+        SwingUtilities.invokeLater {
+            browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
+        }
+    }
+
+    private fun pushColumnEdgesDelta(delta: ColumnEdgesDelta) {
+        val browser = this.browser ?: return
+        val json = LineageJson.encodeToString(ColumnEdgesDelta.serializer(), delta)
+        val script = "window.applyColumnEdgesDelta && window.applyColumnEdgesDelta(" +
+            "JSON.parse(${jsStringLiteral(json)}));"
         SwingUtilities.invokeLater {
             browser.cefBrowser.executeJavaScript(script, browser.cefBrowser.url, 0)
         }

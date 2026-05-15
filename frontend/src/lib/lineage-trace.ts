@@ -75,6 +75,23 @@ export function buildColumnLineageTrace(
   };
   if (!selectedColumn) return trace;
 
+  // O(V+E) BFS instead of O(V×E): bucket column edges by endpoint once
+  // up-front, then look up neighbours from the bucket inside the BFS
+  // loop. The earlier nested `for (const ce of columnEdges)` scan was
+  // re-invoked on every streaming column-trace publish, snowballing into
+  // a frozen JCEF panel on large dbt projects.
+  const colKey = (uid: string, col: string) => `${uid}|${col}`;
+  const upstreamByTarget = new Map<string, ColumnEdge[]>();
+  const downstreamBySource = new Map<string, ColumnEdge[]>();
+  for (const ce of columnEdges) {
+    const tgt = colKey(ce.target_unique_id, ce.target_column);
+    const src = colKey(ce.source_unique_id, ce.source_column);
+    const inbound = upstreamByTarget.get(tgt);
+    if (inbound) inbound.push(ce); else upstreamByTarget.set(tgt, [ce]);
+    const outbound = downstreamBySource.get(src);
+    if (outbound) outbound.push(ce); else downstreamBySource.set(src, [ce]);
+  }
+
   const noteVisit = (uniqueId: string, column: string) => {
     let cols = trace.columns.get(uniqueId);
     if (!cols) {
@@ -86,57 +103,35 @@ export function buildColumnLineageTrace(
   };
   noteVisit(selectedColumn.unique_id, selectedColumn.column);
 
-  // Upstream walk: edges where target == cur, jump to source.
-  {
+  // Index-based queues keep dequeue O(1). `queue.shift()` is O(n) and
+  // becomes a second-order bottleneck on long traces.
+  const walk = (
+    direction: "upstream" | "downstream",
+  ) => {
     const queue: SelectedColumn[] = [selectedColumn];
-    const seen = new Set<string>([
-      `${selectedColumn.unique_id}|${selectedColumn.column}`,
-    ]);
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      for (const ce of columnEdges) {
-        if (ce.target_unique_id === cur.unique_id && ce.target_column === cur.column) {
-          trace.edges.add(edgeKey(ce));
-          const next: SelectedColumn = {
-            unique_id: ce.source_unique_id,
-            column: ce.source_column,
-          };
-          const key = `${next.unique_id}|${next.column}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            noteVisit(next.unique_id, next.column);
-            queue.push(next);
-          }
+    let head = 0;
+    const seen = new Set<string>([colKey(selectedColumn.unique_id, selectedColumn.column)]);
+    const adj = direction === "upstream" ? upstreamByTarget : downstreamBySource;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const edgesHere = adj.get(colKey(cur.unique_id, cur.column));
+      if (!edgesHere) continue;
+      for (const ce of edgesHere) {
+        trace.edges.add(edgeKey(ce));
+        const next: SelectedColumn = direction === "upstream"
+          ? { unique_id: ce.source_unique_id, column: ce.source_column }
+          : { unique_id: ce.target_unique_id, column: ce.target_column };
+        const key = colKey(next.unique_id, next.column);
+        if (!seen.has(key)) {
+          seen.add(key);
+          noteVisit(next.unique_id, next.column);
+          queue.push(next);
         }
       }
     }
-  }
-
-  // Downstream walk: edges where source == cur, jump to target.
-  {
-    const queue: SelectedColumn[] = [selectedColumn];
-    const seen = new Set<string>([
-      `${selectedColumn.unique_id}|${selectedColumn.column}`,
-    ]);
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      for (const ce of columnEdges) {
-        if (ce.source_unique_id === cur.unique_id && ce.source_column === cur.column) {
-          trace.edges.add(edgeKey(ce));
-          const next: SelectedColumn = {
-            unique_id: ce.target_unique_id,
-            column: ce.target_column,
-          };
-          const key = `${next.unique_id}|${next.column}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            noteVisit(next.unique_id, next.column);
-            queue.push(next);
-          }
-        }
-      }
-    }
-  }
+  };
+  walk("upstream");
+  walk("downstream");
 
   // Source-augmentation pass: dbt sources frequently lack column docs,
   // so sqlglot's lineage walker drops their `SELECT *` references as
@@ -180,20 +175,31 @@ export function buildModelTrace(
     return { ancestors, descendants, all: new Set() };
   }
 
+  // Bucket once, walk in O(V+E). See buildColumnLineageTrace for the
+  // rationale; same hot path was making column traces snowball.
+  const parentsOf = new Map<string, string[]>();
+  const childrenOf = new Map<string, string[]>();
+  for (const me of modelEdges) {
+    const ps = parentsOf.get(me.target_unique_id);
+    if (ps) ps.push(me.source_unique_id);
+    else parentsOf.set(me.target_unique_id, [me.source_unique_id]);
+    const cs = childrenOf.get(me.source_unique_id);
+    if (cs) cs.push(me.target_unique_id);
+    else childrenOf.set(me.source_unique_id, [me.target_unique_id]);
+  }
+
   // Upstream
   {
     const queue: string[] = [selectedModelUid];
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      for (const me of modelEdges) {
-        if (
-          me.target_unique_id === cur &&
-          me.source_unique_id !== selectedModelUid &&
-          !ancestors.has(me.source_unique_id)
-        ) {
-          ancestors.add(me.source_unique_id);
-          queue.push(me.source_unique_id);
-        }
+    let head = 0;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const parents = parentsOf.get(cur);
+      if (!parents) continue;
+      for (const parent of parents) {
+        if (parent === selectedModelUid || ancestors.has(parent)) continue;
+        ancestors.add(parent);
+        queue.push(parent);
       }
     }
   }
@@ -201,17 +207,15 @@ export function buildModelTrace(
   // Downstream
   {
     const queue: string[] = [selectedModelUid];
-    while (queue.length > 0) {
-      const cur = queue.shift()!;
-      for (const me of modelEdges) {
-        if (
-          me.source_unique_id === cur &&
-          me.target_unique_id !== selectedModelUid &&
-          !descendants.has(me.target_unique_id)
-        ) {
-          descendants.add(me.target_unique_id);
-          queue.push(me.target_unique_id);
-        }
+    let head = 0;
+    while (head < queue.length) {
+      const cur = queue[head++];
+      const children = childrenOf.get(cur);
+      if (!children) continue;
+      for (const child of children) {
+        if (child === selectedModelUid || descendants.has(child)) continue;
+        descendants.add(child);
+        queue.push(child);
       }
     }
   }
