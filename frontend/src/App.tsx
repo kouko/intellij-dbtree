@@ -16,6 +16,11 @@ import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnSpec, LineagePayload } from "./types";
 import { CurvedBezierEdge } from "./components/CurvedBezierEdge";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
+import {
+  HIDDEN_GHOST_HEIGHT,
+  HiddenNeighboursGhost,
+  type HiddenNeighboursGhostData,
+} from "./components/HiddenNeighboursGhost";
 import { HopStepper, isUnlimited } from "./components/HopStepper";
 import { layoutModelGraph } from "./lib/layout";
 import {
@@ -27,7 +32,12 @@ import {
 } from "./lib/lineage-trace";
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
-const NODE_TYPES: NodeTypes = { dbtModel: DbtModelNode };
+const NODE_TYPES: NodeTypes = {
+  dbtModel: DbtModelNode,
+  dbtGhost: HiddenNeighboursGhost,
+};
+const ghostId = (uid: string, side: "upstream" | "downstream") =>
+  `__hidden__${uid}__${side}`;
 const EDGE_TYPES: EdgeTypes = { curved: CurvedBezierEdge };
 const NODE_WIDTH = 320;
 // Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
@@ -525,8 +535,6 @@ function App() {
           lineageTrace.columns.get(m.unique_id) ?? EMPTY_HIGHLIGHTED_COLUMNS,
         onLineagePath: onLineagePath(m.unique_id),
         isSelectedModel: m.unique_id === selectedModelUid,
-        hiddenUpstreamCount: m.hidden_upstream ?? 0,
-        hiddenDownstreamCount: m.hidden_downstream ?? 0,
         theme,
         cardWidth: NODE_WIDTH,
         onToggleExpanded: toggleExpanded,
@@ -547,6 +555,56 @@ function App() {
     onColumnClick,
     onOpenFile,
   ]);
+
+  // Synthetic placeholder cards for "+N hidden upstream / downstream
+  // models" — every visible model with a non-zero hidden_upstream
+  // (or _downstream) gets a small dashed ghost card placed on the
+  // matching side, connected by a dashed model edge. Lets the user
+  // tell "no lineage in this direction" apart from "lineage exists
+  // but is hidden by hops" without clicking anything.
+  const ghostNodes: Array<Node<HiddenNeighboursGhostData, "dbtGhost">> = useMemo(() => {
+    const ghosts: Array<Node<HiddenNeighboursGhostData, "dbtGhost">> = [];
+    for (const m of payload.models) {
+      const up = m.hidden_upstream ?? 0;
+      const down = m.hidden_downstream ?? 0;
+      if (up > 0) {
+        ghosts.push({
+          id: ghostId(m.unique_id, "upstream"),
+          type: "dbtGhost" as const,
+          position: { x: 0, y: 0 },
+          data: { count: up, side: "upstream", theme, cardWidth: NODE_WIDTH },
+        });
+      }
+      if (down > 0) {
+        ghosts.push({
+          id: ghostId(m.unique_id, "downstream"),
+          type: "dbtGhost" as const,
+          position: { x: 0, y: 0 },
+          data: { count: down, side: "downstream", theme, cardWidth: NODE_WIDTH },
+        });
+      }
+    }
+    return ghosts;
+  }, [payload.models, theme]);
+
+  const ghostEdgesForLayout = useMemo(() => {
+    const out: Array<{ source_unique_id: string; target_unique_id: string }> = [];
+    for (const m of payload.models) {
+      if ((m.hidden_upstream ?? 0) > 0) {
+        out.push({
+          source_unique_id: ghostId(m.unique_id, "upstream"),
+          target_unique_id: m.unique_id,
+        });
+      }
+      if ((m.hidden_downstream ?? 0) > 0) {
+        out.push({
+          source_unique_id: m.unique_id,
+          target_unique_id: ghostId(m.unique_id, "downstream"),
+        });
+      }
+    }
+    return out;
+  }, [payload.models]);
 
   const heights: Record<string, number> = useMemo(() => {
     const h: Record<string, number> = {};
@@ -573,8 +631,11 @@ function App() {
       }
       h[m.unique_id] = headerH + colsH;
     }
+    for (const g of ghostNodes) {
+      h[g.id] = HIDDEN_GHOST_HEIGHT;
+    }
     return h;
-  }, [payload, expanded]);
+  }, [payload, expanded, ghostNodes]);
 
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
 
@@ -591,13 +652,18 @@ function App() {
       payload.model_edges
         .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
         .sort()
+        .join("|") +
+      ";" +
+      ghostEdgesForLayout
+        .map((e) => `${e.source_unique_id}->${e.target_unique_id}`)
+        .sort()
         .join("|");
     const heightVals = Object.keys(heights)
       .sort()
       .map((k) => `${k}=${heights[k]}`)
       .join(",");
     return `${topo}/${heightVals}`;
-  }, [payload.models, payload.model_edges, heights]);
+  }, [payload.models, payload.model_edges, ghostEdgesForLayout, heights]);
 
   useEffect(() => {
     let cancelled = false;
@@ -605,12 +671,27 @@ function App() {
     // Build a minimal Node[] for layout — node `data` (highlight, selection,
     // expansion) is irrelevant to positioning. Re-running layout when only
     // display state changes would shift coordinates on every column click.
-    const layoutNodes: Node[] = payload.models.map((m) => ({
-      id: m.unique_id,
-      position: { x: 0, y: 0 },
-      data: {},
-    }));
-    layoutModelGraph(layoutNodes, modelLevelEdges(payload), {
+    const layoutNodes: Node[] = [
+      ...payload.models.map((m) => ({
+        id: m.unique_id,
+        position: { x: 0, y: 0 },
+        data: {},
+      })),
+      ...ghostNodes.map((g) => ({
+        id: g.id,
+        position: { x: 0, y: 0 },
+        data: {},
+      })),
+    ];
+    const layoutEdges: Edge[] = [
+      ...modelLevelEdges(payload),
+      ...ghostEdgesForLayout.map((e) => ({
+        id: `m:${e.source_unique_id}->${e.target_unique_id}`,
+        source: e.source_unique_id,
+        target: e.target_unique_id,
+      })),
+    ];
+    layoutModelGraph(layoutNodes, layoutEdges, {
       rankdir: "LR",
       nodeWidth: NODE_WIDTH,
       nodeSpacing: 60,
@@ -631,7 +712,11 @@ function App() {
   }, [layoutInputKey]);
 
   const derivedNodes: Node[] = useMemo(() => {
-    return rawNodes.map((n) => {
+    const all: Array<Node<DbtModelNodeData, "dbtModel"> | Node<HiddenNeighboursGhostData, "dbtGhost">> = [
+      ...rawNodes,
+      ...ghostNodes,
+    ];
+    return all.map((n) => {
       const manual = manualPositions[n.id];
       const auto = positions[n.id];
       // If a node has no position yet (fresh from a hop change, ELK still
@@ -651,7 +736,7 @@ function App() {
         height: heights[n.id] ?? 60,
       };
     });
-  }, [rawNodes, positions, manualPositions, heights]);
+  }, [rawNodes, ghostNodes, positions, manualPositions, heights]);
 
   // What ReactFlow actually renders: derivedNodes overlaid with any
   // in-flight drag positions. No separate state — derivedNodes is the
@@ -757,7 +842,25 @@ function App() {
           }))
       : [];
 
-    return [...modelEdges, ...columnEdges];
+    // Dashed, low-opacity edge from each ghost placeholder to its real
+    // model. Reuses the curved edge type so it follows the same
+    // bezier shape as model edges and behaves consistently when cards
+    // get dragged.
+    const ghostEdgeList: Edge[] = ghostEdgesForLayout.map((e) => ({
+      id: `gh:${e.source_unique_id}->${e.target_unique_id}`,
+      source: e.source_unique_id,
+      target: e.target_unique_id,
+      type: "curved",
+      data: haloData,
+      style: {
+        stroke: theme.edge,
+        strokeWidth: 1.5,
+        strokeDasharray: "4 4",
+        opacity: 0.5,
+      },
+    }));
+
+    return [...modelEdges, ...ghostEdgeList, ...columnEdges];
   }, [
     payload,
     lineageTrace,
@@ -765,6 +868,7 @@ function App() {
     columnTraceEdgePairs,
     selectedColumn,
     selectedModelUid,
+    ghostEdgesForLayout,
     theme,
   ]);
 

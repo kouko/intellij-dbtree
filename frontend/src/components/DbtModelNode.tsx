@@ -26,15 +26,6 @@ export interface DbtModelNodeData extends Record<string, unknown> {
   highlightedColumns: Set<string>;
   onLineagePath: boolean;
   isSelectedModel: boolean;
-  /**
-   * Counts of upstream / downstream neighbours in the FULL dbt graph
-   * that fall outside this payload (their uids weren't included by
-   * the seed's hop budget). Rendered as small "+N" chips next to the
-   * left / right handle. Always meaningful — driven by manifest
-   * structure, not by a column-trace selection.
-   */
-  hiddenUpstreamCount: number;
-  hiddenDownstreamCount: number;
   theme: Theme;
   cardWidth: number;
   onToggleExpanded: (uniqueId: string) => void;
@@ -116,9 +107,6 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
   }
 
   const cardStyle: React.CSSProperties = {
-    // Anchors the absolute-positioned hidden-neighbour chips that
-    // stick out past the left/right card edges next to the handles.
-    position: "relative",
     borderRadius: 10,
     border: `2px solid ${data.isSelectedModel ? t.selectedBorder : colors.border}`,
     background: cardBackground,
@@ -170,21 +158,6 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
           border: `2px solid ${t.toolbarBg}`,
         }}
       />
-
-      {data.hiddenUpstreamCount > 0 && (
-        <HiddenNeighbourChip
-          theme={t}
-          side="left"
-          count={data.hiddenUpstreamCount}
-        />
-      )}
-      {data.hiddenDownstreamCount > 0 && (
-        <HiddenNeighbourChip
-          theme={t}
-          side="right"
-          count={data.hiddenDownstreamCount}
-        />
-      )}
 
       <header
         style={{
@@ -377,59 +350,6 @@ export function materializationLetter(value: string | undefined): string | null 
     default:
       return null;
   }
-}
-
-/**
- * "+N" chip rendered just outside the left or right card edge, telling
- * the user there are N more upstream / downstream models in the full
- * dbt graph that fell outside this payload's hop sphere. Always shown
- * (independent of column selection) so the user can tell "no lineage
- * in this direction" apart from "lineage exists but is hidden by
- * hops" at any time. Pure indicator — no click action.
- */
-function HiddenNeighbourChip({
-  theme,
-  side,
-  count,
-}: {
-  theme: Theme;
-  side: "left" | "right";
-  count: number;
-}) {
-  return (
-    <div
-      title={
-        side === "left"
-          ? `${count} more upstream model${count === 1 ? "" : "s"} exist in the dbt graph but are outside the current up_hops range`
-          : `${count} more downstream model${count === 1 ? "" : "s"} exist in the dbt graph but are outside the current down_hops range`
-      }
-      onClick={(e) => e.stopPropagation()}
-      style={{
-        position: "absolute",
-        top: "50%",
-        [side]: -32,
-        transform: "translateY(-50%)",
-        minWidth: 22,
-        height: 18,
-        padding: "0 5px",
-        borderRadius: 9,
-        background: theme.edgeHighlight,
-        color: theme.toolbarBg,
-        fontSize: 10,
-        fontWeight: 700,
-        fontFamily: "ui-monospace, SFMono-Regular, monospace",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
-        cursor: "help",
-        userSelect: "none",
-        whiteSpace: "nowrap",
-      }}
-    >
-      +{count}
-    </div>
-  );
 }
 
 function MaterializationBadge({
