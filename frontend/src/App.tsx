@@ -30,6 +30,7 @@ import {
   edgeKey,
   isEdgeOnModelTreePath,
 } from "./lib/lineage-trace";
+import { applyColumnEdgesDelta, type ColumnEdgesDelta } from "./lib/payload-reducer";
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = {
@@ -98,6 +99,15 @@ declare global {
      * sqlglot sidecar — avoids re-pushing the whole DAG.
      */
     applyModelColumns?: (uniqueId: string, columns: ColumnSpec[]) => void;
+    /**
+     * Streaming column-edges patch: append new edges, optionally flip the
+     * column_lineage_done flag, optionally surface a warning. Used by
+     * the Kotlin sidecar's stream-publish path so the JCEF bridge no
+     * longer JSON-parses a full payload every 500ms while a column
+     * trace is streaming — the cause of the dbtree-panel freeze on
+     * iCHEF-sized projects.
+     */
+    applyColumnEdgesDelta?: (delta: ColumnEdgesDelta) => void;
     kotlinCallback?: (payload: string) => void;
     __DBTREE_THEME__?: ThemeName;
     __DBTREE_HOST_STATE__?: HostState;
@@ -221,10 +231,14 @@ function App() {
         return next;
       });
     };
+    window.applyColumnEdgesDelta = (delta) => {
+      setPayload((prev) => applyColumnEdgesDelta(prev, delta));
+    };
     return () => {
       delete window.setLineageInfo;
       delete window.setSelectedModel;
       delete window.applyModelColumns;
+      delete window.applyColumnEdgesDelta;
     };
   }, []);
 

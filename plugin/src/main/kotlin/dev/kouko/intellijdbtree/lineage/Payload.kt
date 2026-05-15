@@ -82,6 +82,28 @@ data class Selected(
     val column: String? = null,
 )
 
+/**
+ * Streaming column-edges patch. Companion to
+ * [LineageInfoListener.columnEdgesAppended]: instead of re-sending the
+ * whole [LineagePayload] every 500ms during a column-lineage trace
+ * (which made JCEF JSON-parse a multi-MB script source on each flush
+ * and snowballed React's memo cascade), the producer sends only the
+ * newly-discovered edges plus the terminal flags. The React-side
+ * reducer in `payload-reducer.ts` folds these onto the existing
+ * payload while keeping topology fields by reference.
+ */
+@Serializable
+data class ColumnEdgesDelta(
+    @SerialName("append_edges") val appendEdges: List<ColumnEdge>,
+    @SerialName("column_lineage_done") val columnLineageDone: Boolean,
+    /**
+     * `null` clears any prior warning (clean completion); non-null
+     * replaces it. Mirrors the explicit-null contract documented on
+     * the TS side.
+     */
+    val warning: String? = null,
+)
+
 @Serializable
 data class LineagePayload(
     val models: List<DbtModel> = emptyList(),

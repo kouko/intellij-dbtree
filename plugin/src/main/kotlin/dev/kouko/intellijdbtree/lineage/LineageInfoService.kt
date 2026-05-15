@@ -33,6 +33,18 @@ interface LineageInfoListener {
      * surgically patch the payload's model entry without re-layout.
      */
     fun modelColumnsUpdated(uniqueId: String, columns: List<ColumnSpec>) {}
+
+    /**
+     * Streaming column-edges patch — sent during a column-lineage
+     * trace every [LineageInfoService.STREAM_PUBLISH_INTERVAL_MS] ms
+     * (intermediate, done=false) and once at the end (done=true,
+     * optional warning). Subscribers should fold this onto the active
+     * payload's `column_edges` without re-laying out — topology
+     * doesn't change between the trace-start publish (a regular
+     * [lineagePayloadChanged] with empty column_edges) and these
+     * delta events.
+     */
+    fun columnEdgesAppended(delta: ColumnEdgesDelta) {}
 }
 
 /**
@@ -285,9 +297,18 @@ class LineageInfoService(private val project: Project) {
                 ),
             )
 
-            // Step 2: stream edges, debounced republish.
+            // Step 2: stream edges, debounced republish. Each flush
+            // pushes ONLY the edges discovered since the previous flush
+            // (not the whole accumulated list), and only via the
+            // delta-event channel — topology and `selected` were already
+            // established by Step 1. This is the load-bearing change that
+            // unfreezes the dbtree panel on iCHEF-sized projects: a 30s
+            // trace used to ship ~60 multi-MB full payloads through
+            // JCEF's `executeJavaScript` literal-source path; now it
+            // ships ~60 small edge-only payloads.
             val edges = mutableListOf<ColumnEdge>()
             var lastFlushNanos = System.nanoTime()
+            var lastFlushedCount = 0
             val flushIntervalNanos = TimeUnit.MILLISECONDS.toNanos(STREAM_PUBLISH_INTERVAL_MS)
             val flushLock = Any()
 
@@ -302,39 +323,44 @@ class LineageInfoService(private val project: Project) {
                         if (now - lastFlushNanos >= flushIntervalNanos) {
                             lastFlushNanos = now
                             if (!project.isDisposed && !isSuperseded(myEpoch, state.get())) {
-                                publisher.lineagePayloadChanged(
-                                    basePayload.copy(
-                                        columnEdges = edges.toList(),
-                                        selected = selected,
-                                        columnLineageDone = false,
-                                    ),
-                                )
+                                val newEdges = edges.subList(lastFlushedCount, edges.size).toList()
+                                lastFlushedCount = edges.size
+                                if (newEdges.isNotEmpty()) {
+                                    publisher.columnEdgesAppended(
+                                        ColumnEdgesDelta(
+                                            appendEdges = newEdges,
+                                            columnLineageDone = false,
+                                            warning = null,
+                                        ),
+                                    )
+                                }
                             }
                         }
                     }
                 },
             )
 
-            // Step 3: final publish (edges complete + done=true + warning).
+            // Step 3: final publish (any leftover edges + done=true +
+            // optional warning). Same delta channel as Step 2.
             if (project.isDisposed) return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
 
-            val (finalEdges, warning) = synchronized(flushLock) {
-                val snapshot = edges.toList()
+            val (tailEdges, warning) = synchronized(flushLock) {
+                val tail = edges.subList(lastFlushedCount, edges.size).toList()
+                lastFlushedCount = edges.size
                 val w = when (outcome) {
                     is ColumnLineageService.StreamOutcome.Ok ->
-                        outcome.notice?.takeIf { it.isNotBlank() && snapshot.isEmpty() }
+                        outcome.notice?.takeIf { it.isNotBlank() && edges.isEmpty() }
                     is ColumnLineageService.StreamOutcome.Failed -> outcome.warning
                 }
-                snapshot to w
+                tail to w
             }
 
-            publisher.lineagePayloadChanged(
-                basePayload.copy(
-                    columnEdges = finalEdges,
-                    selected = selected,
-                    warning = warning,
+            publisher.columnEdgesAppended(
+                ColumnEdgesDelta(
+                    appendEdges = tailEdges,
                     columnLineageDone = true,
+                    warning = warning,
                 ),
             )
         }
