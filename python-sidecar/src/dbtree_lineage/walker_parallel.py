@@ -81,7 +81,19 @@ def _qualified_cached(
     coverage on models qualify can't handle.
     """
     parsed = sqlglot.parse_one(sql, dialect=dialect)
-    qualified = sqlglot_qualify(parsed, schema=_W_SCHEMA, dialect=dialect)
+    # Match sqlglot.lineage's own qualify flags: validate=False so we
+    # don't blow up on the unresolved-column edge cases lineage tolerates
+    # at runtime, identify=False so we don't pay the quoting normalization
+    # cost (cosmetic, irrelevant to lineage output). Without these flags
+    # we were falling back to the slow path on most real dbt SQL and
+    # losing the qualify-cache win entirely.
+    qualified = sqlglot_qualify(
+        parsed,
+        schema=_W_SCHEMA,
+        dialect=dialect,
+        validate_qualify_columns=False,
+        identify=False,
+    )
     scope = build_scope(qualified)
     return qualified, scope
 
