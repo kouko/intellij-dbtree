@@ -8,9 +8,14 @@ brittle. We assert structural properties instead.
 
 from __future__ import annotations
 
+import sqlglot
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import build_scope
+
 from dbtree_lineage.lineage import (
     LineageNode,
     collect_source_columns,
+    extract_all_column_lineage,
     extract_column_lineage,
 )
 
@@ -135,3 +140,119 @@ def test_serializable() -> None:
     parsed = json.loads(payload)
     assert parsed["name"] == "sum"
     assert parsed["source_type"] == "select"
+
+
+# ---------------------------------------------------------------------------
+# New behaviour 1: extract_column_lineage with pre-built scope
+# ---------------------------------------------------------------------------
+
+_SCOPE_SQL = """\
+WITH base AS (
+  SELECT id, amount, customer_id
+  FROM raw.orders
+)
+SELECT id, amount * 1.05 AS amount_with_tax, customer_id
+FROM base
+"""
+
+
+def _build_scope(sql: str, dialect: str | None = None):
+    """Helper: parse + qualify + build_scope for a SQL string."""
+    parsed = sqlglot.parse_one(sql, dialect=dialect)
+    qualified = qualify(
+        parsed,
+        dialect=dialect,
+        validate_qualify_columns=False,
+        identify=False,
+    )
+    return qualified, build_scope(qualified)
+
+
+def test_extract_column_lineage_scope_param_produces_same_result() -> None:
+    """Passing a pre-built scope yields the same LineageNode tree as the
+    unscoped (raw-string) path."""
+    sql = _SCOPE_SQL
+    qualified, scope = _build_scope(sql, dialect="postgres")
+
+    for col in ("id", "amount_with_tax", "customer_id"):
+        node_raw = extract_column_lineage(col, sql, dialect="postgres")
+        node_scoped = extract_column_lineage(
+            col, qualified, dialect="postgres", scope=scope
+        )
+        assert node_raw.to_dict() == node_scoped.to_dict(), (
+            f"scope vs no-scope mismatch for column {col!r}"
+        )
+
+
+def test_extract_column_lineage_shared_scope_is_safe_across_calls() -> None:
+    """Re-using the same scope object across multiple column calls must not
+    mutate the scope — the result for column A after calling for B must equal
+    the result for A from the first call."""
+    sql = _SCOPE_SQL
+    qualified, scope = _build_scope(sql, dialect="postgres")
+
+    first_id = extract_column_lineage("id", qualified, dialect="postgres", scope=scope)
+    # interleave with a different column
+    _customer = extract_column_lineage(
+        "customer_id", qualified, dialect="postgres", scope=scope
+    )
+    second_id = extract_column_lineage("id", qualified, dialect="postgres", scope=scope)
+
+    assert first_id.to_dict() == second_id.to_dict(), (
+        "scope was mutated between calls — third call result differs from first"
+    )
+
+
+# ---------------------------------------------------------------------------
+# New behaviour 2: extract_all_column_lineage
+# ---------------------------------------------------------------------------
+
+_MULTI_COL_SQL = """\
+SELECT
+  order_id,
+  customer_id,
+  amount * 1.1 AS amount_with_markup,
+  created_at
+FROM raw.orders
+"""
+
+
+def test_extract_all_column_lineage_returns_one_entry_per_output_column() -> None:
+    """Bulk lineage dict must have exactly the top-level output column names."""
+    expected_cols = {"order_id", "customer_id", "amount_with_markup", "created_at"}
+
+    result = extract_all_column_lineage(_MULTI_COL_SQL, dialect="postgres")
+
+    assert set(result.keys()) == expected_cols
+    assert len(result) == len(expected_cols), "no duplicate keys expected"
+
+
+def test_extract_all_column_lineage_entries_match_per_column_results() -> None:
+    """Each bulk[col] tree must be structurally equivalent to a dedicated
+    extract_column_lineage(col, …) call on the same SQL."""
+    sql = _MULTI_COL_SQL
+
+    bulk = extract_all_column_lineage(sql, dialect="postgres")
+    for col, bulk_node in bulk.items():
+        per_col_node = extract_column_lineage(col, sql, dialect="postgres")
+        assert bulk_node.to_dict() == per_col_node.to_dict(), (
+            f"bulk vs per-column mismatch for column {col!r}"
+        )
+
+
+def test_extract_all_column_lineage_with_scope_matches_without_scope() -> None:
+    """Passing a pre-built scope to extract_all_column_lineage produces the
+    same result as the unscoped path."""
+    sql = _MULTI_COL_SQL
+    qualified, scope = _build_scope(sql, dialect="postgres")
+
+    bulk_raw = extract_all_column_lineage(sql, dialect="postgres")
+    bulk_scoped = extract_all_column_lineage(
+        qualified, dialect="postgres", scope=scope
+    )
+
+    assert set(bulk_raw.keys()) == set(bulk_scoped.keys())
+    for col in bulk_raw:
+        assert bulk_raw[col].to_dict() == bulk_scoped[col].to_dict(), (
+            f"scope vs no-scope mismatch for column {col!r}"
+        )

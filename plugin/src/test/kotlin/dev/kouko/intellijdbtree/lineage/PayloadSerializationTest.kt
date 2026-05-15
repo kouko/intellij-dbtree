@@ -170,6 +170,67 @@ class PayloadSerializationTest {
     }
 
     @Test
+    fun `DbtModel hidden_upstream and hidden_downstream serialize as snake_case`() {
+        // Frontend reads `hidden_upstream` / `hidden_downstream` to render
+        // the "+N" handle chip — camelCase here would silently disable the
+        // chip on the React side without any compile-time signal.
+        val model = DbtModel(
+            uniqueId = "model.demo.orders",
+            name = "orders",
+            packageName = "demo",
+            hiddenUpstream = 3,
+            hiddenDownstream = 5,
+        )
+        val raw = json.encodeToString(DbtModel.serializer(), model)
+        val tree = json.parseToJsonElement(raw).jsonObject
+
+        assertEquals(3, tree["hidden_upstream"]!!.jsonPrimitive.content.toInt())
+        assertEquals(5, tree["hidden_downstream"]!!.jsonPrimitive.content.toInt())
+        assertFalse("hiddenUpstream" in tree, "camelCase form must not appear")
+        assertFalse("hiddenDownstream" in tree, "camelCase form must not appear")
+        // Sanity: also assert the literal substring the wire format must contain.
+        assertTrue(
+            raw.contains("\"hidden_upstream\":3") && raw.contains("\"hidden_downstream\":5"),
+            "expected snake_case integer fields in encoded JSON: $raw",
+        )
+    }
+
+    @Test
+    fun `DbtModel hidden counts round-trip through encode and decode`() {
+        val original = DbtModel(
+            uniqueId = "model.demo.orders",
+            name = "orders",
+            packageName = "demo",
+            hiddenUpstream = 7,
+            hiddenDownstream = 11,
+        )
+        val decoded = json.decodeFromString(
+            DbtModel.serializer(),
+            json.encodeToString(DbtModel.serializer(), original),
+        )
+        assertEquals(7, decoded.hiddenUpstream)
+        assertEquals(11, decoded.hiddenDownstream)
+        assertEquals(original, decoded)
+    }
+
+    @Test
+    fun `DbtModel default hidden counts are emitted as 0 (encodeDefaults=true)`() {
+        // LineageJson uses `encodeDefaults = true`, so even default-valued
+        // Int fields appear in the wire output. The frontend relies on
+        // this — `payload.hidden_upstream ?? 0` would also work, but we
+        // pin the actual emitted shape here so a future config flip to
+        // `encodeDefaults = false` can't silently ship and break the chip.
+        val model = DbtModel(uniqueId = "uid", name = "n", packageName = "demo")
+        val raw = json.encodeToString(DbtModel.serializer(), model)
+        val tree = json.parseToJsonElement(raw).jsonObject
+
+        assertTrue("hidden_upstream" in tree, "default Int still emitted under encodeDefaults=true")
+        assertTrue("hidden_downstream" in tree, "default Int still emitted under encodeDefaults=true")
+        assertEquals(0, tree["hidden_upstream"]!!.jsonPrimitive.content.toInt())
+        assertEquals(0, tree["hidden_downstream"]!!.jsonPrimitive.content.toInt())
+    }
+
+    @Test
     fun `round-trip of a full payload preserves all fields`() {
         val original = LineagePayload(
             models = listOf(
