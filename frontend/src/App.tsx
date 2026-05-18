@@ -16,6 +16,7 @@ import demoFixture from "./fixtures/lineage-demo.json";
 import type { ColumnSpec, LineagePayload } from "./types";
 import { CurvedBezierEdge } from "./components/CurvedBezierEdge";
 import { DbtModelNode, type DbtModelNodeData } from "./components/DbtModelNode";
+import { KeyboardShortcuts } from "./components/KeyboardShortcuts";
 import {
   HIDDEN_GHOST_HEIGHT,
   HiddenNeighboursGhost,
@@ -1113,6 +1114,7 @@ function App() {
               }}
             />
             <Controls position="bottom-right" />
+            <KeyboardShortcuts />
           </ReactFlow>
         )}
       </div>
