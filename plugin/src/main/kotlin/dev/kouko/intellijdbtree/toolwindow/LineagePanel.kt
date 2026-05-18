@@ -241,32 +241,6 @@ class LineagePanel(private val project: Project) : Disposable {
         )
     }
 
-    /**
-     * User-triggered hard reset of the JCEF surface.
-     *
-     * Reloads the bundled URL; `onLoadEnd` will re-inject the bridge,
-     * theme, host state, and republish the last lineage payload from
-     * [pending]. This is the heavy-handed manual fallback when the
-     * automatic nudge in [subscribeToAppActivation] fails to recover
-     * a frozen panel.
-     */
-    fun resetBrowser() {
-        val browser = this.browser ?: return
-        // Dedupe rapid re-entrant clicks: skip when a reload is already in
-        // flight. pageReady is cleared by onLoadStart and by this method, so
-        // a second click within the load window short-circuits.
-        if (!pageReady.compareAndSet(true, false)) return
-        SwingUtilities.invokeLater {
-            mainPanel.revalidate()
-            mainPanel.repaint()
-            browser.cefBrowser.wasResized(
-                mainPanel.width.coerceAtLeast(1),
-                mainPanel.height.coerceAtLeast(1),
-            )
-            browser.loadURL("$BASE_URL/$INDEX_FILE")
-        }
-    }
-
     private fun triggerInitialLineage() {
         ApplicationManager.getApplication().executeOnPooledThread {
             val openFile = ApplicationManager.getApplication().runReadAction<com.intellij.openapi.vfs.VirtualFile?> {
