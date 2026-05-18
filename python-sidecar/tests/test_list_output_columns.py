@@ -90,6 +90,36 @@ class TestStarExpansion:
         assert "name" in cols
         assert "order_id" in cols
 
+    def test_select_star_from_final_cte_expands_without_schema(self) -> None:
+        # Standard dbt convention: a `final` CTE projects the model's
+        # output columns and the top-level statement is `SELECT * FROM final`.
+        # No external schema is needed because the star resolves against
+        # an in-query CTE — qualify must run unconditionally for this to
+        # work (regression for the iCHEF pl_account_metric_mapping bug,
+        # where 15 columns silently collapsed to ['*']).
+        sql = """
+            WITH src AS (SELECT 1 AS id, 'a' AS name),
+                 final AS (SELECT id, name, id * 2 AS doubled FROM src)
+            SELECT * FROM final
+        """
+        cols = list_output_columns(sql)
+        assert cols == ["id", "name", "doubled"]
+
+    def test_select_star_from_cte_with_declared_column_list(self) -> None:
+        # The exact iCHEF pattern: `WITH name (col1, col2, ...) AS (
+        # SELECT lit1, lit2, ... UNION ALL ...)` — column names declared
+        # at the CTE header, inner SELECT uses bare literals. A downstream
+        # `SELECT * FROM name` must still resolve to the declared list.
+        sql = """
+            WITH mapping (account_number, pl_category, metric_l1) AS (
+                          SELECT '410001', 'PL_POS', 'Revenue'
+                UNION ALL SELECT '410002', 'PL_POS', 'Revenue'
+            )
+            SELECT * FROM mapping
+        """
+        cols = list_output_columns(sql)
+        assert cols == ["account_number", "pl_category", "metric_l1"]
+
 
 class TestDialects:
     def test_redshift_dialect(self) -> None:
