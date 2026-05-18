@@ -127,15 +127,19 @@ def list_output_columns(
     """Return the names of columns the top-level SELECT in ``sql`` produces.
 
     For ``SELECT a, b, c FROM ...`` returns ``["a", "b", "c"]``. For
-    ``SELECT *`` we run sqlglot's qualifier with the supplied [schema] to
-    expand the star — without a schema for the source, ``*`` cannot be
-    resolved and we return ``["*"]`` (the caller should treat that as "no
-    columns recoverable").
+    ``SELECT *`` we run sqlglot's qualifier to expand the star. Stars over
+    in-query CTEs (the standard dbt ``SELECT * FROM final`` pattern) are
+    resolvable without any external schema; stars over an external table
+    still need the supplied [schema] to expand and otherwise fall back to
+    ``["*"]`` (the caller should treat that as "no columns recoverable").
+    Qualify is therefore always run, regardless of whether [schema] is
+    supplied.
 
     Args:
         sql: Compiled SQL of the model.
         dialect: sqlglot dialect (e.g. ``"redshift"``, ``"postgres"``).
-        schema: Optional nested-dict schema for ``SELECT *`` expansion.
+        schema: Optional nested-dict schema for star expansion over
+            external tables. Not required for CTE-internal stars.
 
     Returns:
         Ordered list of output column names. Unique within a single SELECT,
@@ -143,13 +147,12 @@ def list_output_columns(
         sources.
     """
     tree = sqlglot.parse_one(sql, dialect=dialect)
-    if schema is not None:
-        try:
-            tree = qualify(tree, schema=schema, dialect=dialect)
-        except Exception:
-            # qualify can fail on aggressive normalization; fall back to the
-            # un-qualified tree rather than crashing the whole call.
-            pass
+    try:
+        tree = qualify(tree, schema=schema, dialect=dialect)
+    except Exception:
+        # qualify can fail on aggressive normalization; fall back to the
+        # un-qualified tree rather than crashing the whole call.
+        pass
     if not isinstance(tree, exp.Query):
         return []
     # `named_selects` handles Select, Union, and CTE-wrapped queries
