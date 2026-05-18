@@ -129,6 +129,9 @@ class LineagePanel(private val project: Project) : Disposable {
                     pushHostState()
                     pageReady.set(true)
                     pending.get()?.let { pushPayload(it) }
+                    project.service<LineageInfoService>().snapshot().activeUid?.let {
+                        pushSelected(it)
+                    }
                 }
 
                 override fun onLoadError(

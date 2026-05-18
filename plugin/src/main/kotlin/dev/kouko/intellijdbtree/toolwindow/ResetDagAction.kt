@@ -16,7 +16,8 @@ import com.intellij.openapi.project.DumbAware
 class ResetDagAction(private val panel: LineagePanel) :
     AnAction(
         "Reset DAG Panel",
-        "Reload the lineage view — use if the panel froze after the IDE was in the background.",
+        "Reload the lineage view if it froze after the IDE was backgrounded. " +
+            "DAG content and hop settings are preserved; viewport and column-trace highlights will reset.",
         AllIcons.Actions.Refresh,
     ),
     DumbAware {
