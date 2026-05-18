@@ -125,12 +125,33 @@ def walk_full_lineage(
     #    sub-path cache shared across columns — another ~1.8x over
     #    per-column even with a pre-built scope. Downstream queries
     #    every output column of every child, so this dominates.
-    qualified_cache: dict[str, tuple[exp.Expression, Scope] | None] = {}
-    bulk_lineage_cache: dict[str, dict | None] = {}
+    qualified_cache: dict[tuple[str, str | None], tuple[exp.Expression, Scope] | None] = {}
+    bulk_lineage_cache: dict[tuple[str, str | None], dict | None] = {}
 
-    def get_qualified(sql: str) -> tuple[exp.Expression, Scope] | None:
-        if sql in qualified_cache:
-            return qualified_cache[sql]
+    def _schema_for(exclude_name: str | None) -> dict[str, dict[str, str]] | None:
+        """Schema view for qualifying a single model's SQL.
+
+        Pop the model's *own* entry before handing the schema to
+        sqlglot. Without this, qualify treats a bare column reference
+        like ``id`` as ambiguously belonging to either the FROM-clause
+        upstream or the model itself, gives up on adding a table prefix,
+        and the column-lineage trace can no longer resolve which
+        upstream column it sources from. The model's columns still
+        belong in the global schema so *downstream* qualify calls can
+        expand ``SELECT *`` against it.
+        """
+        if not schema:
+            return None
+        if exclude_name and exclude_name in schema:
+            return {k: v for k, v in schema.items() if k != exclude_name}
+        return schema
+
+    def get_qualified(
+        sql: str, exclude_name: str | None = None,
+    ) -> tuple[exp.Expression, Scope] | None:
+        cache_key = (sql, exclude_name)
+        if cache_key in qualified_cache:
+            return qualified_cache[cache_key]
         try:
             parsed = sqlglot.parse_one(sql, dialect=dialect)
             # Match sqlglot.lineage's own qualify flags — validate=False
@@ -139,24 +160,25 @@ def walk_full_lineage(
             # qualify reads it as an unresolved column).
             qualified = sqlglot_qualify(
                 parsed,
-                schema=schema,
+                schema=_schema_for(exclude_name),
                 dialect=dialect,
                 validate_qualify_columns=False,
                 identify=False,
             )
             scope = build_scope(qualified)
         except Exception:
-            qualified_cache[sql] = None
+            qualified_cache[cache_key] = None
             return None
-        qualified_cache[sql] = (qualified, scope)
+        qualified_cache[cache_key] = (qualified, scope)
         return qualified, scope
 
-    def get_bulk_lineage(sql: str):
-        if sql in bulk_lineage_cache:
-            return bulk_lineage_cache[sql]
-        qs = get_qualified(sql)
+    def get_bulk_lineage(sql: str, exclude_name: str | None = None):
+        cache_key = (sql, exclude_name)
+        if cache_key in bulk_lineage_cache:
+            return bulk_lineage_cache[cache_key]
+        qs = get_qualified(sql, exclude_name=exclude_name)
         if qs is None:
-            bulk_lineage_cache[sql] = None
+            bulk_lineage_cache[cache_key] = None
             return None
         qualified, scope = qs
         try:
@@ -165,13 +187,13 @@ def walk_full_lineage(
             )
         except Exception:
             result = None
-        bulk_lineage_cache[sql] = result
+        bulk_lineage_cache[cache_key] = result
         return result
 
-    def single_lineage(column: str, sql: str):
+    def single_lineage(column: str, sql: str, exclude_name: str | None = None):
         """Per-column lineage using the qualify cache; falls back to the
         raw `sql=str` path when qualify can't handle the SQL."""
-        qs = get_qualified(sql)
+        qs = get_qualified(sql, exclude_name=exclude_name)
         if qs is not None:
             qualified, scope = qs
             try:
@@ -181,7 +203,8 @@ def walk_full_lineage(
             except Exception:
                 pass
         return extract_column_lineage(
-            column=column, sql=sql, dialect=dialect, schema=schema,
+            column=column, sql=sql, dialect=dialect,
+            schema=_schema_for(exclude_name),
         )
 
     # ---- Upstream ----------------------------------------------------
@@ -201,7 +224,7 @@ def walk_full_lineage(
             return
         saw_compiled_sql = True
         try:
-            tree = single_lineage(col, model.compiled_sql)
+            tree = single_lineage(col, model.compiled_sql, exclude_name=model.name)
         except Exception:
             return
         root_expression = tree.expression if tree.expression and tree.expression.strip() else None
@@ -254,7 +277,9 @@ def walk_full_lineage(
             if not child_columns:
                 try:
                     child_columns = list_output_columns(
-                        sql=child_model.compiled_sql, dialect=dialect, schema=schema,
+                        sql=child_model.compiled_sql,
+                        dialect=dialect,
+                        schema=_schema_for(child_model.name),
                     )
                 except Exception:
                     child_columns = []
@@ -266,7 +291,7 @@ def walk_full_lineage(
             # shared sub-path cache); falls back to per-column on
             # qualify failure. The bulk dict is then keyed by
             # output-column name.
-            bulk = get_bulk_lineage(child_model.compiled_sql)
+            bulk = get_bulk_lineage(child_model.compiled_sql, exclude_name=child_model.name)
 
             for child_col in child_columns:
                 try:
@@ -275,7 +300,10 @@ def walk_full_lineage(
                         if child_tree is None:
                             continue
                     else:
-                        child_tree = single_lineage(child_col, child_model.compiled_sql)
+                        child_tree = single_lineage(
+                            child_col, child_model.compiled_sql,
+                            exclude_name=child_model.name,
+                        )
                 except Exception:
                     continue
                 child_sources = collect_source_columns(child_tree)
