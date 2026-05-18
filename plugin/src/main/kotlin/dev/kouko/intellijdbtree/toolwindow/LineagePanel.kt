@@ -13,6 +13,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.wm.IdeFrame
+import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
@@ -128,9 +129,11 @@ class LineagePanel(private val project: Project) : Disposable {
                     pushTheme(currentTheme())
                     pushHostState()
                     pageReady.set(true)
-                    pending.get()?.let { pushPayload(it) }
-                    project.service<LineageInfoService>().snapshot().activeUid?.let {
-                        pushSelected(it)
+                    pending.get()?.let { payload ->
+                        pushPayload(payload)
+                        project.service<LineageInfoService>().snapshot().activeUid?.let {
+                            pushSelected(it)
+                        }
                     }
                 }
 
@@ -216,18 +219,22 @@ class LineagePanel(private val project: Project) : Disposable {
             ApplicationActivationListener.TOPIC,
             object : ApplicationActivationListener {
                 override fun applicationActivated(ideFrame: IdeFrame) {
-                    val cef = browser?.cefBrowser ?: return
+                    // Skip when the tool window is hidden — there's no surface
+                    // to repaint, and macOS users cmd-tab many times an hour.
+                    val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(TOOL_WINDOW_ID)
+                    if (toolWindow?.isVisible != true) return
                     SwingUtilities.invokeLater {
+                        if (!mainPanel.isShowing || mainPanel.width <= 0) return@invokeLater
+                        val cef = browser?.cefBrowser ?: return@invokeLater
                         mainPanel.revalidate()
                         mainPanel.repaint()
-                        cef.wasResized(
-                            mainPanel.width.coerceAtLeast(1),
-                            mainPanel.height.coerceAtLeast(1),
-                        )
-                        cef.executeJavaScript(
-                            "window.dispatchEvent(new Event('resize'));",
-                            cef.url, 0,
-                        )
+                        cef.wasResized(mainPanel.width, mainPanel.height)
+                        if (pageReady.get()) {
+                            cef.executeJavaScript(
+                                "window.dispatchEvent(new Event('resize'));",
+                                cef.url, 0,
+                            )
+                        }
                     }
                 }
             },
@@ -245,15 +252,17 @@ class LineagePanel(private val project: Project) : Disposable {
      */
     fun resetBrowser() {
         val browser = this.browser ?: return
-        val cef = browser.cefBrowser
+        // Dedupe rapid re-entrant clicks: skip when a reload is already in
+        // flight. pageReady is cleared by onLoadStart and by this method, so
+        // a second click within the load window short-circuits.
+        if (!pageReady.compareAndSet(true, false)) return
         SwingUtilities.invokeLater {
             mainPanel.revalidate()
             mainPanel.repaint()
-            cef.wasResized(
+            browser.cefBrowser.wasResized(
                 mainPanel.width.coerceAtLeast(1),
                 mainPanel.height.coerceAtLeast(1),
             )
-            pageReady.set(false)
             browser.loadURL("$BASE_URL/$INDEX_FILE")
         }
     }
@@ -446,6 +455,7 @@ class LineagePanel(private val project: Project) : Disposable {
         private const val RESOURCE_DIR = "lineage-panel-dist"
         private const val INDEX_FILE = "index.html"
         private const val BASE_URL = "https://intellij-dbtree.local"
+        private const val TOOL_WINDOW_ID = "dbtree"
 
         private val BUNDLED_FILES: List<Pair<String, String>> = listOf(
             "index.html" to "text/html",
