@@ -344,6 +344,66 @@ def test_walk_cache_does_not_taint_different_column(dbt_project_inline: Path) ->
     )
 
 
+def test_walk_resolves_select_star_from_undocumented_upstream(tmp_path: Path) -> None:
+    """When a model does ``SELECT * FROM {{ ref(upstream) }}`` and the
+    upstream has no schema.yml docs and no catalog row, column-lineage
+    tracing should still resolve the leaf to the upstream model's
+    column. The fix needs two coordinated pieces:
+
+      1. ``build_sqlglot_schema`` parses each model's compiled SQL when
+         no docs exist, so the upstream's output column names get into
+         the schema.
+      2. The walker excludes the current model's own entry from the
+         schema before qualifying its SQL — otherwise sqlglot treats a
+         bare column reference as ambiguously belonging to the model
+         itself and stops adding the upstream's table prefix, breaking
+         the trace.
+
+    Without either piece, this regression for the iCHEF business-denom
+    file (lots of ``SELECT * FROM ...``-via-CTE plumbing) would
+    silently produce zero column edges.
+    """
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    upstream_sql = "SELECT id, amount, customer_id FROM raw.orders"
+    # `passthrough` projects upstream via SELECT * inside a CTE.
+    passthrough_sql = (
+        "WITH src AS (SELECT * FROM analytics.upstream) "
+        "SELECT * FROM src"
+    )
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.upstream": {
+                "unique_id": "model.demo.upstream", "name": "upstream",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": upstream_sql, "compiled_path": None,
+                "depends_on": {"nodes": []},
+                # Crucially: no `columns` block at all — schema.yml absent
+            },
+            "model.demo.passthrough": {
+                "unique_id": "model.demo.passthrough", "name": "passthrough",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": passthrough_sql, "compiled_path": None,
+                "depends_on": {"nodes": ["model.demo.upstream"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8"
+    )
+
+    edges = _edges(project, "upstream", "amount")
+    assert any(
+        e["source_unique_id"] == "model.demo.upstream"
+        and e["source_column"] == "amount"
+        and e["target_unique_id"] == "model.demo.passthrough"
+        and e["target_column"] == "amount"
+        for e in edges
+    ), f"upstream.amount → passthrough.amount not traced; edges={edges}"
+
+
 def test_walk_tolerates_redshift_dateadd_syntax(tmp_path: Path) -> None:
     """Walker must not crash and must produce upstream/downstream edges when
     a model's WHERE clause uses Redshift-specific DATEADD(day, -30, …).
@@ -423,3 +483,212 @@ WHERE created_at > DATEADD(day, -30, CURRENT_DATE)
         and e["target_column"] == "id"
         for e in edges
     ), f"expected downstream edge not found; got: {edges}"
+
+
+# ---------------------------------------------------------------------------
+# BFS traversal + priority ordering (0.4.6 behaviour)
+# ---------------------------------------------------------------------------
+
+
+def _edge_streamed_order(project: Path, seed_model: str, seed_col: str) -> list[dict]:
+    """Return the streamed (in-flight) edge order — what the JCEF panel
+    would see live, before any post-walk reordering."""
+    streamed: list[dict] = []
+    manifest = DbtManifest.from_project(project)
+    schema = manifest.build_sqlglot_schema() or None
+    walk_full_lineage(
+        manifest=manifest,
+        seed_uid=manifest.resolve_unique_id(seed_model),
+        seed_column=seed_col,
+        dialect=manifest.dialect,
+        schema=schema,
+        on_edge=lambda e: streamed.append(e),
+    )
+    return streamed
+
+
+def test_walk_down_emits_hop1_edges_before_hop2(tmp_path: Path) -> None:
+    """BFS guarantee: every edge at hop=1 from the seed is emitted before
+    any edge at hop=2. Under the old DFS walker, the deepest leaf of the
+    first branch came out before the second hop-1 sibling — disorienting
+    UX. The BFS rewrite makes the stream feel like a ripple expanding
+    radially from the seed.
+    """
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    #  seed → child_a (hop 1) → grand_a (hop 2)
+    #  seed → child_b (hop 1) → grand_b (hop 2)
+    # Under DFS the order would be: seed→child_a, child_a→grand_a,
+    # seed→child_b, child_b→grand_b. Under BFS we expect both hop=1
+    # edges before any hop=2 edge.
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.seed": {
+                "unique_id": "model.demo.seed", "name": "seed",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM raw.orders",
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.child_a": {
+                "unique_id": "model.demo.child_a", "name": "child_a",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM analytics.seed",
+                "depends_on": {"nodes": ["model.demo.seed"]},
+            },
+            "model.demo.child_b": {
+                "unique_id": "model.demo.child_b", "name": "child_b",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM analytics.seed",
+                "depends_on": {"nodes": ["model.demo.seed"]},
+            },
+            "model.demo.grand_a": {
+                "unique_id": "model.demo.grand_a", "name": "grand_a",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM analytics.child_a",
+                "depends_on": {"nodes": ["model.demo.child_a"]},
+            },
+            "model.demo.grand_b": {
+                "unique_id": "model.demo.grand_b", "name": "grand_b",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id FROM analytics.child_b",
+                "depends_on": {"nodes": ["model.demo.child_b"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+
+    streamed = _edge_streamed_order(project, "seed", "id")
+
+    def _hop(edge: dict) -> int:
+        # hop number = how many edges from seed to the target
+        if edge["target_unique_id"] in {"model.demo.child_a", "model.demo.child_b"}:
+            return 1
+        if edge["target_unique_id"] in {"model.demo.grand_a", "model.demo.grand_b"}:
+            return 2
+        return 99
+
+    hops = [_hop(e) for e in streamed]
+    # Find the first hop=2 emission, assert everything before it is hop=1.
+    first_hop2 = next((i for i, h in enumerate(hops) if h == 2), None)
+    assert first_hop2 is not None, f"no hop-2 edge emitted; got hops={hops}"
+    assert all(h == 1 for h in hops[:first_hop2]), (
+        f"hop-2 edge emitted before hop-1 was drained — DFS leaked: hops={hops}"
+    )
+
+
+def test_walk_down_prioritizes_children_whose_sql_mentions_col(tmp_path: Path) -> None:
+    """Priority signal: among children of a single (uid, col), the ones
+    whose compiled SQL textually mentions [col] are processed before the
+    ones whose SQL doesn't (e.g. `SELECT *` passthrough). Both groups
+    still emit edges — this is a *priority* hint, never a filter — but
+    the high-confidence matches surface in earlier debouncer windows.
+    """
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    # Both children consume seed.amount, but:
+    #   explicit_child names 'amount' directly in its SQL → high priority
+    #   star_child uses SELECT *, no mention of 'amount' → low priority
+    # The dict order below puts star_child FIRST so a naive iteration
+    # would emit star_child's edge before explicit_child's. The priority
+    # sort must flip them.
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.seed": {
+                "unique_id": "model.demo.seed", "name": "seed",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id, amount FROM raw.orders",
+                "depends_on": {"nodes": []},
+            },
+            "model.demo.star_child": {
+                "unique_id": "model.demo.star_child", "name": "star_child",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": (
+                    "WITH src AS (SELECT * FROM analytics.seed) "
+                    "SELECT * FROM src"
+                ),
+                "depends_on": {"nodes": ["model.demo.seed"]},
+            },
+            "model.demo.explicit_child": {
+                "unique_id": "model.demo.explicit_child", "name": "explicit_child",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT amount FROM analytics.seed",
+                "depends_on": {"nodes": ["model.demo.seed"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+
+    streamed = _edge_streamed_order(project, "seed", "amount")
+
+    # Sanity: both children get edges (priority is reorder, not filter).
+    targets = {e["target_unique_id"] for e in streamed}
+    assert "model.demo.explicit_child" in targets, (
+        f"explicit_child edge missing; got: {streamed}"
+    )
+    assert "model.demo.star_child" in targets, (
+        f"star_child edge missing (priority became a filter); got: {streamed}"
+    )
+
+    # The explicit-mention child's edge must come BEFORE the star child's.
+    explicit_idx = next(
+        i for i, e in enumerate(streamed)
+        if e["target_unique_id"] == "model.demo.explicit_child"
+    )
+    star_idx = next(
+        i for i, e in enumerate(streamed)
+        if e["target_unique_id"] == "model.demo.star_child"
+    )
+    assert explicit_idx < star_idx, (
+        f"priority sort did not reorder: explicit_idx={explicit_idx}, "
+        f"star_idx={star_idx}, streamed={streamed}"
+    )
+
+
+def test_bfs_does_not_drop_edges_through_select_star(tmp_path: Path) -> None:
+    """Regression guard for the 0.4.5 fix: priority reordering must not
+    silently drop the `SELECT * FROM undocumented_upstream` case. The
+    low-priority bucket still has to be processed.
+    """
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.upstream": {
+                "unique_id": "model.demo.upstream", "name": "upstream",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": "SELECT id, amount FROM raw.orders",
+                "depends_on": {"nodes": []},
+                # No `columns` block — undocumented.
+            },
+            "model.demo.passthrough": {
+                "unique_id": "model.demo.passthrough", "name": "passthrough",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": (
+                    "WITH src AS (SELECT * FROM analytics.upstream) "
+                    "SELECT * FROM src"
+                ),
+                "depends_on": {"nodes": ["model.demo.upstream"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8",
+    )
+    edges = _edges(project, "upstream", "amount")
+    assert any(
+        e["source_unique_id"] == "model.demo.upstream"
+        and e["source_column"] == "amount"
+        and e["target_unique_id"] == "model.demo.passthrough"
+        and e["target_column"] == "amount"
+        for e in edges
+    ), f"SELECT * edge dropped — priority became filter: {edges}"

@@ -13,6 +13,8 @@ are wire-compatible.
 
 from __future__ import annotations
 
+import re
+from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
@@ -41,6 +43,29 @@ class ColumnEdge:
 
 def _strip_quotes(s: str) -> str:
     return s.strip().strip('"').strip("'").strip("`")
+
+
+def _has_word(sql: str, col: str) -> bool:
+    """Case-insensitive word-boundary search for [col] inside [sql].
+
+    Used as a cheap priority signal — children whose compiled SQL
+    textually mentions the column being propagated are processed before
+    children that don't. Word boundaries avoid false positives like
+    ``id`` matching inside ``customer_id`` or ``valid``.
+
+    Strictly a priority hint, not a filter: both groups are still
+    processed in full, so a false negative here only reorders work, it
+    never drops edges. That keeps the ``SELECT *`` from undocumented
+    upstream case (fixed in 0.4.5) safe — such children land in the
+    low-priority bucket and get processed last, but they DO get
+    processed.
+    """
+    if not sql or not col:
+        return False
+    return re.search(
+        r"(?i)\b" + re.escape(col) + r"\b",
+        sql,
+    ) is not None
 
 
 def _extract_table_name(table_expr: str) -> str | None:
@@ -101,6 +126,12 @@ def walk_full_lineage(
     progressive UI updates. The final return value still contains the
     full list regardless of callback presence, so non-streaming
     callers see the same contract.
+
+    Traversal is **BFS** (queue-based, not recursive): every edge at
+    hop=N is emitted before any edge at hop=N+1. Combined with the
+    plugin-side 500 ms debouncer, each batch flush corresponds to one
+    hop's worth of edges — a "radial ripple" from the seed instead of
+    DFS's deepest-chain-first ordering.
     """
     edges: list[ColumnEdge] = []
     models_by_name = manifest.models_by_name()
@@ -125,12 +156,33 @@ def walk_full_lineage(
     #    sub-path cache shared across columns — another ~1.8x over
     #    per-column even with a pre-built scope. Downstream queries
     #    every output column of every child, so this dominates.
-    qualified_cache: dict[str, tuple[exp.Expression, Scope] | None] = {}
-    bulk_lineage_cache: dict[str, dict | None] = {}
+    qualified_cache: dict[tuple[str, str | None], tuple[exp.Expression, Scope] | None] = {}
+    bulk_lineage_cache: dict[tuple[str, str | None], dict | None] = {}
 
-    def get_qualified(sql: str) -> tuple[exp.Expression, Scope] | None:
-        if sql in qualified_cache:
-            return qualified_cache[sql]
+    def _schema_for(exclude_name: str | None) -> dict[str, dict[str, str]] | None:
+        """Schema view for qualifying a single model's SQL.
+
+        Pop the model's *own* entry before handing the schema to
+        sqlglot. Without this, qualify treats a bare column reference
+        like ``id`` as ambiguously belonging to either the FROM-clause
+        upstream or the model itself, gives up on adding a table prefix,
+        and the column-lineage trace can no longer resolve which
+        upstream column it sources from. The model's columns still
+        belong in the global schema so *downstream* qualify calls can
+        expand ``SELECT *`` against it.
+        """
+        if not schema:
+            return None
+        if exclude_name and exclude_name in schema:
+            return {k: v for k, v in schema.items() if k != exclude_name}
+        return schema
+
+    def get_qualified(
+        sql: str, exclude_name: str | None = None,
+    ) -> tuple[exp.Expression, Scope] | None:
+        cache_key = (sql, exclude_name)
+        if cache_key in qualified_cache:
+            return qualified_cache[cache_key]
         try:
             parsed = sqlglot.parse_one(sql, dialect=dialect)
             # Match sqlglot.lineage's own qualify flags — validate=False
@@ -139,24 +191,25 @@ def walk_full_lineage(
             # qualify reads it as an unresolved column).
             qualified = sqlglot_qualify(
                 parsed,
-                schema=schema,
+                schema=_schema_for(exclude_name),
                 dialect=dialect,
                 validate_qualify_columns=False,
                 identify=False,
             )
             scope = build_scope(qualified)
         except Exception:
-            qualified_cache[sql] = None
+            qualified_cache[cache_key] = None
             return None
-        qualified_cache[sql] = (qualified, scope)
+        qualified_cache[cache_key] = (qualified, scope)
         return qualified, scope
 
-    def get_bulk_lineage(sql: str):
-        if sql in bulk_lineage_cache:
-            return bulk_lineage_cache[sql]
-        qs = get_qualified(sql)
+    def get_bulk_lineage(sql: str, exclude_name: str | None = None):
+        cache_key = (sql, exclude_name)
+        if cache_key in bulk_lineage_cache:
+            return bulk_lineage_cache[cache_key]
+        qs = get_qualified(sql, exclude_name=exclude_name)
         if qs is None:
-            bulk_lineage_cache[sql] = None
+            bulk_lineage_cache[cache_key] = None
             return None
         qualified, scope = qs
         try:
@@ -165,13 +218,13 @@ def walk_full_lineage(
             )
         except Exception:
             result = None
-        bulk_lineage_cache[sql] = result
+        bulk_lineage_cache[cache_key] = result
         return result
 
-    def single_lineage(column: str, sql: str):
+    def single_lineage(column: str, sql: str, exclude_name: str | None = None):
         """Per-column lineage using the qualify cache; falls back to the
         raw `sql=str` path when qualify can't handle the SQL."""
-        qs = get_qualified(sql)
+        qs = get_qualified(sql, exclude_name=exclude_name)
         if qs is not None:
             qualified, scope = qs
             try:
@@ -181,134 +234,187 @@ def walk_full_lineage(
             except Exception:
                 pass
         return extract_column_lineage(
-            column=column, sql=sql, dialect=dialect, schema=schema,
+            column=column, sql=sql, dialect=dialect,
+            schema=_schema_for(exclude_name),
         )
 
-    # ---- Upstream ----------------------------------------------------
+    # ---- Upstream (BFS) ----------------------------------------------
+    # Use an explicit queue rather than recursion so emission order is
+    # hop-by-hop (radial), not chain-then-chain. Combined with the
+    # plugin-side 500ms debouncer, each batch flush corresponds to roughly
+    # one hop's worth of edges — much more intuitive "ripple outward from
+    # seed" than DFS, where the deepest leaf of one branch shows up
+    # before the hop-1 sibling of another.
     visited_up: set[tuple[str, str]] = set()
 
-    def walk_up(uid: str, col: str) -> None:
+    def walk_up_all(start_uid: str, start_col: str) -> None:
         nonlocal saw_compiled_sql, attempted_resolve
-        if (uid, col) in visited_up:
-            return
-        visited_up.add((uid, col))
-        attempted_resolve = True
-        try:
-            model = manifest.resolve_model(uid)
-        except Exception:
-            return
-        if not model.compiled_sql:
-            return
-        saw_compiled_sql = True
-        try:
-            tree = single_lineage(col, model.compiled_sql)
-        except Exception:
-            return
-        root_expression = tree.expression if tree.expression and tree.expression.strip() else None
-        for table_expr, src_col in collect_source_columns(tree):
-            src_uid = _resolve_table(table_expr, models_by_name, sources_by_name)
-            if src_uid is None:
+        queue: deque[tuple[str, str]] = deque([(start_uid, start_col)])
+        while queue:
+            uid, col = queue.popleft()
+            if (uid, col) in visited_up:
                 continue
-            src_col_clean = _strip_quotes(src_col.split(".")[-1])
-            edge = ColumnEdge(
-                source_unique_id=src_uid,
-                source_column=src_col_clean,
-                target_unique_id=uid,
-                target_column=col,
-                expression=root_expression,
-            )
-            edges.append(edge)
-            if on_edge is not None:
-                on_edge(asdict(edge))
-            if src_uid.startswith("source."):
-                continue
-            walk_up(src_uid, src_col_clean)
-
-    # ---- Downstream ---------------------------------------------------
-    # For each child of (uid, col), parse the child's compiled SQL once
-    # for ALL its output columns and check which cite the seed. This is
-    # the same strategy the previous Kotlin walker used (--all-columns).
-    visited_down: set[tuple[str, str]] = set()
-
-    def walk_down(uid: str, col: str) -> None:
-        if (uid, col) in visited_down:
-            return
-        visited_down.add((uid, col))
-        target_name = manifest.model_name(uid)
-        if not target_name:
-            return
-        nonlocal saw_compiled_sql, attempted_resolve
-        for child_uid in children_by_parent.get(uid, []):
+            visited_up.add((uid, col))
             attempted_resolve = True
             try:
-                child_model = manifest.resolve_model(child_uid)
+                model = manifest.resolve_model(uid)
             except Exception:
                 continue
-            if not child_model.compiled_sql:
+            if not model.compiled_sql:
                 continue
             saw_compiled_sql = True
-            # Prefer manifest yml / catalog columns (cheap lookup). Fall
-            # back to parsing SQL output columns when neither has any —
-            # required for projects without catalog.json or yml docs.
-            child_columns = manifest.list_model_columns(child_uid)
-            if not child_columns:
-                try:
-                    child_columns = list_output_columns(
-                        sql=child_model.compiled_sql, dialect=dialect, schema=schema,
-                    )
-                except Exception:
-                    child_columns = []
-                child_columns = [c for c in child_columns if c and c != "*"]
-            if not child_columns:
+            try:
+                tree = single_lineage(col, model.compiled_sql, exclude_name=model.name)
+            except Exception:
                 continue
-
-            # Try bulk lineage (all output columns in one call with a
-            # shared sub-path cache); falls back to per-column on
-            # qualify failure. The bulk dict is then keyed by
-            # output-column name.
-            bulk = get_bulk_lineage(child_model.compiled_sql)
-
-            for child_col in child_columns:
-                try:
-                    if bulk is not None:
-                        child_tree = bulk.get(child_col)
-                        if child_tree is None:
-                            continue
-                    else:
-                        child_tree = single_lineage(child_col, child_model.compiled_sql)
-                except Exception:
+            root_expression = (
+                tree.expression if tree.expression and tree.expression.strip() else None
+            )
+            for table_expr, src_col in collect_source_columns(tree):
+                src_uid = _resolve_table(table_expr, models_by_name, sources_by_name)
+                if src_uid is None:
                     continue
-                child_sources = collect_source_columns(child_tree)
-                # Does this child column cite (uid, col)?
-                cites_seed = False
-                for table_expr, src_col in child_sources:
-                    if _extract_table_name(table_expr) != target_name:
-                        continue
-                    if _strip_quotes(src_col.split(".")[-1]) != col:
-                        continue
-                    cites_seed = True
-                    break
-                if not cites_seed:
-                    continue
-                root_expression = (
-                    child_tree.expression
-                    if child_tree.expression and child_tree.expression.strip()
-                    else None
-                )
+                src_col_clean = _strip_quotes(src_col.split(".")[-1])
                 edge = ColumnEdge(
-                    source_unique_id=uid,
-                    source_column=col,
-                    target_unique_id=child_uid,
-                    target_column=child_col,
+                    source_unique_id=src_uid,
+                    source_column=src_col_clean,
+                    target_unique_id=uid,
+                    target_column=col,
                     expression=root_expression,
                 )
                 edges.append(edge)
                 if on_edge is not None:
                     on_edge(asdict(edge))
-                walk_down(child_uid, child_col)
+                if src_uid.startswith("source."):
+                    continue
+                # Enqueue for next hop instead of recursing — keeps edges
+                # at hop N emitted before any hop N+1 edge.
+                queue.append((src_uid, src_col_clean))
 
-    walk_up(seed_uid, seed_column)
-    walk_down(seed_uid, seed_column)
+    # ---- Downstream (BFS + per-node priority) ------------------------
+    # For each child of (uid, col), parse the child's compiled SQL once
+    # for ALL its output columns and check which cite the seed. This is
+    # the same strategy the previous Kotlin walker used (--all-columns).
+    #
+    # Within the children of a single (uid, col), reorder so models whose
+    # compiled SQL textually mentions [col] are processed before those
+    # that don't. The "no textual mention" group still gets processed —
+    # it covers `SELECT *` from undocumented upstream (the 0.4.5 case)
+    # which legitimately propagates [col] without naming it. So this is
+    # a *priority* signal, not a filter: zero risk of dropping edges,
+    # but the high-confidence matches surface in earlier debouncer
+    # windows for a more responsive feel.
+    visited_down: set[tuple[str, str]] = set()
+
+    def walk_down_all(start_uid: str, start_col: str) -> None:
+        nonlocal saw_compiled_sql, attempted_resolve
+        queue: deque[tuple[str, str]] = deque([(start_uid, start_col)])
+        while queue:
+            uid, col = queue.popleft()
+            if (uid, col) in visited_down:
+                continue
+            visited_down.add((uid, col))
+            target_name = manifest.model_name(uid)
+            if not target_name:
+                continue
+
+            raw_children = children_by_parent.get(uid, [])
+            if not raw_children:
+                continue
+            # Priority sort: children whose compiled SQL textually
+            # mentions [col] go first. Children whose SQL we can't even
+            # load (resolve_model raises or compiled_sql missing) drop
+            # to the bottom — we still try them, but later.
+            def _priority_key(child_uid: str) -> int:
+                try:
+                    child_model = manifest.resolve_model(child_uid)
+                except Exception:
+                    return 2
+                if not child_model.compiled_sql:
+                    return 2
+                return 0 if _has_word(child_model.compiled_sql, col) else 1
+
+            ordered_children = sorted(raw_children, key=_priority_key)
+
+            for child_uid in ordered_children:
+                attempted_resolve = True
+                try:
+                    child_model = manifest.resolve_model(child_uid)
+                except Exception:
+                    continue
+                if not child_model.compiled_sql:
+                    continue
+                saw_compiled_sql = True
+                # Prefer manifest yml / catalog columns (cheap lookup).
+                # Fall back to parsing SQL output columns when neither
+                # has any — required for projects without catalog.json
+                # or yml docs.
+                child_columns = manifest.list_model_columns(child_uid)
+                if not child_columns:
+                    try:
+                        child_columns = list_output_columns(
+                            sql=child_model.compiled_sql,
+                            dialect=dialect,
+                            schema=_schema_for(child_model.name),
+                        )
+                    except Exception:
+                        child_columns = []
+                    child_columns = [c for c in child_columns if c and c != "*"]
+                if not child_columns:
+                    continue
+
+                # Try bulk lineage (all output columns in one call with
+                # a shared sub-path cache); falls back to per-column on
+                # qualify failure.
+                bulk = get_bulk_lineage(
+                    child_model.compiled_sql, exclude_name=child_model.name,
+                )
+
+                for child_col in child_columns:
+                    try:
+                        if bulk is not None:
+                            child_tree = bulk.get(child_col)
+                            if child_tree is None:
+                                continue
+                        else:
+                            child_tree = single_lineage(
+                                child_col, child_model.compiled_sql,
+                                exclude_name=child_model.name,
+                            )
+                    except Exception:
+                        continue
+                    child_sources = collect_source_columns(child_tree)
+                    # Does this child column cite (uid, col)?
+                    cites_seed = False
+                    for table_expr, src_col in child_sources:
+                        if _extract_table_name(table_expr) != target_name:
+                            continue
+                        if _strip_quotes(src_col.split(".")[-1]) != col:
+                            continue
+                        cites_seed = True
+                        break
+                    if not cites_seed:
+                        continue
+                    root_expression = (
+                        child_tree.expression
+                        if child_tree.expression and child_tree.expression.strip()
+                        else None
+                    )
+                    edge = ColumnEdge(
+                        source_unique_id=uid,
+                        source_column=col,
+                        target_unique_id=child_uid,
+                        target_column=child_col,
+                        expression=root_expression,
+                    )
+                    edges.append(edge)
+                    if on_edge is not None:
+                        on_edge(asdict(edge))
+                    # Enqueue for next hop instead of recursing.
+                    queue.append((child_uid, child_col))
+
+    walk_up_all(seed_uid, seed_column)
+    walk_down_all(seed_uid, seed_column)
 
     notice: str | None = None
     # Surface a hint when the walker had work to do but every node it

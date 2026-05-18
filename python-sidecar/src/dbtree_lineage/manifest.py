@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .lineage import list_output_columns
+
 # dbt adapter_type -> sqlglot dialect.
 # dbt-core supports many adapters; we map the common ones and fall back to
 # the adapter_type string itself, since sqlglot's dialect names mostly match.
@@ -203,6 +205,19 @@ class DbtManifest:
             "Run `dbt compile` first."
         )
 
+    def _safe_read_compiled_sql(self, node: dict[str, Any]) -> str | None:
+        """Like [_read_compiled_sql] but swallows missing-SQL errors.
+
+        Used by schema construction where any node lacking compiled SQL
+        is silently skipped (we just don't contribute its columns) rather
+        than aborting the whole schema build.
+        """
+        try:
+            sql = self._read_compiled_sql(node)
+        except Exception:
+            return None
+        return sql if sql and sql.strip() else None
+
     def _derived_compiled_path(self, node: dict[str, Any]) -> Path | None:
         package = node.get("package_name")
         original = node.get("original_file_path")
@@ -261,14 +276,35 @@ class DbtManifest:
             cat_cols = (catalog_entry or {}).get("columns", {})
             for col, spec in cat_cols.items():
                 t = spec.get("type") if isinstance(spec, dict) else None
-                if t:
-                    cols[col] = t
+                # Keep the column even if the type is missing — sqlglot only
+                # needs the *name* for star expansion and qualifier lookups.
+                # validate_qualify_columns=False on the walker side means
+                # "UNKNOWN" types never trigger errors.
+                cols[col] = t or "UNKNOWN"
             for col, spec in (node.get("columns") or {}).items():
                 if col in cols:
                     continue
                 t = spec.get("data_type") if isinstance(spec, dict) else None
-                if t:
-                    cols[col] = t
+                cols[col] = t or "UNKNOWN"
+
+            # Fallback for models with neither catalog.json nor schema.yml
+            # column docs (common during in-development branches): parse the
+            # compiled SQL and use its output column names. Without this,
+            # `SELECT *` from an undocumented upstream model can't be
+            # expanded by sqlglot, and column-lineage tracing through it
+            # stops at an unresolved `*` leaf — so no edges get emitted
+            # for any downstream column that ultimately flows through that
+            # star.
+            if not cols and node.get("resource_type") == "model":
+                compiled = self._safe_read_compiled_sql(node)
+                if compiled:
+                    try:
+                        names = list_output_columns(compiled, dialect=self.dialect)
+                    except Exception:
+                        names = []
+                    if names and names != ["*"]:
+                        cols = {n: "UNKNOWN" for n in names}
+
             if not cols:
                 return
 
