@@ -344,6 +344,66 @@ def test_walk_cache_does_not_taint_different_column(dbt_project_inline: Path) ->
     )
 
 
+def test_walk_resolves_select_star_from_undocumented_upstream(tmp_path: Path) -> None:
+    """When a model does ``SELECT * FROM {{ ref(upstream) }}`` and the
+    upstream has no schema.yml docs and no catalog row, column-lineage
+    tracing should still resolve the leaf to the upstream model's
+    column. The fix needs two coordinated pieces:
+
+      1. ``build_sqlglot_schema`` parses each model's compiled SQL when
+         no docs exist, so the upstream's output column names get into
+         the schema.
+      2. The walker excludes the current model's own entry from the
+         schema before qualifying its SQL — otherwise sqlglot treats a
+         bare column reference as ambiguously belonging to the model
+         itself and stops adding the upstream's table prefix, breaking
+         the trace.
+
+    Without either piece, this regression for the iCHEF business-denom
+    file (lots of ``SELECT * FROM ...``-via-CTE plumbing) would
+    silently produce zero column edges.
+    """
+    import json
+    project = tmp_path / "demo"
+    (project / "target").mkdir(parents=True)
+    upstream_sql = "SELECT id, amount, customer_id FROM raw.orders"
+    # `passthrough` projects upstream via SELECT * inside a CTE.
+    passthrough_sql = (
+        "WITH src AS (SELECT * FROM analytics.upstream) "
+        "SELECT * FROM src"
+    )
+    manifest_dict = {
+        "metadata": {"adapter_type": "postgres"},
+        "nodes": {
+            "model.demo.upstream": {
+                "unique_id": "model.demo.upstream", "name": "upstream",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": upstream_sql, "compiled_path": None,
+                "depends_on": {"nodes": []},
+                # Crucially: no `columns` block at all — schema.yml absent
+            },
+            "model.demo.passthrough": {
+                "unique_id": "model.demo.passthrough", "name": "passthrough",
+                "package_name": "demo", "resource_type": "model",
+                "compiled_code": passthrough_sql, "compiled_path": None,
+                "depends_on": {"nodes": ["model.demo.upstream"]},
+            },
+        },
+    }
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest_dict), encoding="utf-8"
+    )
+
+    edges = _edges(project, "upstream", "amount")
+    assert any(
+        e["source_unique_id"] == "model.demo.upstream"
+        and e["source_column"] == "amount"
+        and e["target_unique_id"] == "model.demo.passthrough"
+        and e["target_column"] == "amount"
+        for e in edges
+    ), f"upstream.amount → passthrough.amount not traced; edges={edges}"
+
+
 def test_walk_tolerates_redshift_dateadd_syntax(tmp_path: Path) -> None:
     """Walker must not crash and must produce upstream/downstream edges when
     a model's WHERE clause uses Redshift-specific DATEADD(day, -30, …).

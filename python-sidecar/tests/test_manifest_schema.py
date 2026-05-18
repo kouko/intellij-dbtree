@@ -206,9 +206,12 @@ class TestBuildSqlglotSchema:
             "orders": {"id": "INT"},
         }
 
-    def test_skips_models_with_empty_columns(self) -> None:
-        # If we have neither catalog rows nor manifest data_type, the entry
-        # is omitted (sqlglot can't use a typeless schema row anyway).
+    def test_keeps_documented_column_names_without_type(self) -> None:
+        # When a column is documented in schema.yml but has no data_type
+        # (and no catalog row either), the name still belongs in the
+        # schema — sqlglot only needs *names* to expand `SELECT *` and
+        # resolve column references; missing types are fine with the
+        # walker's `validate_qualify_columns=False`.
         manifest = {
             "nodes": {
                 "model.demo.orders": _model(
@@ -217,6 +220,50 @@ class TestBuildSqlglotSchema:
                     relation_name='"db"."s"."orders"',
                     columns={"id": {}},  # no data_type, no catalog
                 ),
+            },
+        }
+        m = DbtManifest(manifest)
+        assert m.build_sqlglot_schema() == {"orders": {"id": "UNKNOWN"}}
+
+    def test_falls_back_to_compiled_sql_when_undocumented(self) -> None:
+        # Models without schema.yml docs *or* catalog entries (common on
+        # in-development branches) used to be omitted from the schema,
+        # which broke `SELECT *` expansion when a downstream traced through
+        # them — leaf nodes ended at an unresolved `*` and no column edges
+        # got emitted. Now the compiled SQL is parsed to recover the
+        # output column names (types unknown).
+        manifest = {
+            "nodes": {
+                "model.demo.users": {
+                    "unique_id": "model.demo.users",
+                    "name": "users",
+                    "package_name": "demo",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT id, email, created_at FROM raw.users",
+                    "depends_on": {"nodes": []},
+                },
+            },
+        }
+        m = DbtManifest(manifest)
+        assert m.build_sqlglot_schema() == {
+            "users": {"id": "UNKNOWN", "email": "UNKNOWN", "created_at": "UNKNOWN"},
+        }
+
+    def test_compiled_sql_fallback_skipped_when_unparseable(self) -> None:
+        # When the SQL fallback can't recover a real column list (e.g.
+        # the model is just `SELECT * FROM external_table` with no schema
+        # available, so list_output_columns returns `["*"]`), the entry
+        # is still omitted instead of polluting the schema with a star.
+        manifest = {
+            "nodes": {
+                "model.demo.passthrough": {
+                    "unique_id": "model.demo.passthrough",
+                    "name": "passthrough",
+                    "package_name": "demo",
+                    "resource_type": "model",
+                    "compiled_code": "SELECT * FROM raw.external",
+                    "depends_on": {"nodes": []},
+                },
             },
         }
         m = DbtManifest(manifest)
