@@ -62,7 +62,7 @@ class LineagePanel(private val project: Project) : Disposable {
         JBCefBrowserBuilder()
             .setClient(it)
             .setEnableOpenDevToolsMenuItem(isSandbox)
-            .setOffScreenRendering(false)
+            .setOffScreenRendering(true)
             .build()
     }
     private val jsQuery: JBCefJSQuery? =
