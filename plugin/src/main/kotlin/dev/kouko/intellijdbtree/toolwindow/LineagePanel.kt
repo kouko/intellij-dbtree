@@ -1,5 +1,6 @@
 package dev.kouko.intellijdbtree.toolwindow
 
+import com.intellij.ide.projectView.ProjectView
 import com.intellij.ide.ui.LafManager
 import com.intellij.ide.ui.LafManagerListener
 import com.intellij.openapi.Disposable
@@ -376,7 +377,16 @@ class LineagePanel(private val project: Project) : Disposable {
             val vf = LocalFileSystem.getInstance().refreshAndFindFileByPath(path.toString())
                 ?: return@executeOnPooledThread
             ApplicationManager.getApplication().invokeLater(
-                { FileEditorManager.getInstance(project).openFile(vf, true) },
+                {
+                    FileEditorManager.getInstance(project).openFile(vf, true)
+                    // Also reveal the file in the Project tool window so
+                    // the user can see where the model lives in the dbt
+                    // tree without having to manually navigate. Pass
+                    // requestFocus=false so keyboard focus stays in the
+                    // DAG panel — moving focus on every click would
+                    // disrupt rapid model-to-model navigation.
+                    ProjectView.getInstance(project).select(null, vf, false)
+                },
                 ModalityState.defaultModalityState(),
             )
         }
