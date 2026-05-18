@@ -12,6 +12,7 @@ class DbtreeToolWindowFactory : ToolWindowFactory, DumbAware {
         val panel = LineagePanel(project)
         val content = ContentFactory.getInstance().createContent(panel.component, "", false)
         toolWindow.contentManager.addContent(content)
+        toolWindow.setTitleActions(listOf(ResetDagAction(panel)))
     }
 
     override fun shouldBeAvailable(project: Project): Boolean = true
