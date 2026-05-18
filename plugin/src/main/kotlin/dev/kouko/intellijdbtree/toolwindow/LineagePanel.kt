@@ -203,9 +203,10 @@ class LineagePanel(private val project: Project) : Disposable {
      *
      * macOS 26 (Tahoe) periodically breaks the Java2D Metal pipeline (see
      * JBR-9171); after app reactivation the CEF surface can be left stale
-     * with no further repaints. Re-focusing the browser and dispatching a
-     * `resize` to the React side forces a fresh paint without requiring
-     * users to opt out of Metal via custom VM options.
+     * with no further repaints. Forcing a Swing re-layout + telling CEF
+     * its size changed is the canonical "repaint stuck JCEF" workaround
+     * (see JetBrains support guidance for tool-window JCEF panels), and
+     * is a no-op on healthy surfaces.
      */
     private fun subscribeToAppActivation() {
         ApplicationManager.getApplication().messageBus.connect(this).subscribe(
@@ -214,8 +215,12 @@ class LineagePanel(private val project: Project) : Disposable {
                 override fun applicationActivated(ideFrame: IdeFrame) {
                     val cef = browser?.cefBrowser ?: return
                     SwingUtilities.invokeLater {
-                        cef.setFocus(false)
-                        cef.setFocus(true)
+                        mainPanel.revalidate()
+                        mainPanel.repaint()
+                        cef.wasResized(
+                            mainPanel.width.coerceAtLeast(1),
+                            mainPanel.height.coerceAtLeast(1),
+                        )
                         cef.executeJavaScript(
                             "window.dispatchEvent(new Event('resize'));",
                             cef.url, 0,
@@ -224,6 +229,30 @@ class LineagePanel(private val project: Project) : Disposable {
                 }
             },
         )
+    }
+
+    /**
+     * User-triggered hard reset of the JCEF surface.
+     *
+     * Reloads the bundled URL; `onLoadEnd` will re-inject the bridge,
+     * theme, host state, and republish the last lineage payload from
+     * [pending]. This is the heavy-handed manual fallback when the
+     * automatic nudge in [subscribeToAppActivation] fails to recover
+     * a frozen panel.
+     */
+    fun resetBrowser() {
+        val browser = this.browser ?: return
+        val cef = browser.cefBrowser
+        SwingUtilities.invokeLater {
+            mainPanel.revalidate()
+            mainPanel.repaint()
+            cef.wasResized(
+                mainPanel.width.coerceAtLeast(1),
+                mainPanel.height.coerceAtLeast(1),
+            )
+            pageReady.set(false)
+            browser.loadURL("$BASE_URL/$INDEX_FILE")
+        }
     }
 
     private fun triggerInitialLineage() {
