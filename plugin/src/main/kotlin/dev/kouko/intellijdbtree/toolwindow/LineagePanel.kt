@@ -3,6 +3,7 @@ package dev.kouko.intellijdbtree.toolwindow
 import com.intellij.ide.ui.LafManager
 import com.intellij.ide.ui.LafManagerListener
 import com.intellij.openapi.Disposable
+import com.intellij.openapi.application.ApplicationActivationListener
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.components.service
@@ -11,6 +12,7 @@ import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.wm.IdeFrame
 import com.intellij.ui.JBColor
 import com.intellij.ui.jcef.JBCefApp
 import com.intellij.ui.jcef.JBCefBrowser
@@ -62,7 +64,7 @@ class LineagePanel(private val project: Project) : Disposable {
         JBCefBrowserBuilder()
             .setClient(it)
             .setEnableOpenDevToolsMenuItem(isSandbox)
-            .setOffScreenRendering(true)
+            .setOffScreenRendering(false)
             .build()
     }
     private val jsQuery: JBCefJSQuery? =
@@ -81,6 +83,7 @@ class LineagePanel(private val project: Project) : Disposable {
             installJsToKotlinBridge()
             subscribeToLineageEvents()
             subscribeToThemeChanges()
+            subscribeToAppActivation()
             triggerInitialLineage()
         }
     }
@@ -191,6 +194,34 @@ class LineagePanel(private val project: Project) : Disposable {
             LafManagerListener.TOPIC,
             LafManagerListener {
                 if (pageReady.get()) pushTheme(currentTheme())
+            },
+        )
+    }
+
+    /**
+     * Nudge the JCEF browser when the IDE returns from the background.
+     *
+     * macOS 26 (Tahoe) periodically breaks the Java2D Metal pipeline (see
+     * JBR-9171); after app reactivation the CEF surface can be left stale
+     * with no further repaints. Re-focusing the browser and dispatching a
+     * `resize` to the React side forces a fresh paint without requiring
+     * users to opt out of Metal via custom VM options.
+     */
+    private fun subscribeToAppActivation() {
+        ApplicationManager.getApplication().messageBus.connect(this).subscribe(
+            ApplicationActivationListener.TOPIC,
+            object : ApplicationActivationListener {
+                override fun applicationActivated(ideFrame: IdeFrame) {
+                    val cef = browser?.cefBrowser ?: return
+                    SwingUtilities.invokeLater {
+                        cef.setFocus(false)
+                        cef.setFocus(true)
+                        cef.executeJavaScript(
+                            "window.dispatchEvent(new Event('resize'));",
+                            cef.url, 0,
+                        )
+                    }
+                }
             },
         )
     }
