@@ -257,6 +257,36 @@ function App() {
     return new Set(payload.selected ? [payload.selected.unique_id] : []);
   });
 
+  // Sticky preference for the toolbar's "expand all columns" toggle.
+  // Without this, every fresh payload (clicking a different model,
+  // hitting refresh, hop-slider rebuild) would reset the per-model
+  // expanded state to empty because `allExpanded` is derived from
+  // `expanded.has(uid)` for the new uids — none of which are in the
+  // stale set. Tracking the user's intent separately means "expand
+  // all" survives a redraw. Cleared automatically when the user
+  // manually collapses any individual card (`toggleExpanded` below)
+  // so the next redraw doesn't re-expand against their wishes.
+  const [expandAllSticky, setExpandAllSticky] = useState(false);
+
+  // Re-apply the sticky preference whenever the payload model set
+  // changes. The effect only ADDS uids — never removes — so it can't
+  // fight an in-progress individual expand. The `useEffect` early-
+  // returns when the preference is off so the no-op path is cheap.
+  useEffect(() => {
+    if (!expandAllSticky) return;
+    setExpanded((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const m of payload.models) {
+        if (!next.has(m.unique_id)) {
+          next.add(m.unique_id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [expandAllSticky, payload.models]);
+
   const [selectedColumn, setSelectedColumn] = useState<{
     unique_id: string;
     column: string;
@@ -392,6 +422,10 @@ function App() {
         const next = new Set(prev);
         if (next.has(uniqueId)) {
           next.delete(uniqueId);
+          // Manual collapse opts out of "expand all" mode — otherwise
+          // the next payload refresh would re-expand this card and
+          // confuse the user.
+          setExpandAllSticky(false);
         } else {
           next.add(uniqueId);
           // Going from collapsed → expanded: trigger lazy column fetch.
@@ -446,10 +480,13 @@ function App() {
     payload.models.length > 0 && payload.models.every((m) => expanded.has(m.unique_id));
 
   const onToggleAllExpanded = useCallback(() => {
-    setExpanded(() => {
-      if (allExpanded) return new Set();
-      return new Set(payload.models.map((m) => m.unique_id));
-    });
+    if (allExpanded) {
+      setExpandAllSticky(false);
+      setExpanded(new Set());
+    } else {
+      setExpandAllSticky(true);
+      setExpanded(new Set(payload.models.map((m) => m.unique_id)));
+    }
   }, [allExpanded, payload.models]);
 
   // ---- Manual node positions (drag override) -------------------------------
@@ -1285,41 +1322,66 @@ function Toolbar({
       <span style={{ flex: 1 }} />
       {selected ? (
         <>
-          <span style={{ color: t.toolbarTextMuted }}>
-            tracing{" "}
-            <code
+          {focusedIsHover && focusedModelName ? (
+            // Hovering during a column trace — temporarily replace the
+            // trace summary with the hovered model's name so the user
+            // can still identify cards while keeping `clear` reachable.
+            <span
               style={{
-                background: t.codeBg,
-                color: t.highlightText,
-                padding: "1px 6px",
-                borderRadius: 4,
+                color: t.toolbarTextMuted,
                 fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                fontSize: 12,
+                lineHeight: 1.3,
+                maxWidth: 480,
+                maxHeight: "2.6em",
+                overflow: "hidden",
+                overflowWrap: "anywhere",
+                wordBreak: "break-all",
+                textAlign: "right",
+                userSelect: "text",
+                cursor: "text",
               }}
+              title={focusedModelName}
             >
-              {selected.unique_id.split(".").pop()}.{selected.column}
-            </code>
-            {" — "}
-            {computing && traceCount === 0 ? (
-              <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
-                computing column lineage…
-              </em>
-            ) : computing ? (
-              // Streaming sidecar emits edges progressively. Show the
-              // running count alongside an italic "(computing…)" suffix
-              // so the user sees forward motion without losing sight of
-              // the fact that more edges may still arrive.
-              <>
-                {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
+              {focusedModelName}
+            </span>
+          ) : (
+            <span style={{ color: t.toolbarTextMuted }}>
+              tracing{" "}
+              <code
+                style={{
+                  background: t.codeBg,
+                  color: t.highlightText,
+                  padding: "1px 6px",
+                  borderRadius: 4,
+                  fontFamily: "ui-monospace, SFMono-Regular, monospace",
+                }}
+              >
+                {selected.unique_id.split(".").pop()}.{selected.column}
+              </code>
+              {" — "}
+              {computing && traceCount === 0 ? (
                 <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
-                  (computing…)
+                  computing column lineage…
                 </em>
-              </>
-            ) : (
-              <>
-                {traceCount} column edge{traceCount === 1 ? "" : "s"}
-              </>
-            )}
-          </span>
+              ) : computing ? (
+                // Streaming sidecar emits edges progressively. Show the
+                // running count alongside an italic "(computing…)" suffix
+                // so the user sees forward motion without losing sight of
+                // the fact that more edges may still arrive.
+                <>
+                  {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
+                  <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                    (computing…)
+                  </em>
+                </>
+              ) : (
+                <>
+                  {traceCount} column edge{traceCount === 1 ? "" : "s"}
+                </>
+              )}
+            </span>
+          )}
           <button type="button" onClick={onClear} style={buttonStyle}>
             clear
           </button>
