@@ -14,8 +14,8 @@
 -->
 <plugins>
   <plugin id="dev.kouko.intellij-dbtree"
-          url="https://github.com/kouko/intellij-dbtree/releases/download/v0.4.6/dbtree-0.4.6.zip"
-          version="0.4.6">
+          url="https://github.com/kouko/intellij-dbtree/releases/download/v0.4.7/dbtree-0.4.7.zip"
+          version="0.4.7">
     <idea-version since-build="261"/>
     <name>dbtree</name>
     <vendor email="kouko.d@gmail.com" url="https://github.com/kouko/intellij-dbtree">kouko</vendor>
