@@ -1,7 +1,11 @@
 import type { Theme } from "../lib/theme";
 
 const HOP_STEPS = [0, 1, 2, 3, 5, 10] as const;
-const UNLIMITED = Number.MAX_SAFE_INTEGER;
+// Sentinel for "no hop limit" — must fit in Kotlin Int (signed 32-bit) because
+// the value crosses the JCEF bridge into LineagePanel.JsCallback.{up,down}Hops.
+// Number.MAX_SAFE_INTEGER overflows kotlinx-serialization's Int decoder, the
+// HOP_CHANGE event is dropped on the Kotlin side, and the DAG never rebuilds.
+const UNLIMITED = 2_147_483_647;
 
 export function nextHop(value: number): number {
   if (value >= 10) return UNLIMITED;

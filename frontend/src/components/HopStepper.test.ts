@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isUnlimited, nextHop, prevHop } from "./HopStepper";
 
-const UNLIMITED = Number.MAX_SAFE_INTEGER;
+const UNLIMITED = 2_147_483_647;
 
 describe("nextHop", () => {
   it("walks the documented sequence 0,1,2,3,5,10,∞", () => {
@@ -16,6 +16,16 @@ describe("nextHop", () => {
   it("stays at unlimited once past 10", () => {
     expect(nextHop(UNLIMITED)).toBe(UNLIMITED);
     expect(nextHop(Infinity)).toBe(UNLIMITED);
+  });
+
+  // The unlimited sentinel crosses the JCEF bridge into a Kotlin `Int`
+  // field on LineagePanel.JsCallback. Anything above 2^31-1 overflows
+  // kotlinx-serialization's Int decoder, the HOP_CHANGE event is silently
+  // dropped, and the DAG never rebuilds — the UI number changes but the
+  // graph doesn't move.
+  it("returns a sentinel that fits in Kotlin Int (signed 32-bit)", () => {
+    const KOTLIN_INT_MAX = 2_147_483_647;
+    expect(nextHop(10)).toBeLessThanOrEqual(KOTLIN_INT_MAX);
   });
 
   it("snaps an out-of-cycle finite value (e.g. 7) into the cycle", () => {
@@ -42,7 +52,7 @@ describe("prevHop", () => {
 });
 
 describe("isUnlimited", () => {
-  it("treats Number.MAX_SAFE_INTEGER as unlimited", () => {
+  it("treats the unlimited sentinel as unlimited", () => {
     expect(isUnlimited(UNLIMITED)).toBe(true);
   });
 
