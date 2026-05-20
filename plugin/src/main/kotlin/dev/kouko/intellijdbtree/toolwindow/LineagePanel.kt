@@ -38,6 +38,7 @@ import org.cef.browser.CefFrame
 import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.swing.JComponent
@@ -74,6 +75,19 @@ class LineagePanel(private val project: Project) : Disposable {
 
     private val pageReady = AtomicBoolean(false)
     private val pending = AtomicReference<LineagePayload?>(null)
+
+    /**
+     * Column-list updates that arrived from the batch sidecar before
+     * `pageReady` flipped true — without this buffer they were silently
+     * dropped (the listener's `if (pageReady.get())` gate), leaving cards
+     * stuck on "Parsing SQL…" until the user manually collapsed + expanded
+     * to trigger a force-retry. Symmetric to [pending] for full payloads.
+     *
+     * Key = model uniqueId. Latest-write-wins: only the most recent column
+     * list per uid is replayed, since older lists would just be overwritten
+     * on render anyway.
+     */
+    private val pendingColumnUpdates = ConcurrentHashMap<String, List<ColumnSpec>>()
 
     init {
         Disposer.register(project, this)
@@ -136,6 +150,19 @@ class LineagePanel(private val project: Project) : Disposable {
                             pushSelected(it)
                         }
                     }
+                    // Drain any column-list updates the batch sidecar
+                    // produced before the page finished loading. Order
+                    // matters: pushPayload above seeds the React payload's
+                    // models with empty columns, then these patches
+                    // populate them — same final state as if the sidecar
+                    // had finished after the page was ready.
+                    if (pendingColumnUpdates.isNotEmpty()) {
+                        val drained = HashMap(pendingColumnUpdates)
+                        pendingColumnUpdates.clear()
+                        for ((uid, cols) in drained) {
+                            pushModelColumns(uid, cols)
+                        }
+                    }
                 }
 
                 override fun onLoadError(
@@ -186,7 +213,16 @@ class LineagePanel(private val project: Project) : Disposable {
                 }
 
                 override fun modelColumnsUpdated(uniqueId: String, columns: List<ColumnSpec>) {
-                    if (pageReady.get()) pushModelColumns(uniqueId, columns)
+                    if (pageReady.get()) {
+                        pushModelColumns(uniqueId, columns)
+                    } else {
+                        // Buffer for replay in onLoadEnd. The batch sidecar
+                        // routinely finishes faster than the JCEF page
+                        // initial load on cold IDE start; without this
+                        // every model in the first prefetch wave shows
+                        // "Parsing SQL…" indefinitely.
+                        pendingColumnUpdates[uniqueId] = columns
+                    }
                 }
 
                 override fun columnEdgesAppended(delta: ColumnEdgesDelta) {
