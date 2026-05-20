@@ -606,6 +606,18 @@ class ColumnLineageService(private val project: Project) {
         columnListCache.clear()
     }
 
+    /**
+     * Read-only peek at the column-list cache. Used by [LineageInfoService.publishFull]
+     * to prepopulate the payload so React skips the prefetch round-trip for
+     * already-known models — fixes the "navigate away and back → empty card"
+     * bug where React's `attemptedColumns` gate blocked the re-prefetch.
+     *
+     * Null = cache miss (no entry). Empty list = cache hit with no parseable
+     * columns (sidecar ran, sqlglot returned nothing) — still authoritative,
+     * caller should treat as "we tried, leave the manifest cols as-is."
+     */
+    fun getCachedColumns(modelUid: String): List<String>? = columnListCache[modelUid]
+
     private fun sidecarCommand(
         python: String,
         pythonPath: String,
