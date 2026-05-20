@@ -95,6 +95,40 @@ internal fun stateAfterSelectionOnly(
  * - ParseError   → point at idea.log because the cause is usually a dbt
  *                  internal error or a bad manifest version
  */
+/**
+ * Policy: at publishFull time, fold the Kotlin column-list cache into the
+ * payload's models so the React side never has to round-trip for cols it
+ * already has. Solves the "navigate away and back → card empty" bug: React's
+ * `attemptedColumns` set grows monotonically per session, so the second
+ * arrival of a model's payload would skip the prefetch entirely and the
+ * `columnListCache` data sat unused until the user collapsed + re-expanded
+ * the card.
+ *
+ * Merge policy mirrors React's `mergePayloadPreservingColumns`:
+ *   - Model already has non-empty cols from manifest (yml / catalog) → leave
+ *     them. Manifest is authoritative; it carries type + description metadata
+ *     the sqlglot cache doesn't.
+ *   - Model has empty cols + cache hit → fill in.
+ *   - Model has empty cols + cache miss → leave empty; the sidecar's
+ *     prefetch wave will populate them.
+ *
+ * [getCached] is injected so this stays pure-testable.
+ */
+internal fun augmentPayloadWithCachedColumns(
+    payload: LineagePayload,
+    getCached: (String) -> List<String>?,
+): LineagePayload {
+    if (payload.models.isEmpty()) return payload
+    var anyChanged = false
+    val mergedModels = payload.models.map { model ->
+        if (model.columns.isNotEmpty()) return@map model
+        val cached = getCached(model.uniqueId) ?: return@map model
+        anyChanged = true
+        model.copy(columns = cached.map { ColumnSpec(name = it) })
+    }
+    return if (anyChanged) payload.copy(models = mergedModels) else payload
+}
+
 internal fun manifestStatusWarning(result: ManifestService.RefreshResult): String? = when (result) {
     is ManifestService.RefreshResult.Ok -> null
     is ManifestService.RefreshResult.NoDbtProject ->

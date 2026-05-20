@@ -278,12 +278,117 @@ class LineageInfoPolicyTest {
         }
     }
 
-    // ShouldPublishModelColumnsTests removed alongside the function it pinned.
-    // The gate's drop-on-absent-uid behavior caused ~60% publish loss during
-    // heavy navigation (uid leaves publishedUids → publish skipped → React's
-    // `pendingColumns` Set never cleared → toolbar "Parsing N" stuck). The
-    // replacement: onRequestColumns publishes unconditionally and lets
-    // React's no-op `models.map()` handle absent uids. See the comment block
-    // where the function used to live in LineageInfoPolicy.kt for the full
-    // rationale.
+    // ShouldPublishModelColumnsTests removed in 0.4.12 alongside the function
+    // it pinned. The gate's drop-on-absent-uid behavior caused ~60% publish
+    // loss during heavy navigation (uid leaves publishedUids → publish
+    // skipped → React's `pendingColumns` Set never cleared → toolbar
+    // "Parsing N" stuck). Replacement: onRequestColumns publishes
+    // unconditionally and lets React's no-op `models.map()` handle absent
+    // uids. See the comment block where the function used to live in
+    // LineageInfoPolicy.kt for the full rationale.
+
+    /**
+     * Pins the column-cache prepopulation policy.
+     *
+     * Background: prior to this fix, the React side gated prefetch on a
+     * monotonically-growing `attemptedColumns` set (a uid that ever received
+     * an `applyModelColumns` response stays in the set until force-retry).
+     * When the user navigated A → X → A, the second arrival of A's payload
+     * had empty manifest-cols (no carry-forward via mergePayloadPreservingColumns
+     * because the immediately-previous state was X's DAG, not A's). Prefetch
+     * effect saw `attemptedColumns.has(A) === true` → skipped → A's card sat
+     * empty even though the Kotlin-side `columnListCache[A]` still had the
+     * data from the original visit. Only manual collapse + expand recovered.
+     *
+     * Fix: at publishFull time, post-process the manifest-derived payload by
+     * folding the Kotlin cache into each model with empty cols. The payload
+     * arrives in React with columns already populated, so `m.columns.length > 0`
+     * makes the prefetch effect skip without needing to consult attemptedColumns
+     * at all — no round-trip required for previously-seen models.
+     */
+    @Nested
+    inner class AugmentPayloadWithCachedColumnsTests {
+
+        private fun model(uid: String, cols: List<String> = emptyList()) = DbtModel(
+            uniqueId = uid,
+            name = uid.substringAfterLast('.'),
+            packageName = "pkg",
+            columns = cols.map { ColumnSpec(name = it) },
+        )
+
+        @Test
+        fun `model with non-empty manifest cols is untouched (manifest wins over cache)`() {
+            // Catalog / yml columns are authoritative when present — they
+            // carry type + description metadata the sqlglot cache doesn't.
+            val payload = LineagePayload(models = listOf(model("model.foo", listOf("a", "b"))))
+            val out = augmentPayloadWithCachedColumns(payload) {
+                fail("should not consult cache when manifest already has cols")
+            }
+            assertEquals(payload, out)
+        }
+
+        @Test
+        fun `model with empty cols and cache hit gets cols filled in`() {
+            val payload = LineagePayload(models = listOf(model("model.foo")))
+            val out = augmentPayloadWithCachedColumns(payload) { uid ->
+                if (uid == "model.foo") listOf("x", "y", "z") else null
+            }
+            assertEquals(1, out.models.size)
+            assertEquals(
+                listOf("x", "y", "z"),
+                out.models[0].columns.map { it.name },
+            )
+        }
+
+        @Test
+        fun `model with empty cols and cache miss stays empty (sidecar will fill later)`() {
+            val payload = LineagePayload(models = listOf(model("model.foo")))
+            val out = augmentPayloadWithCachedColumns(payload) { null }
+            assertEquals(0, out.models[0].columns.size)
+        }
+
+        @Test
+        fun `mixed payload — only empty + cache-hit models get filled`() {
+            val payload = LineagePayload(
+                models = listOf(
+                    model("model.manifest", listOf("from_manifest")),
+                    model("model.cached"),
+                    model("model.uncached"),
+                ),
+            )
+            val out = augmentPayloadWithCachedColumns(payload) { uid ->
+                if (uid == "model.cached") listOf("from_cache") else null
+            }
+            assertEquals(listOf("from_manifest"), out.models[0].columns.map { it.name })
+            assertEquals(listOf("from_cache"), out.models[1].columns.map { it.name })
+            assertEquals(emptyList<String>(), out.models[2].columns.map { it.name })
+        }
+
+        @Test
+        fun `non-column fields are preserved (model identity, edges, warning)`() {
+            // Smoke check that this is a focused augmentation, not a payload
+            // rebuild — easy to accidentally drop fields by doing payload.copy
+            // with only the models field set elsewhere.
+            val payload = LineagePayload(
+                models = listOf(model("model.foo")),
+                warning = "test-warning",
+                selected = Selected(uniqueId = "model.foo", column = null),
+            )
+            val out = augmentPayloadWithCachedColumns(payload) { listOf("c") }
+            assertEquals("test-warning", out.warning)
+            assertEquals("model.foo", out.selected?.uniqueId)
+        }
+
+        @Test
+        fun `empty payload short-circuits without invoking the cache lookup`() {
+            // No models → no need to even ask the cache. Cheap defensive
+            // case for empty-payload publishes (manifest load failures).
+            val out = augmentPayloadWithCachedColumns(LineagePayload()) {
+                fail("should not consult cache on empty payload")
+            }
+            assertEquals(0, out.models.size)
+        }
+    }
 }
+
+private fun fail(msg: String): Nothing = throw AssertionError(msg)

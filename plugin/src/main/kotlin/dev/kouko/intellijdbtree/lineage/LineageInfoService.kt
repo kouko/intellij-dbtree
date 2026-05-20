@@ -392,11 +392,20 @@ class LineageInfoService(private val project: Project) {
      */
     private fun publishFull(manifest: ParsedManifest, newActiveUid: String?) {
         val cur = state.get()
-        val payload = if (newActiveUid != null) {
+        val rawPayload = if (newActiveUid != null) {
             manifest.buildLineage(newActiveUid, upHops = cur.upHops, downHops = cur.downHops)
         } else {
             LineagePayload()
         }
+        // Fold the Kotlin column-list cache into the payload BEFORE shipping
+        // to React. Without this, navigating A → X → A leaves A's card empty
+        // on return: React's `attemptedColumns` gate blocks the re-prefetch,
+        // and `mergePayloadPreservingColumns` only carries cols from the
+        // immediately-previous payload (which was X's DAG, not A's). The
+        // Kotlin cache has the data the whole time — this just stops it
+        // from sitting there unused.
+        val cls = project.service<ColumnLineageService>()
+        val payload = augmentPayloadWithCachedColumns(rawPayload) { cls.getCachedColumns(it) }
         val publishedUids = payload.models.map { it.uniqueId }.toSet()
         state.updateAndGet { stateAfterPublishFull(it, newActiveUid, publishedUids) }
         publisher.lineagePayloadChanged(payload)
