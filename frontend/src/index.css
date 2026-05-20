@@ -62,3 +62,24 @@ body,
 .column-list::-webkit-scrollbar-thumb:hover {
   background-color: rgba(127, 127, 127, 0.7);
 }
+
+/* Toolbar parsing indicator: a small ring that spins while the Python
+ * sidecar is parsing column lists for one or more model cards. Without
+ * this, batches in flight produce no visible toolbar feedback for the
+ * 4–10s sqlglot startup window — users see a static UI and assume
+ * the plugin is stuck. */
+@keyframes dbtree-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.dbtree-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: dbtree-spin 0.9s linear infinite;
+  vertical-align: -1px;
+}
