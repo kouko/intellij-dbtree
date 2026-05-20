@@ -31,7 +31,11 @@ import {
   edgeKey,
   isEdgeOnModelTreePath,
 } from "./lib/lineage-trace";
-import { applyColumnEdgesDelta, type ColumnEdgesDelta } from "./lib/payload-reducer";
+import {
+  applyColumnEdgesDelta,
+  mergePayloadPreservingColumns,
+  type ColumnEdgesDelta,
+} from "./lib/payload-reducer";
 import { THEMES, detectInitialTheme, normalizeLayer, type Theme, type ThemeName } from "./lib/theme";
 
 const NODE_TYPES: NodeTypes = {
@@ -42,6 +46,11 @@ const ghostId = (uid: string, side: "upstream" | "downstream") =>
   `__hidden__${uid}__${side}`;
 const EDGE_TYPES: EdgeTypes = { curved: CurvedBezierEdge };
 const NODE_WIDTH = 320;
+// Max time a uid may remain in pendingColumns before being force-cleared
+// by the safety-net effect. Pegged comfortably above the Kotlin sidecar
+// default timeout (60s) so a healthy slow response isn't snipped — this
+// only fires when the publish back was actually lost.
+const PENDING_COLUMNS_TIMEOUT_MS = 90_000;
 // Empirical char-per-line estimate at NODE_WIDTH=320, font-weight 600 / 12px,
 // after subtracting padding + layer chip + chevron button width. Used only
 // to feed the layout engine an approximate per-node height; actual rendering
@@ -179,6 +188,14 @@ function App() {
 
   const onRefresh = useCallback(() => {
     if (!window.kotlinCallback) return;
+    // Clear the "attempted" memo so models whose first prefetch failed
+    // (e.g. Python interpreter wasn't configured yet, sidecar timed out,
+    // sqlglot returned empty) get a fresh REQUEST_COLUMNS in the
+    // prefetch wave that follows the refresh-driven setLineageInfo.
+    // Backend mirrors this — refreshFromDisk invalidates columnListCache —
+    // so the new requests actually re-run sqlglot rather than hitting a
+    // stale empty cache entry.
+    setAttemptedColumns((prev) => (prev.size === 0 ? prev : new Set()));
     window.kotlinCallback(JSON.stringify({ event: "REFRESH" }));
   }, []);
 
@@ -209,7 +226,14 @@ function App() {
       );
     };
     window.setLineageInfo = (next) => {
-      setPayload(next);
+      // Carry forward sidecar-patched columns from the prev payload so a
+      // model navigation / hop change / dbt compile manifest reload
+      // doesn't wipe them back to []. Without this, every fresh full
+      // payload triggers a re-prefetch wave through the sidecar, and any
+      // publish that silently drops in the Kotlin → JCEF → React chain
+      // leaves the card stuck on "Parsing SQL…" with no recovery path.
+      // See mergePayloadPreservingColumns docstring for the full rationale.
+      setPayload((prev) => mergePayloadPreservingColumns(prev, next));
       const newModel = next.selected?.unique_id ?? null;
       setSelectedModelUid(newModel);
       dropStaleColumn(newModel);
@@ -229,6 +253,20 @@ function App() {
         if (!prev.has(uid)) return prev;
         const next = new Set(prev);
         next.delete(uid);
+        return next;
+      });
+      // Record that we got a terminal response (empty or full) so the
+      // prefetch effect doesn't immediately re-fire for an empty
+      // response. Without this, a model whose sidecar fails (no Python
+      // interpreter, sqlglot can't parse, etc.) churns the IPC bus
+      // indefinitely as setPayload-empty → setPending-clear → prefetch
+      // re-fires → ... User can still retry by collapse + expand
+      // (toggleExpanded calls requestColumnsIfNeeded with force: true,
+      // which evicts from attemptedColumns).
+      setAttemptedColumns((prev) => {
+        if (prev.has(uid)) return prev;
+        const next = new Set(prev);
+        next.add(uid);
         return next;
       });
     };
@@ -251,6 +289,43 @@ function App() {
   const [pendingColumns, setPendingColumns] = useState<Set<string>>(
     () => new Set(),
   );
+
+  // uids that have already received a terminal applyModelColumns response
+  // (success OR empty). Distinguishes "haven't asked yet" from "asked and
+  // got back an empty list" — without this distinction the prefetch effect
+  // re-fires for empty responses (since model.columns.length === 0) and
+  // hammers the IPC bus. Eviction happens only on a manual force-retry
+  // (toggleExpanded → requestColumnsIfNeeded({force: true})), so a user
+  // can recover from a transient failure (e.g. Python interpreter just
+  // got configured) by collapse + expand on the card.
+  const [attemptedColumns, setAttemptedColumns] = useState<Set<string>>(
+    () => new Set(),
+  );
+
+  // Safety net: auto-clear a uid from pendingColumns after this long,
+  // even if no applyModelColumns response ever arrives. The
+  // Kotlin → executeJavaScript → window.applyModelColumns chain has
+  // multiple silent-failure paths (EDT contention, JCEF script drops on
+  // transient page states, race with a concurrent setLineageInfo); without
+  // this clamp the card stays on "Parsing SQL…" forever and the user has
+  // no way to recover except restarting the IDE. After expiry, manually
+  // re-expanding the card triggers a fresh REQUEST_COLUMNS via
+  // toggleExpanded's force-retry path.
+  useEffect(() => {
+    if (pendingColumns.size === 0) return;
+    const uids = Array.from(pendingColumns);
+    const timers = uids.map((uid) =>
+      setTimeout(() => {
+        setPendingColumns((prev) => {
+          if (!prev.has(uid)) return prev;
+          const next = new Set(prev);
+          next.delete(uid);
+          return next;
+        });
+      }, PENDING_COLUMNS_TIMEOUT_MS),
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [pendingColumns]);
 
   // ---- Expanded models -----------------------------------------------------
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -371,12 +446,27 @@ function App() {
    * fetch is already in flight.
    */
   const requestColumnsIfNeeded = useCallback(
-    (uniqueId: string) => {
+    (uniqueId: string, options: { force?: boolean } = {}) => {
       if (!isInsidePlugin || !window.kotlinCallback) return;
       const model = payload.models.find((m) => m.unique_id === uniqueId);
       if (!model || model.columns.length > 0) return;
-      if (pendingColumns.has(uniqueId)) return;
+      if (!options.force) {
+        // Default: skip if a prior REQUEST_COLUMNS is still in flight, or
+        // if we already received a terminal response (success or empty).
+        if (pendingColumns.has(uniqueId)) return;
+        if (attemptedColumns.has(uniqueId)) return;
+      } else {
+        // `force` overrides both gates so a manual expand can retry past
+        // a dropped publish OR past a prior empty/failure response.
+        setAttemptedColumns((prev) => {
+          if (!prev.has(uniqueId)) return prev;
+          const next = new Set(prev);
+          next.delete(uniqueId);
+          return next;
+        });
+      }
       setPendingColumns((prev) => {
+        if (prev.has(uniqueId)) return prev;
         const next = new Set(prev);
         next.add(uniqueId);
         return next;
@@ -385,7 +475,7 @@ function App() {
         JSON.stringify({ event: "REQUEST_COLUMNS", unique_id: uniqueId }),
       );
     },
-    [payload.models, pendingColumns],
+    [payload.models, pendingColumns, attemptedColumns],
   );
 
   // Prefetch column lists for every model in the current DAG as soon
@@ -403,6 +493,13 @@ function App() {
     for (const m of payload.models) {
       if (m.columns.length > 0) continue;
       if (pendingColumns.has(m.unique_id)) continue;
+      // Skip uids that already received a terminal response (success
+      // OR empty) — without this guard, an empty response (sidecar
+      // failure / sqlglot parse miss) immediately triggers another
+      // REQUEST_COLUMNS because applyModelColumns cleared pending and
+      // the model's columns are still []. User can force a retry via
+      // collapse + expand on the card.
+      if (attemptedColumns.has(m.unique_id)) continue;
       toRequest.push(m.unique_id);
     }
     if (toRequest.length === 0) return;
@@ -414,7 +511,7 @@ function App() {
       for (const uid of toRequest) next.add(uid);
       return next;
     });
-  }, [payload.models, pendingColumns]);
+  }, [payload.models, pendingColumns, attemptedColumns]);
 
   const toggleExpanded = useCallback(
     (uniqueId: string) => {
@@ -429,8 +526,11 @@ function App() {
         } else {
           next.add(uniqueId);
           // Going from collapsed → expanded: trigger lazy column fetch.
-          // No-op if columns already populated or already fetching.
-          requestColumnsIfNeeded(uniqueId);
+          // Force-retry past any stale pending flag so the user has a
+          // working recovery path when a prior REQUEST_COLUMNS response
+          // was silently dropped in the Kotlin → JCEF → React chain.
+          // No-op if columns already populated.
+          requestColumnsIfNeeded(uniqueId, { force: true });
         }
         return next;
       });
@@ -486,8 +586,19 @@ function App() {
     } else {
       setExpandAllSticky(true);
       setExpanded(new Set(payload.models.map((m) => m.unique_id)));
+      // Mirror the single-card collapse+expand semantics: any model with
+      // empty columns gets a force-retry, evicting it from attemptedColumns
+      // and re-issuing REQUEST_COLUMNS. Without this, models that failed
+      // an earlier prefetch (e.g. before a Python interpreter was
+      // configured) stay empty when the toolbar "expand all" is used —
+      // surprising vs the per-card expand behavior.
+      for (const m of payload.models) {
+        if (m.columns.length === 0) {
+          requestColumnsIfNeeded(m.unique_id, { force: true });
+        }
+      }
     }
-  }, [allExpanded, payload.models]);
+  }, [allExpanded, payload.models, requestColumnsIfNeeded]);
 
   // ---- Manual node positions (drag override) -------------------------------
   // Two layers:
@@ -1112,6 +1223,7 @@ function App() {
         }
         focusedModelName={focusedModelName}
         focusedIsHover={hoveredModelUid !== null}
+        parsingCount={pendingColumns.size}
       />
       {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
       <div style={{ flex: 1, position: "relative" }}>
@@ -1208,6 +1320,7 @@ function Toolbar({
   computing,
   focusedModelName,
   focusedIsHover,
+  parsingCount,
 }: {
   theme: Theme;
   upHops: number;
@@ -1227,6 +1340,8 @@ function Toolbar({
   focusedModelName: string | null;
   /** True when [focusedModelName] is the hovered card (not just the selected one). */
   focusedIsHover: boolean;
+  /** Number of model uids currently waiting on a sidecar column-list response. */
+  parsingCount: number;
 }) {
   const t = theme;
   const buttonStyle: React.CSSProperties = {
@@ -1317,6 +1432,23 @@ function Toolbar({
           >
             ↺ reset layout
           </button>
+        )}
+        {parsingCount > 0 && (
+          <span
+            title={`Parsing column lists for ${parsingCount} model${parsingCount === 1 ? "" : "s"} via sqlglot…`}
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              color: t.toolbarTextMuted,
+              fontFamily: "ui-sans-serif, system-ui, -apple-system, sans-serif",
+              fontSize: 11,
+              fontVariantNumeric: "tabular-nums",
+            }}
+          >
+            <span className="dbtree-spinner" aria-hidden />
+            <span>parsing {parsingCount}</span>
+          </span>
         )}
       </div>
       <span style={{ flex: 1 }} />

@@ -228,9 +228,18 @@ class LineageInfoService(private val project: Project) {
         ApplicationManager.getApplication().executeOnPooledThread {
             if (project.isDisposed) return@executeOnPooledThread
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
+            // Always publish, even on sidecar failure (null) — coerce to
+            // an empty column list. Otherwise the frontend has no signal
+            // that the request completed and the card stays on
+            // "Parsing SQL…" forever (e.g. when no Python interpreter is
+            // configured, or sqlglot can't parse the model). The frontend's
+            // `attemptedColumns` set treats any response — empty or full —
+            // as terminal so the prefetch effect doesn't loop on the empty
+            // case. The user can still force a re-fetch by collapse +
+            // expand on the card.
             val names = project.service<ColumnLineageService>()
                 .listColumnsViaSidecar(modelUid, manifest)
-                ?: return@executeOnPooledThread
+                ?: emptyList()
             if (project.isDisposed) return@executeOnPooledThread
             if (!shouldPublishModelColumns(modelUid, state.get())) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
