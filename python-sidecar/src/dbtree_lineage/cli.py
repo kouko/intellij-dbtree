@@ -39,7 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Direct path to manifest.json (alternative to --project-dir).",
     )
-    p.add_argument("--model", required=True, help="Model name or unique_id.")
+    p.add_argument(
+        "--model",
+        required=False,
+        help="Model name or unique_id. Required for all modes except "
+             "--list-columns-batch (which reads model uids from stdin).",
+    )
     p.add_argument(
         "--column",
         required=False,
@@ -56,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Return only the names of columns the model's compiled SQL "
              "produces (no lineage). Used by the plugin to populate cards "
              "for models lacking schema.yml docs.",
+    )
+    p.add_argument(
+        "--list-columns-batch",
+        action="store_true",
+        help="Batched variant of --list-columns: reads model unique_ids "
+             "from stdin (one per line, blank lines skipped) and emits "
+             "{'results': {uid: {'columns': [...], 'error'?: '...'}}}. "
+             "One Python startup + one sqlglot import covers N models — "
+             "amortizes the ~3-second sqlglot import across the batch. "
+             "Mutually exclusive with --model; per-uid failures land in "
+             "that uid's result entry rather than aborting the run.",
     )
     p.add_argument(
         "--full-walk",
@@ -100,6 +116,52 @@ def run(args: argparse.Namespace) -> dict[str, Any] | None:
     dialect = args.dialect or manifest.dialect
     schema = manifest.build_sqlglot_schema()
     schema_arg = schema if schema else None
+
+    if args.list_columns_batch:
+        # Read uids from stdin, one per line, skipping blanks. Reading all
+        # upfront (vs streaming) keeps the protocol trivial — the Kotlin
+        # batcher closes its end of the pipe after writing the batch.
+        uids = [line.strip() for line in sys.stdin if line.strip()]
+        if args.stream:
+            # NDJSON: one JSON object per line per uid, flushed on emit so
+            # the Kotlin reader can publish per-card as each parse finishes.
+            # Critical for iCHEF-sized DAGs where one slow-to-parse model
+            # (e.g. 417 cols, multi-CTE chains) would otherwise hold the
+            # entire batch behind it past the 60s subprocess timeout, leaving
+            # cards that already parsed cleanly stuck on "Parsing SQL…".
+            for uid in uids:
+                try:
+                    model = manifest.resolve_model(uid)
+                    names = list_output_columns(
+                        sql=model.compiled_sql,
+                        dialect=dialect,
+                        schema=schema_arg,
+                    )
+                    entry: dict[str, Any] = {"uid": uid, "columns": names}
+                except Exception as e:  # noqa: BLE001 — per-uid isolated
+                    entry = {"uid": uid, "columns": [], "error": str(e)}
+                print(json.dumps(entry, ensure_ascii=False), flush=True)
+            return None
+        results: dict[str, dict[str, Any]] = {}
+        for uid in uids:
+            try:
+                model = manifest.resolve_model(uid)
+            except Exception as e:  # noqa: BLE001 — per-uid failure isolated
+                results[uid] = {"columns": [], "error": str(e)}
+                continue
+            try:
+                names = list_output_columns(
+                    sql=model.compiled_sql,
+                    dialect=dialect,
+                    schema=schema_arg,
+                )
+                results[uid] = {"columns": names}
+            except Exception as e:  # noqa: BLE001 — surface per-uid
+                results[uid] = {"columns": [], "error": str(e)}
+        return {"dialect": dialect, "results": results}
+
+    if not args.model:
+        raise SystemExit("--model is required unless --list-columns-batch is set")
 
     # --full-walk only needs the seed unique_id; per-node SQL is loaded
     # lazily by the walker and missing-SQL nodes are skipped gracefully.

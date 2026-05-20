@@ -10,12 +10,15 @@ from pathlib import Path
 import pytest
 
 
-def _run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+def _run_cli(
+    *args: str, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "dbtree_lineage.cli", *args],
         check=False,
         capture_output=True,
         text=True,
+        input=stdin,
     )
 
 
@@ -144,3 +147,101 @@ def test_cli_full_walk_non_stream_still_returns_object(dbt_project_inline: Path)
     payload = json.loads(result.stdout)
     assert "edges" in payload
     assert isinstance(payload["edges"], list)
+
+
+def test_cli_list_columns_batch_reads_stdin(dbt_project_inline: Path) -> None:
+    """--list-columns-batch reads model uids (one per line) from stdin
+    and emits {"results": {uid: {columns: [...]}}}. One Python startup +
+    one sqlglot import covers N models — the whole point of batching."""
+    stdin = "model.demo.stg_orders\nmodel.demo.fct_orders\n"
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--list-columns-batch",
+        stdin=stdin,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    results = payload["results"]
+    assert set(results.keys()) == {"model.demo.stg_orders", "model.demo.fct_orders"}
+    assert "id" in results["model.demo.stg_orders"]["columns"]
+    assert "amount_with_tax" in results["model.demo.fct_orders"]["columns"]
+
+
+def test_cli_list_columns_batch_records_per_uid_errors(
+    dbt_project_inline: Path,
+) -> None:
+    """A bad uid in the batch should NOT fail the whole call — the failure
+    is recorded under that uid's result entry; the good uids still parse."""
+    stdin = "model.demo.no_such_model\nmodel.demo.stg_orders\n"
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--list-columns-batch",
+        stdin=stdin,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    results = payload["results"]
+    assert "error" in results["model.demo.no_such_model"]
+    assert results["model.demo.no_such_model"]["columns"] == []
+    assert "id" in results["model.demo.stg_orders"]["columns"]
+
+
+def test_cli_list_columns_batch_ignores_blank_lines(
+    dbt_project_inline: Path,
+) -> None:
+    """Blank lines in the stdin uid list should be skipped (defends against
+    trailing newlines / accidental empty entries from the Kotlin batcher)."""
+    stdin = "model.demo.stg_orders\n\n   \nmodel.demo.fct_orders\n"
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--list-columns-batch",
+        stdin=stdin,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    assert set(payload["results"].keys()) == {
+        "model.demo.stg_orders",
+        "model.demo.fct_orders",
+    }
+
+
+def test_cli_list_columns_batch_stream_emits_ndjson(dbt_project_inline: Path) -> None:
+    """--list-columns-batch --stream emits one NDJSON line per uid as it
+    finishes parsing. The Kotlin batcher reads stdout line-by-line and
+    publishes each card immediately — so a slow-to-parse model can't
+    hold quickly-parsed siblings behind it."""
+    stdin = "model.demo.stg_orders\nmodel.demo.fct_orders\n"
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--list-columns-batch",
+        "--stream",
+        stdin=stdin,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    assert len(lines) == 2
+    entries = [json.loads(line) for line in lines]
+    by_uid = {e["uid"]: e for e in entries}
+    assert "id" in by_uid["model.demo.stg_orders"]["columns"]
+    assert "amount_with_tax" in by_uid["model.demo.fct_orders"]["columns"]
+
+
+def test_cli_list_columns_batch_stream_records_per_uid_errors(
+    dbt_project_inline: Path,
+) -> None:
+    """A bad uid in --stream mode should land on its own line with an
+    error field — the rest of the batch still streams cleanly."""
+    stdin = "model.demo.no_such\nmodel.demo.stg_orders\n"
+    result = _run_cli(
+        "--project-dir", str(dbt_project_inline),
+        "--list-columns-batch",
+        "--stream",
+        stdin=stdin,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    entries = [json.loads(line) for line in lines]
+    by_uid = {e["uid"]: e for e in entries}
+    assert "error" in by_uid["model.demo.no_such"]
+    assert by_uid["model.demo.no_such"]["columns"] == []
+    assert "id" in by_uid["model.demo.stg_orders"]["columns"]
