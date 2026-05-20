@@ -278,44 +278,12 @@ class LineageInfoPolicyTest {
         }
     }
 
-    /**
-     * Pins the column-request publish gate. Replacing epoch supersession
-     * with a publishedUids check fixed the regression where any unrelated
-     * payload-changing event (column click, hop change) would kill in-flight
-     * column-list prefetches and leave cards stuck on "Parsing SQL…".
-     */
-    @Nested
-    inner class ShouldPublishModelColumnsTests {
-
-        @Test
-        fun `publishes when model is in publishedUids`() {
-            val state = LineageInfoService.State(publishedUids = setOf("model.foo", "model.bar"))
-            assertTrue(shouldPublishModelColumns("model.foo", state))
-        }
-
-        @Test
-        fun `drops when model is not in publishedUids`() {
-            val state = LineageInfoService.State(publishedUids = setOf("model.foo"))
-            assertFalse(shouldPublishModelColumns("model.bar", state))
-        }
-
-        @Test
-        fun `drops when publishedUids is empty`() {
-            val state = LineageInfoService.State(publishedUids = emptySet())
-            assertFalse(shouldPublishModelColumns("model.foo", state))
-        }
-
-        @Test
-        fun `does not consult epoch — epoch differences are irrelevant to the gate`() {
-            // The original bug: column-prefetch tasks were keyed by epoch
-            // and any unrelated bump would supersede them. The fix gates
-            // strictly on publishedUids, so even a wildly different epoch
-            // shouldn't change the decision.
-            val state = LineageInfoService.State(
-                publishedUids = setOf("model.foo"),
-                epoch = 999L,
-            )
-            assertTrue(shouldPublishModelColumns("model.foo", state))
-        }
-    }
+    // ShouldPublishModelColumnsTests removed alongside the function it pinned.
+    // The gate's drop-on-absent-uid behavior caused ~60% publish loss during
+    // heavy navigation (uid leaves publishedUids → publish skipped → React's
+    // `pendingColumns` Set never cleared → toolbar "Parsing N" stuck). The
+    // replacement: onRequestColumns publishes unconditionally and lets
+    // React's no-op `models.map()` handle absent uids. See the comment block
+    // where the function used to live in LineageInfoPolicy.kt for the full
+    // rationale.
 }
