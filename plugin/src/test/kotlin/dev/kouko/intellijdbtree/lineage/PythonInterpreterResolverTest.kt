@@ -1,11 +1,13 @@
 package dev.kouko.intellijdbtree.lineage
 
+import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Nested
 import org.junit.jupiter.api.Test
 import java.nio.file.Path
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Tests over the pure parts of [PythonInterpreterResolver]:
@@ -19,6 +21,14 @@ import kotlin.test.assertNull
  * `PythonSdkType` reflection) and exercised by manual sandbox testing.
  */
 class PythonInterpreterResolverTest {
+
+    // Cache lives on the singleton object and bleeds across tests; clear it
+    // before each so a passing validate in one test can't pre-cache a path
+    // another test wants to see fail.
+    @BeforeEach
+    fun clearResolverCache() {
+        PythonInterpreterResolver.invalidateValidationCache()
+    }
 
     @Nested
     inner class RunChainTests {
@@ -119,6 +129,136 @@ class PythonInterpreterResolverTest {
             )
             assertIs<PythonInterpreterResolver.Resolution.Ok>(res)
             assertEquals("/sdk", res.pythonPath, "fallback wins when manual fails validation")
+        }
+    }
+
+    @Nested
+    inner class ValidationCacheTests {
+
+        // Cache cleared by outer @BeforeEach. Resolver caches validate(path)
+        // results across runChain calls so the v0.4.8 streaming batch sidecar
+        // doesn't pay a ~3s `python -c "import sqlglot"` probe per batch.
+
+        @Test
+        fun `validate is called once per path across repeated runChain calls`() {
+            var calls = 0
+            val candidates = listOf(
+                PythonInterpreterResolver.Source.Manual to "/path/manual",
+            )
+            val validate: (String) -> Boolean = { calls++; true }
+
+            PythonInterpreterResolver.runChain(candidates, validate)
+            PythonInterpreterResolver.runChain(candidates, validate)
+            PythonInterpreterResolver.runChain(candidates, validate)
+
+            assertEquals(1, calls, "subsequent runChain calls must hit cache")
+        }
+
+        @Test
+        fun `failed validations are also cached (avoid retrying broken paths)`() {
+            var calls = 0
+            val candidates = listOf(
+                PythonInterpreterResolver.Source.Manual to "/broken/python",
+                PythonInterpreterResolver.Source.ProjectVenv to "/working/python",
+            )
+            val validate: (String) -> Boolean = { path ->
+                calls++
+                path == "/working/python"
+            }
+
+            val first = PythonInterpreterResolver.runChain(candidates, validate)
+            val second = PythonInterpreterResolver.runChain(candidates, validate)
+
+            assertIs<PythonInterpreterResolver.Resolution.Ok>(first)
+            assertIs<PythonInterpreterResolver.Resolution.Ok>(second)
+            assertEquals(
+                2, calls,
+                "first call probes both paths once; second call hits cache for both",
+            )
+        }
+
+        @Test
+        fun `invalidateValidationCache forces re-validation`() {
+            var calls = 0
+            val candidates = listOf(
+                PythonInterpreterResolver.Source.Manual to "/path/manual",
+            )
+            val validate: (String) -> Boolean = { calls++; true }
+
+            PythonInterpreterResolver.runChain(candidates, validate)
+            PythonInterpreterResolver.invalidateValidationCache()
+            PythonInterpreterResolver.runChain(candidates, validate)
+
+            assertEquals(2, calls, "invalidate must clear the cache")
+        }
+
+        @Test
+        fun `different paths are cached independently`() {
+            val seen = mutableListOf<String>()
+            val validate: (String) -> Boolean = { seen += it; true }
+
+            PythonInterpreterResolver.runChain(
+                listOf(PythonInterpreterResolver.Source.Manual to "/a"),
+                validate,
+            )
+            PythonInterpreterResolver.runChain(
+                listOf(PythonInterpreterResolver.Source.Manual to "/b"),
+                validate,
+            )
+            PythonInterpreterResolver.runChain(
+                listOf(PythonInterpreterResolver.Source.Manual to "/a"),
+                validate,
+            )
+
+            assertEquals(listOf("/a", "/b"), seen, "each unique path probed once")
+        }
+
+        @Test
+        fun `cached result returns same Resolution outcome`() {
+            // Cache stores the boolean, but the Resolution.Ok wrapper must
+            // still be reconstructed correctly on cache hit (right source,
+            // right path) — easy to break by returning a stale Resolution
+            // object instead of re-walking the candidate list.
+            val candidates = listOf(
+                PythonInterpreterResolver.Source.Manual to "/cached/python",
+            )
+            PythonInterpreterResolver.runChain(candidates) { true }
+            val second = PythonInterpreterResolver.runChain(candidates) {
+                error("validate should not run on cache hit")
+            }
+            assertIs<PythonInterpreterResolver.Resolution.Ok>(second)
+            assertEquals("/cached/python", second.pythonPath)
+            assertEquals(PythonInterpreterResolver.Source.Manual, second.source)
+        }
+
+        @Test
+        fun `negative-cache fall-through still walks to next candidate`() {
+            // Edge: first candidate is cached as failing; runChain must
+            // still consult the cache, see false, and fall through — not
+            // skip the cached entry entirely and resolve to it anyway.
+            PythonInterpreterResolver.runChain(
+                listOf(PythonInterpreterResolver.Source.Manual to "/broken"),
+                validate = { false },
+            )
+
+            // Now /broken is cached as false. Run again with the broken
+            // path first, working second, and a validate that would PASS
+            // for /broken if invoked — we want to prove the cache shortcuts
+            // the validate call and we still pick /working.
+            var validateCalledForBroken = false
+            val res = PythonInterpreterResolver.runChain(
+                listOf(
+                    PythonInterpreterResolver.Source.Manual to "/broken",
+                    PythonInterpreterResolver.Source.ProjectVenv to "/working",
+                ),
+                validate = { path ->
+                    if (path == "/broken") validateCalledForBroken = true
+                    true
+                },
+            )
+            assertIs<PythonInterpreterResolver.Resolution.Ok>(res)
+            assertEquals("/working", res.pythonPath)
+            assertTrue(!validateCalledForBroken, "cached /broken must skip validate")
         }
     }
 

@@ -6,6 +6,7 @@ import com.intellij.openapi.projectRoots.Sdk
 import com.intellij.openapi.roots.ProjectRootManager
 import dev.kouko.intellijdbtree.settings.DbtreeSettingsService
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Determine which Python interpreter to invoke for column-level lineage.
@@ -38,6 +39,25 @@ import java.nio.file.Path
 internal object PythonInterpreterResolver {
 
     private val log = Logger.getInstance(PythonInterpreterResolver::class.java)
+
+    /**
+     * Memoizes `python -c "import sqlglot"` results keyed by pythonPath.
+     * The probe is ~3 seconds (JVM-to-Python cold start dominates) and
+     * the v0.4.8 streaming batch sidecar runs it once per batch — when
+     * the user expands several model cards in a row that adds up. The
+     * interpreter path itself only changes when the user edits Settings
+     * or the project SDK; both flow through [invalidateValidationCache].
+     */
+    private val validationCache = ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * Clear the validation cache. Called by [LineageInfoService.refreshFromDisk]
+     * so the ↻ toolbar button re-probes the interpreter alongside re-reading
+     * the manifest — semantic match for "rebuild everything from scratch."
+     */
+    fun invalidateValidationCache() {
+        validationCache.clear()
+    }
 
     sealed interface Resolution {
         /** A working interpreter was found. */
@@ -91,7 +111,13 @@ internal object PythonInterpreterResolver {
         }
 
         for ((source, path) in candidates) {
-            if (validate(path)) {
+            // computeIfAbsent: cache miss runs `validate` once and stores
+            // the result; subsequent hits short-circuit the ~3s subprocess.
+            // Both true AND false outcomes are cached — a broken path is
+            // unlikely to fix itself mid-session, and re-probing on every
+            // batch was the exact bottleneck this cache exists to solve.
+            val ok = validationCache.computeIfAbsent(path) { validate(it) }
+            if (ok) {
                 log.info("PythonInterpreterResolver: using $source ($path)")
                 return Resolution.Ok(path, source)
             } else {

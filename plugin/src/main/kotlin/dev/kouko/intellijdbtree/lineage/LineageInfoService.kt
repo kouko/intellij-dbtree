@@ -196,6 +196,7 @@ class LineageInfoService(private val project: Project) {
             if (project.isDisposed) return@executeOnPooledThread
             project.service<ManifestService>().refresh()
             project.service<ColumnLineageService>().invalidateColumnListCache()
+            PythonInterpreterResolver.invalidateValidationCache()
             val manifest = ensureManifestOrPublishStatus() ?: return@executeOnPooledThread
             if (isSuperseded(myEpoch, state.get())) return@executeOnPooledThread
             publishFull(manifest, state.get().activeUid)
