@@ -36,23 +36,22 @@ internal fun decideFocusEvent(uid: String, publishedUids: Set<String>): FocusDec
 internal fun isSuperseded(myEpoch: Long, current: LineageInfoService.State): Boolean =
     myEpoch != current.epoch
 
-/**
- * Policy: a per-model column patch (sidecar's `listColumnsViaSidecar`
- * emitting a `modelColumnsUpdated` event) should only publish when the
- * model is still in the active payload. We deliberately do NOT consult
- * epoch — column requests are independent of payload-changing events,
- * and gating them on epoch would let any unrelated event (column click,
- * hop change) kill in-flight prefetches and leave cards stuck on
- * "Parsing SQL…" indefinitely.
- *
- * The check exists only to skip the IPC for models that were dropped
- * from the payload while sqlglot was running; `applyModelColumns` would
- * be a no-op on the frontend anyway.
- */
-internal fun shouldPublishModelColumns(
-    modelUid: String,
-    current: LineageInfoService.State,
-): Boolean = modelUid in current.publishedUids
+// `shouldPublishModelColumns` removed in 0.4.12.
+//
+// The gate had returned `modelUid in current.publishedUids` to skip IPC for
+// models the user navigated away from while sqlglot was running. The skip
+// was wrong: `applyModelColumns` on the React side ALSO clears the
+// `pendingColumns` Set as a side effect, so a dropped publish left the uid
+// stuck in `pendingColumns` until the 90s safety net fired — and the safety
+// net is starved by ongoing activity (its useEffect re-schedules all timers
+// every time `pendingColumns` changes), so during normal navigation the
+// stuck count just keeps climbing. Observed in production: 73 stuck out of
+// 123 sidecar-emitted (~60% drop rate).
+//
+// LineageInfoService.onRequestColumns now publishes unconditionally; the
+// React-side `setPayload` is a no-op for absent uids (model.map() finds
+// nothing) but the `setPendingColumns` side-effect runs, draining the
+// indicator correctly.
 
 /**
  * Policy: state transition after a topology-publishing event

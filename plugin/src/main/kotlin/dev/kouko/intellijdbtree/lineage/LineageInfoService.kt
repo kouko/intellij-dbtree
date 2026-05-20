@@ -218,11 +218,19 @@ class LineageInfoService(private val project: Project) {
      * hundred ms later would stomp the entire prefetch batch, leaving
      * the affected cards stuck on "Parsing SQL…" forever.
      *
-     * Instead we gate the publish on `publishedUids` — if the model is
-     * no longer in the active payload, [applyModelColumns] would no-op
-     * anyway, so we save the IPC. Models that are still on screen
-     * get their column patch regardless of what other events happened
-     * while sqlglot was running.
+     * No publishedUids gate: this used to skip the publish when the model
+     * had been navigated away from while sqlglot was running, on the theory
+     * that `applyModelColumns` would be a no-op for an absent model. That
+     * theory was wrong — `applyModelColumns` ALSO clears the React
+     * `pendingColumns` Set as a side effect, so dropping the publish leaves
+     * the uid stuck in `pendingColumns` forever, inflating the toolbar
+     * "Parsing N" indicator until the 90s safety net fires. With heavy
+     * navigation, ~60% of publishes were being silently dropped and the
+     * counter stayed stuck at large values (observed: 73 / 123 emitted).
+     *
+     * The IPC saving was negligible (one executeJavaScript per navigated-
+     * away uid, microseconds); the visible-payload model.map() is a no-op
+     * on the React side. Always publish.
      */
     fun onRequestColumns(modelUid: String) {
         ApplicationManager.getApplication().executeOnPooledThread {
@@ -241,7 +249,6 @@ class LineageInfoService(private val project: Project) {
                 .listColumnsViaSidecar(modelUid, manifest)
                 ?: emptyList()
             if (project.isDisposed) return@executeOnPooledThread
-            if (!shouldPublishModelColumns(modelUid, state.get())) return@executeOnPooledThread
             val columns = names.map { ColumnSpec(name = it) }
             publisher.modelColumnsUpdated(modelUid, columns)
         }
