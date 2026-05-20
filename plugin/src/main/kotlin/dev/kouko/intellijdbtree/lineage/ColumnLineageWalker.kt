@@ -38,6 +38,30 @@ internal data class ListColumnsResult(
     val error: String? = null,
 )
 
+/**
+ * Wire-format for `--list-columns-batch` mode of the Python sidecar:
+ * one Python startup + one sqlglot import amortized over N model uids.
+ * Per-uid failures are captured in the corresponding entry's [error] field
+ * — the batch never aborts because one model can't be parsed.
+ */
+@Serializable
+internal data class BatchListColumnsResult(
+    val dialect: String? = null,
+    val results: Map<String, ListColumnsResult> = emptyMap(),
+)
+
+/**
+ * One NDJSON line emitted by `--list-columns-batch --stream`. The Kotlin
+ * reader publishes per-card as each line lands so a slow-to-parse model
+ * can't keep already-parsed siblings behind it for the full batch timeout.
+ */
+@Serializable
+internal data class BatchStreamLine(
+    val uid: String,
+    val columns: List<String> = emptyList(),
+    val error: String? = null,
+)
+
 internal fun FullWalkEdge.toColumnEdge(): ColumnEdge = ColumnEdge(
     sourceUniqueId = sourceUniqueId,
     sourceColumn = sourceColumn,

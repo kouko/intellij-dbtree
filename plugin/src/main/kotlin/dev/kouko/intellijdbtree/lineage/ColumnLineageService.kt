@@ -6,6 +6,7 @@ import com.intellij.openapi.components.Service
 import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
+import com.intellij.util.concurrency.AppExecutorUtil
 import dev.kouko.intellijdbtree.settings.DbtreeSettingsService
 import dev.kouko.intellijdbtree.sidecar.SidecarExtractor
 import kotlinx.serialization.json.Json
@@ -13,11 +14,15 @@ import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.nio.file.Path
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -47,6 +52,33 @@ class ColumnLineageService(private val project: Project) {
      * to compiled SQL are picked up.
      */
     private val columnListCache = ConcurrentHashMap<String, List<String>>()
+
+    /**
+     * In-flight uids that are queued for the next batch invocation of the
+     * `--list-columns-batch` sidecar mode. Multiple concurrent callers for
+     * the same uid share one [CompletableFuture] so the sidecar runs once
+     * per uid per batch. See [listColumnsViaSidecar] for the orchestration
+     * and [BATCH_DEBOUNCE_MS] for the coalescing window.
+     */
+    private val pendingBatchFutures = ConcurrentHashMap<String, CompletableFuture<List<String>>>()
+
+    /**
+     * Holds the currently-scheduled batch runner, if any, so we don't
+     * stack-up multiple debounce timers when many REQUEST_COLUMNS events
+     * land in quick succession. Cleared to null when the runner starts.
+     */
+    private val batchRunnerRef = AtomicReference<ScheduledFuture<*>?>(null)
+
+    /**
+     * True while [runBatch] is actively spawning + waiting on the sidecar
+     * subprocess. Gates [scheduleBatch] so concurrent prefetch waves don't
+     * spawn N overlapping Python processes — that's what was burning ~4
+     * sqlglot imports in parallel and tripping the 60s sidecar timeout
+     * on the iCHEF-sized DAG. When a running batch finishes, its `finally`
+     * block re-checks [pendingBatchFutures] and reschedules if more uids
+     * arrived during the run.
+     */
+    private val batchRunning = AtomicBoolean(false)
 
     /**
      * First user-actionable sidecar failure observed during the current
@@ -312,38 +344,262 @@ class ColumnLineageService(private val project: Project) {
      * Returns `null` when no usable Python interpreter can be resolved or the
      * sidecar fails — callers should treat this as "leave columns empty",
      * the warning banner will already explain how to fix it.
+     *
+     * Batching: caller threads enqueue and block on a [CompletableFuture].
+     * Concurrent calls within [BATCH_DEBOUNCE_MS] are coalesced into one
+     * sidecar invocation that uses `--list-columns-batch` mode, amortizing
+     * the ~3-second sqlglot import across N uids. For the iCHEF-sized
+     * prefetch storm this drops total wall time from ~N×6s to ~6s.
      */
-    fun listColumnsViaSidecar(modelUid: String, manifest: ParsedManifest): List<String>? =
-        columnListCache.getOrCompute(modelUid) {
-            val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
-            val python = (resolution as? PythonInterpreterResolver.Resolution.Ok)?.pythonPath
-                ?: run {
-                    log.info(
-                        "ColumnLineageService.listColumnsViaSidecar: " +
-                            "${(resolution as PythonInterpreterResolver.Resolution.None).reason}",
-                    )
-                    return@getOrCompute null
-                }
-            val sidecarDir = try {
-                SidecarExtractor.ensureExtracted()
-            } catch (e: Exception) {
-                log.warn("ColumnLineageService.listColumnsViaSidecar: failed to extract sidecar", e)
-                return@getOrCompute null
-            }
-
-            val cmd = sidecarCommand(
-                python,
-                sidecarDir.toString(),
-                manifest.dbtProjectDir.toString(),
-                modelUid,
-            ).apply { addParameter("--list-columns") }
-            val result = runSidecar(cmd, "$modelUid (list-columns)", ListColumnsResult.serializer())
-                ?: return@getOrCompute null
-
-            val cols = parseColumnList(result.columns)
-            log.info("ColumnLineageService.listColumnsViaSidecar: $modelUid -> ${cols.size} columns")
-            cols
+    fun listColumnsViaSidecar(modelUid: String, manifest: ParsedManifest): List<String>? {
+        columnListCache[modelUid]?.let { return it }
+        val future = pendingBatchFutures.computeIfAbsent(modelUid) { CompletableFuture() }
+        scheduleBatch(manifest)
+        // Block on the batch future. Caller is already on a pooled thread
+        // (see LineageInfoService.onRequestColumns), so the block doesn't
+        // touch EDT. Timeout = sidecar timeout + debounce headroom — past
+        // that, we treat the batch as crashed and let the caller publish
+        // empty so the frontend's pendingColumns clears.
+        val timeoutSec = DbtreeSettingsService.getInstance().state.sidecarTimeoutSeconds
+            .let(DbtreeSettingsService::clampTimeoutSeconds)
+        val waitMs = timeoutSec * 1000L + BATCH_DEBOUNCE_MS + BATCH_WAIT_HEADROOM_MS
+        return try {
+            future.get(waitMs, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            log.warn("listColumnsViaSidecar: batch future for $modelUid timed out after ${waitMs}ms")
+            null
+        } catch (e: ExecutionException) {
+            log.warn("listColumnsViaSidecar: batch future for $modelUid failed", e.cause ?: e)
+            null
         }
+    }
+
+    /**
+     * Schedule the batch processor [BATCH_DEBOUNCE_MS] from now, unless a
+     * scheduled run is already pending. The debounce is the entire reason
+     * batching helps — a single prefetch wave fires N REQUEST_COLUMNS
+     * events synchronously, all of which need to land in [pendingBatchFutures]
+     * before the processor drains it.
+     */
+    private fun scheduleBatch(manifest: ParsedManifest) {
+        val existing = batchRunnerRef.get()
+        if (existing != null && !existing.isDone) return
+        // A batch is currently in-flight running the sidecar — don't stack
+        // another Python subprocess on top. The active batch's finally
+        // clause will pick up anything that landed in pendingBatchFutures
+        // while it was running.
+        if (batchRunning.get()) return
+        val newRun = AppExecutorUtil.getAppScheduledExecutorService().schedule(
+            { runBatch(manifest) },
+            BATCH_DEBOUNCE_MS,
+            TimeUnit.MILLISECONDS,
+        )
+        // CAS to absorb the rare race where two threads scheduled
+        // concurrently — the loser cancels its own scheduled run.
+        if (!batchRunnerRef.compareAndSet(existing, newRun)) {
+            newRun.cancel(false)
+        }
+    }
+
+    /**
+     * Drain all currently-pending uids, dedup against the cache, run one
+     * sidecar batch for the uncached ones, populate the cache + complete
+     * each per-uid future. Per-uid empty results (sqlglot parse failure)
+     * are cached normally — caller distinguishes by an empty list.
+     */
+    private fun runBatch(manifest: ParsedManifest) {
+        batchRunnerRef.set(null)
+        // Serialize batches: if a previous runBatch is somehow still
+        // active (shouldn't happen with scheduleBatch's gate but defended
+        // against here), skip this run. The active one's finally will
+        // re-schedule.
+        if (!batchRunning.compareAndSet(false, true)) return
+        try {
+            // Snapshot + remove every queued uid atomically per-entry. New
+            // arrivals after this point land in the next batch.
+            val draining = HashMap<String, CompletableFuture<List<String>>>()
+            val iter = pendingBatchFutures.entries.iterator()
+            while (iter.hasNext()) {
+                val entry = iter.next()
+                draining[entry.key] = entry.value
+                iter.remove()
+            }
+            if (draining.isEmpty()) return
+
+            // Cache fast-path: if another batch fetched some of these
+            // between queue and now, complete those futures immediately.
+            val needsFetch = mutableListOf<String>()
+            for ((uid, future) in draining) {
+                val cached = columnListCache[uid]
+                if (cached != null) {
+                    future.complete(cached)
+                } else {
+                    needsFetch.add(uid)
+                }
+            }
+            if (needsFetch.isEmpty()) return
+
+            val seen = mutableSetOf<String>()
+            streamBatchSidecar(needsFetch, manifest) { uid, cols ->
+                // Streaming: each line completes one uid as soon as
+                // sqlglot finishes parsing it. Cache + future-complete
+                // happen here so the per-card response is visible to
+                // the React UI within ~1s of the parse, not at the end
+                // of the whole batch.
+                if (!seen.add(uid)) return@streamBatchSidecar
+                val future = draining[uid] ?: return@streamBatchSidecar
+                columnListCache[uid] = cols
+                future.complete(cols)
+            }
+            // Drain anyone the sidecar didn't emit a line for — process
+            // either crashed or hit the watchdog timeout before reaching
+            // them. Don't cache those (so next REQUEST_COLUMNS retries
+            // from scratch) but DO complete the future with empty so
+            // the frontend stops showing "Parsing SQL…".
+            for (uid in needsFetch) {
+                if (uid in seen) continue
+                draining[uid]?.complete(emptyList())
+            }
+        } finally {
+            batchRunning.set(false)
+            // Pick up any uids that landed in pendingBatchFutures while
+            // we were busy. Without this, the prefetch waves that fire
+            // during an in-flight batch would sit forever (their
+            // scheduleBatch call earlier was short-circuited by the
+            // batchRunning gate).
+            if (pendingBatchFutures.isNotEmpty()) {
+                scheduleBatch(manifest)
+            }
+        }
+    }
+
+    /**
+     * Spawn one batch sidecar in `--list-columns-batch --stream` mode and
+     * invoke [onResult] for each NDJSON line the sidecar emits. Returns
+     * after the process exits cleanly or the watchdog kills it past the
+     * configured sidecar timeout — in the kill case, any uids already
+     * emitted have already been delivered to [onResult]; the rest are
+     * left for the caller to fall back to empty.
+     *
+     * Why streaming: on iCHEF-sized DAGs a single batch can contain models
+     * whose compiled SQL takes >5s for sqlglot to parse. With the previous
+     * buffered batch mode, one slow model would push the whole batch past
+     * the 60s subprocess timeout and ALL N uids in the batch came back
+     * empty — even the ones that had parsed in <1s. Streaming publishes
+     * each uid as soon as its line lands, so only the truly-slow ones are
+     * affected by a watchdog timeout.
+     */
+    private fun streamBatchSidecar(
+        uids: List<String>,
+        manifest: ParsedManifest,
+        onResult: (String, List<String>) -> Unit,
+    ) {
+        val resolution = PythonInterpreterResolver.resolve(project, manifest.dbtProjectDir)
+        val python = (resolution as? PythonInterpreterResolver.Resolution.Ok)?.pythonPath
+            ?: run {
+                log.info(
+                    "ColumnLineageService.streamBatchSidecar: " +
+                        "${(resolution as PythonInterpreterResolver.Resolution.None).reason}",
+                )
+                return
+            }
+        val sidecarDir: Path = try {
+            SidecarExtractor.ensureExtracted()
+        } catch (e: Exception) {
+            log.warn("ColumnLineageService.streamBatchSidecar: failed to extract sidecar", e)
+            return
+        }
+
+        val timeoutSec = DbtreeSettingsService.getInstance().state.sidecarTimeoutSeconds
+            .let(DbtreeSettingsService::clampTimeoutSeconds)
+        val timeoutMs = timeoutSec * 1000L
+
+        val pb = ProcessBuilder(
+            python,
+            "-m", "dbtree_lineage.cli",
+            "--project-dir", manifest.dbtProjectDir.toString(),
+            "--list-columns-batch",
+            "--stream",
+        )
+        pb.environment()["PYTHONPATH"] = sidecarDir.toString()
+
+        val stdinPayload = uids.joinToString("\n", postfix = "\n")
+        val startNanos = System.nanoTime()
+        val proc: Process = try {
+            pb.start()
+        } catch (e: Exception) {
+            log.warn("ColumnLineageService.streamBatchSidecar: process start failed", e)
+            return
+        }
+
+        // Watchdog: forcibly destroys the process past the sidecar timeout
+        // so a stuck sqlglot parse doesn't hang the batch executor
+        // indefinitely. Killing the process closes stdout, which causes
+        // our reader to see EOF and exit the loop cleanly.
+        val killedByWatchdog = AtomicBoolean(false)
+        val watchdog = java.util.Timer("dbtree-batch-watchdog", true)
+        watchdog.schedule(object : java.util.TimerTask() {
+            override fun run() {
+                if (proc.isAlive) {
+                    killedByWatchdog.set(true)
+                    proc.destroyForcibly()
+                }
+            }
+        }, timeoutMs)
+
+        var emitCount = 0
+        try {
+            proc.outputStream.use { os ->
+                os.write(stdinPayload.toByteArray(Charsets.UTF_8))
+            }
+            proc.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    val trimmed = line.trim()
+                    if (trimmed.isEmpty()) continue
+                    try {
+                        val parsed = sidecarJson.decodeFromString(
+                            BatchStreamLine.serializer(),
+                            trimmed,
+                        )
+                        val cols = parseColumnList(parsed.columns)
+                        onResult(parsed.uid, cols)
+                        emitCount++
+                    } catch (e: Exception) {
+                        log.warn(
+                            "ColumnLineageService.streamBatchSidecar: " +
+                                "skip unparseable line: ${trimmed.take(200)}",
+                            e,
+                        )
+                    }
+                }
+            }
+            // Reader hit EOF; process should be near-exited. Bounded wait
+            // here just to surface a clean exit code for the log line.
+            proc.waitFor(5, TimeUnit.SECONDS)
+            val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+            if (killedByWatchdog.get()) {
+                log.warn(
+                    "ColumnLineageService.streamBatchSidecar: timed out after ${timeoutSec}s " +
+                        "for ${uids.size} uids ($emitCount emitted before timeout)",
+                )
+            } else {
+                log.info(
+                    "ColumnLineageService.streamBatchSidecar: ${uids.size} uids -> " +
+                        "$emitCount emitted in ${elapsedMs}ms (exit=${proc.exitValue()})",
+                )
+            }
+        } catch (e: Exception) {
+            log.warn(
+                "ColumnLineageService.streamBatchSidecar: failed for ${uids.size} uids " +
+                    "($emitCount emitted before failure)",
+                e,
+            )
+        } finally {
+            watchdog.cancel()
+            if (proc.isAlive) proc.destroyForcibly()
+        }
+    }
 
     /** Drop cached column lists (call on manifest reload / refresh-from-disk). */
     fun invalidateColumnListCache() {
@@ -403,6 +659,27 @@ class ColumnLineageService(private val project: Project) {
             currentFailure.compareAndSet(null, msg)
             null
         }
+    }
+
+    companion object {
+        /**
+         * How long [scheduleBatch] waits after the first queued uid before
+         * the processor drains [pendingBatchFutures]. The whole prefetch
+         * wave fires its REQUEST_COLUMNS events synchronously inside one
+         * useEffect run on the React side, so they all land in well under
+         * 50ms — large enough to coalesce a wave, small enough that a
+         * single column expand doesn't feel laggy.
+         */
+        const val BATCH_DEBOUNCE_MS = 50L
+
+        /**
+         * Headroom added on top of the sidecar timeout when each batch
+         * caller waits on its [CompletableFuture]. Covers the debounce
+         * window plus IPC plumbing — a future genuinely abandoned past
+         * (sidecar timeout + headroom) is treated as crashed and the
+         * caller publishes empty.
+         */
+        const val BATCH_WAIT_HEADROOM_MS = 5_000L
     }
 }
 
