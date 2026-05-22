@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { computeScrollTopForCentering } from "../lib/column-scroll";
-import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
+import { Handle, NodeToolbar, Position, type NodeProps, type Node } from "@xyflow/react";
 import type { ColumnSpec, ModelLayer } from "../types";
 import { normalizeLayer, type Theme } from "../lib/theme";
 import { COLUMN_LIST_MAX_HEIGHT, COLUMN_SCROLL_THRESHOLD } from "../App";
@@ -138,6 +138,35 @@ export function DbtModelNode({ data }: NodeProps<DbtModelNodeType>) {
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
+      {/*
+        Hover tooltip — rendered via React Flow's NodeToolbar, which
+        portals out of the zoomed viewport so the text stays at screen
+        scale regardless of DAG zoom. Replaces the older "echo hovered
+        name in the top toolbar" UX with an in-canvas readout pinned to
+        the card itself.
+      */}
+      <NodeToolbar isVisible={hover} position={Position.Top} offset={6}>
+        <div
+          style={{
+            background: t.toolbarBg,
+            color: t.toolbarText,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 6,
+            padding: "4px 8px",
+            fontFamily: "ui-monospace, SFMono-Regular, monospace",
+            fontSize: 12,
+            lineHeight: 1.3,
+            maxWidth: 360,
+            wordBreak: "break-all",
+            overflowWrap: "anywhere",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.18)",
+            pointerEvents: "none",
+            userSelect: "none",
+          }}
+        >
+          {data.name}
+        </div>
+      </NodeToolbar>
       <Handle
         type="target"
         position={Position.Left}

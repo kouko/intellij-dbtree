@@ -4,9 +4,12 @@ import react from "@vitejs/plugin-react";
 // https://vite.dev/config/
 export default defineConfig({
   test: {
-    // Pure-logic tests only (no React rendering yet), so the default Node
-    // environment is enough. If we add DOM-dependent tests later, switch
-    // this to "jsdom" and add @testing-library/react.
+    // Default to Node for pure-logic tests (faster startup, no DOM cost).
+    // DOM-dependent tests opt in per-file with the
+    //   // @vitest-environment jsdom
+    // pragma at the top of the file. jsdom + @testing-library/react are
+    // installed; see DbtModelNode.tooltip.test.tsx for the canonical
+    // example.
     environment: "node",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
   },
