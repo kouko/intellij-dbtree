@@ -37,6 +37,10 @@ import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
 import org.cef.handler.CefLoadHandlerAdapter
 import java.awt.BorderLayout
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import java.awt.event.HierarchyEvent
+import java.awt.event.HierarchyListener
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,6 +50,7 @@ import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 
 /**
  * Tool-window content for intellij-dbtree.
@@ -89,6 +94,15 @@ class LineagePanel(private val project: Project) : Disposable {
      */
     private val pendingColumnUpdates = ConcurrentHashMap<String, List<ColumnSpec>>()
 
+    /**
+     * Debounces bursts of [java.awt.event.ComponentEvent.COMPONENT_RESIZED]
+     * during fullscreen toggle / display change — AWT can fire 5-20 resize
+     * events back-to-back as the window animates. We only need one nudge
+     * after the burst settles. Restarted on every resize event; fires once
+     * 200ms after the last one.
+     */
+    private var resizeDebounce: Timer? = null
+
     init {
         Disposer.register(project, this)
         if (!JBCefApp.isSupported()) {
@@ -100,6 +114,7 @@ class LineagePanel(private val project: Project) : Disposable {
             subscribeToLineageEvents()
             subscribeToThemeChanges()
             subscribeToAppActivation()
+            subscribeToSurfaceChanges()
             triggerInitialLineage()
         }
     }
@@ -242,15 +257,35 @@ class LineagePanel(private val project: Project) : Disposable {
     }
 
     /**
-     * Nudge the JCEF browser when the IDE returns from the background.
+     * Nudge the JCEF browser back to life after a stale-surface event.
      *
      * macOS 26 (Tahoe) periodically breaks the Java2D Metal pipeline (see
-     * JBR-9171); after app reactivation the CEF surface can be left stale
-     * with no further repaints. Forcing a Swing re-layout + telling CEF
-     * its size changed is the canonical "repaint stuck JCEF" workaround
-     * (see JetBrains support guidance for tool-window JCEF panels), and
-     * is a no-op on healthy surfaces.
+     * JBR-9171); fullscreen toggle, monitor disconnect, and app reactivation
+     * can all leave the CEF surface frozen with no further repaints.
+     * Forcing a Swing re-layout + telling CEF its size changed is the
+     * canonical "repaint stuck JCEF" workaround (see JetBrains support
+     * guidance for tool-window JCEF panels), and is a no-op on healthy
+     * surfaces — safe to call any time.
+     *
+     * Public so the tool-window title action can invoke it manually when
+     * the auto-listeners miss an edge case.
      */
+    fun forceRepaint() {
+        SwingUtilities.invokeLater {
+            if (!mainPanel.isShowing || mainPanel.width <= 0) return@invokeLater
+            val cef = browser?.cefBrowser ?: return@invokeLater
+            mainPanel.revalidate()
+            mainPanel.repaint()
+            cef.wasResized(mainPanel.width, mainPanel.height)
+            if (pageReady.get()) {
+                cef.executeJavaScript(
+                    "window.dispatchEvent(new Event('resize'));",
+                    cef.url, 0,
+                )
+            }
+        }
+    }
+
     private fun subscribeToAppActivation() {
         ApplicationManager.getApplication().messageBus.connect(this).subscribe(
             ApplicationActivationListener.TOPIC,
@@ -260,19 +295,40 @@ class LineagePanel(private val project: Project) : Disposable {
                     // to repaint, and macOS users cmd-tab many times an hour.
                     val toolWindow = ToolWindowManager.getInstance(project).getToolWindow(TOOL_WINDOW_ID)
                     if (toolWindow?.isVisible != true) return
-                    SwingUtilities.invokeLater {
-                        if (!mainPanel.isShowing || mainPanel.width <= 0) return@invokeLater
-                        val cef = browser?.cefBrowser ?: return@invokeLater
-                        mainPanel.revalidate()
-                        mainPanel.repaint()
-                        cef.wasResized(mainPanel.width, mainPanel.height)
-                        if (pageReady.get()) {
-                            cef.executeJavaScript(
-                                "window.dispatchEvent(new Event('resize'));",
-                                cef.url, 0,
-                            )
-                        }
-                    }
+                    forceRepaint()
+                }
+            },
+        )
+    }
+
+    /**
+     * Catch the two repaint-killer events that [subscribeToAppActivation]
+     * misses: fullscreen toggle and external-monitor add/remove.
+     *
+     * - [java.awt.event.ComponentEvent.COMPONENT_RESIZED] fires during
+     *   fullscreen animations and when the panel inherits a new size from
+     *   a display change. AWT can emit a long burst, so we debounce.
+     * - [HierarchyEvent.DISPLAYABILITY_CHANGED] /
+     *   [HierarchyEvent.SHOWING_CHANGED] fire when the panel is reparented
+     *   onto a different `GraphicsConfiguration` (monitor change) or when
+     *   peer state flips — these are when the CEF surface most reliably
+     *   goes stale on macOS 26 / JBR-9171.
+     */
+    private fun subscribeToSurfaceChanges() {
+        val debounce = Timer(RESIZE_DEBOUNCE_MS) { forceRepaint() }.apply {
+            isRepeats = false
+        }
+        resizeDebounce = debounce
+        mainPanel.addComponentListener(object : ComponentAdapter() {
+            override fun componentResized(e: ComponentEvent?) {
+                debounce.restart()
+            }
+        })
+        mainPanel.addHierarchyListener(
+            HierarchyListener { e ->
+                val mask = HierarchyEvent.DISPLAYABILITY_CHANGED or HierarchyEvent.SHOWING_CHANGED
+                if (e.changeFlags and mask.toLong() != 0L) {
+                    debounce.restart()
                 }
             },
         )
@@ -450,6 +506,8 @@ class LineagePanel(private val project: Project) : Disposable {
     }
 
     override fun dispose() {
+        resizeDebounce?.stop()
+        resizeDebounce = null
         jsQuery?.dispose()
         browser?.dispose()
         cefClient?.dispose()
@@ -476,6 +534,7 @@ class LineagePanel(private val project: Project) : Disposable {
         private const val INDEX_FILE = "index.html"
         private const val BASE_URL = "https://intellij-dbtree.local"
         private const val TOOL_WINDOW_ID = "dbtree"
+        private const val RESIZE_DEBOUNCE_MS = 200
 
         private val BUNDLED_FILES: List<Pair<String, String>> = listOf(
             "index.html" to "text/html",
