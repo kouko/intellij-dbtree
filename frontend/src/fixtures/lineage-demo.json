@@ -87,6 +87,42 @@
         { "name": "customer_name", "type": "VARCHAR" },
         { "name": "total_revenue", "type": "NUMERIC(18,2)" }
       ]
+    },
+    {
+      "unique_id": "model.demo.mart_customer_summary_with_lifetime_value",
+      "name": "mart_customer_summary_with_lifetime_value",
+      "package_name": "demo",
+      "layer": "marts",
+      "materialization": "table",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "lifetime_value", "type": "NUMERIC(18,2)" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.int_aggregated_customer_revenue_by_channel_and_region_monthly",
+      "name": "int_aggregated_customer_revenue_by_channel_and_region_monthly",
+      "package_name": "demo",
+      "layer": "intermediate",
+      "materialization": "view",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "channel", "type": "VARCHAR" },
+        { "name": "region", "type": "VARCHAR" },
+        { "name": "month", "type": "DATE" },
+        { "name": "revenue", "type": "NUMERIC(18,2)" }
+      ]
+    },
+    {
+      "unique_id": "model.demo.mart_extremely_long_name_customer_lifetime_value_by_channel_region_cohort_acquisition_month_for_executive_dashboard_v2",
+      "name": "mart_extremely_long_name_customer_lifetime_value_by_channel_region_cohort_acquisition_month_for_executive_dashboard_v2",
+      "package_name": "demo",
+      "layer": "marts",
+      "materialization": "table",
+      "columns": [
+        { "name": "customer_id", "type": "BIGINT" },
+        { "name": "lifetime_value", "type": "NUMERIC(18,2)" }
+      ]
     }
   ],
   "model_edges": [
@@ -96,7 +132,11 @@
     { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.fct_orders" },
     { "source_unique_id": "model.demo.fct_orders",      "target_unique_id": "model.demo.mart_customer_summary" },
     { "source_unique_id": "model.demo.dim_customers",   "target_unique_id": "model.demo.mart_customer_summary" },
-    { "source_unique_id": "model.demo.mart_customer_summary", "target_unique_id": "model.demo.gsheets_customer_summary" }
+    { "source_unique_id": "model.demo.mart_customer_summary", "target_unique_id": "model.demo.gsheets_customer_summary" },
+    { "source_unique_id": "model.demo.mart_customer_summary", "target_unique_id": "model.demo.mart_customer_summary_with_lifetime_value" },
+    { "source_unique_id": "model.demo.stg_orders",            "target_unique_id": "model.demo.int_aggregated_customer_revenue_by_channel_and_region_monthly" },
+    { "source_unique_id": "model.demo.dim_customers",         "target_unique_id": "model.demo.int_aggregated_customer_revenue_by_channel_and_region_monthly" },
+    { "source_unique_id": "model.demo.int_aggregated_customer_revenue_by_channel_and_region_monthly", "target_unique_id": "model.demo.mart_extremely_long_name_customer_lifetime_value_by_channel_region_cohort_acquisition_month_for_executive_dashboard_v2" }
   ],
   "column_edges": [
     { "source_unique_id": "source.demo.raw.orders",    "source_column": "id",          "target_unique_id": "model.demo.stg_orders", "target_column": "id" },

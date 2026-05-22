@@ -1024,28 +1024,13 @@ function App() {
     }
   }, []);
 
-  // Pure-display state — which model the cursor is currently over.
-  // Distinct from `selectedModelUid` (orange-ring focus) and from
-  // DbtModelNode's local `hover` state (which drives the per-card
-  // visual). Used only to populate the toolbar's "focused model"
-  // readout. React Flow fires these handlers regardless of where the
-  // hover happens inside the node, so we don't have to thread a
-  // callback through node data.
-  const [hoveredModelUid, setHoveredModelUid] = useState<string | null>(null);
-  const onNodeMouseEnter = useCallback((_: React.MouseEvent, node: Node) => {
-    setHoveredModelUid(node.id);
-  }, []);
-  const onNodeMouseLeave = useCallback(() => {
-    setHoveredModelUid(null);
-  }, []);
-
-  // Name shown on the right of the toolbar: hover beats selection,
-  // selection beats nothing.
+  // Name shown on the right of the toolbar. Hover is now handled
+  // in-canvas by DbtModelNode's NodeToolbar, so this only reflects the
+  // sticky orange-ring selection.
   const focusedModelName = useMemo(() => {
-    const uid = hoveredModelUid ?? selectedModelUid;
-    if (!uid) return null;
-    return payload.models.find((m) => m.unique_id === uid)?.name ?? null;
-  }, [hoveredModelUid, selectedModelUid, payload.models]);
+    if (!selectedModelUid) return null;
+    return payload.models.find((m) => m.unique_id === selectedModelUid)?.name ?? null;
+  }, [selectedModelUid, payload.models]);
 
   const edges: Edge[] = useMemo(() => {
     const onColumnTreePath = (a: string, b: string): boolean =>
@@ -1222,7 +1207,6 @@ function App() {
              computingFor.column === selectedColumn.column)
         }
         focusedModelName={focusedModelName}
-        focusedIsHover={hoveredModelUid !== null}
         parsingCount={pendingColumns.size}
       />
       {payload.warning && <WarningBanner theme={theme} message={payload.warning} />}
@@ -1238,8 +1222,6 @@ function App() {
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
             onNodeDragStop={onNodeDragStop}
-            onNodeMouseEnter={onNodeMouseEnter}
-            onNodeMouseLeave={onNodeMouseLeave}
             // Default is 1px, which counts a click as a drag the moment
             // the user's hand jitters by a single pixel — and React
             // Flow swallows the click event in that case. Bumping the
@@ -1319,7 +1301,6 @@ function Toolbar({
   traceCount,
   computing,
   focusedModelName,
-  focusedIsHover,
   parsingCount,
 }: {
   theme: Theme;
@@ -1336,10 +1317,8 @@ function Toolbar({
   onClear: () => void;
   traceCount: number;
   computing: boolean;
-  /** Model the user is currently hovering, or — if none — the selected model. */
+  /** Name of the currently selected model, or null if nothing is selected. */
   focusedModelName: string | null;
-  /** True when [focusedModelName] is the hovered card (not just the selected one). */
-  focusedIsHover: boolean;
   /** Number of model uids currently waiting on a sidecar column-list response. */
   parsingCount: number;
 }) {
@@ -1454,66 +1433,41 @@ function Toolbar({
       <span style={{ flex: 1 }} />
       {selected ? (
         <>
-          {focusedIsHover && focusedModelName ? (
-            // Hovering during a column trace — temporarily replace the
-            // trace summary with the hovered model's name so the user
-            // can still identify cards while keeping `clear` reachable.
-            <span
+          <span style={{ color: t.toolbarTextMuted }}>
+            tracing{" "}
+            <code
               style={{
-                color: t.toolbarTextMuted,
+                background: t.codeBg,
+                color: t.highlightText,
+                padding: "1px 6px",
+                borderRadius: 4,
                 fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                fontSize: 12,
-                lineHeight: 1.3,
-                maxWidth: 480,
-                maxHeight: "2.6em",
-                overflow: "hidden",
-                overflowWrap: "anywhere",
-                wordBreak: "break-all",
-                textAlign: "right",
-                userSelect: "text",
-                cursor: "text",
               }}
-              title={focusedModelName}
             >
-              {focusedModelName}
-            </span>
-          ) : (
-            <span style={{ color: t.toolbarTextMuted }}>
-              tracing{" "}
-              <code
-                style={{
-                  background: t.codeBg,
-                  color: t.highlightText,
-                  padding: "1px 6px",
-                  borderRadius: 4,
-                  fontFamily: "ui-monospace, SFMono-Regular, monospace",
-                }}
-              >
-                {selected.unique_id.split(".").pop()}.{selected.column}
-              </code>
-              {" — "}
-              {computing && traceCount === 0 ? (
+              {selected.unique_id.split(".").pop()}.{selected.column}
+            </code>
+            {" — "}
+            {computing && traceCount === 0 ? (
+              <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
+                computing column lineage…
+              </em>
+            ) : computing ? (
+              // Streaming sidecar emits edges progressively. Show the
+              // running count alongside an italic "(computing…)" suffix
+              // so the user sees forward motion without losing sight of
+              // the fact that more edges may still arrive.
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
                 <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
-                  computing column lineage…
+                  (computing…)
                 </em>
-              ) : computing ? (
-                // Streaming sidecar emits edges progressively. Show the
-                // running count alongside an italic "(computing…)" suffix
-                // so the user sees forward motion without losing sight of
-                // the fact that more edges may still arrive.
-                <>
-                  {traceCount} column edge{traceCount === 1 ? "" : "s"}{" "}
-                  <em style={{ color: t.toolbarTextMuted, fontStyle: "italic" }}>
-                    (computing…)
-                  </em>
-                </>
-              ) : (
-                <>
-                  {traceCount} column edge{traceCount === 1 ? "" : "s"}
-                </>
-              )}
-            </span>
-          )}
+              </>
+            ) : (
+              <>
+                {traceCount} column edge{traceCount === 1 ? "" : "s"}
+              </>
+            )}
+          </span>
           <button type="button" onClick={onClear} style={buttonStyle}>
             clear
           </button>
@@ -1521,7 +1475,7 @@ function Toolbar({
       ) : focusedModelName ? (
         <span
           style={{
-            color: focusedIsHover ? t.toolbarTextMuted : t.toolbarText,
+            color: t.toolbarText,
             fontFamily: "ui-monospace, SFMono-Regular, monospace",
             fontSize: 12,
             lineHeight: 1.3,
