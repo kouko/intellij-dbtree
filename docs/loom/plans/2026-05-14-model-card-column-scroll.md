@@ -8,7 +8,7 @@
 
 **Tech Stack:** React 19, `@xyflow/react` 12, TypeScript, vitest. No new dependencies.
 
-**Spec:** `docs/superpowers/specs/2026-05-14-model-card-column-scroll-design.md`
+**Spec:** `docs/loom/specs/2026-05-14-model-card-column-scroll-design.md`
 
 **Testing scope:** Per project memory (`Test coverage scope — Tier 2/3 deferred`), no React/JCEF/Swing/RTL/dagre layer tests. Only the pure scroll-math helper gets a vitest unit test. All UI behaviour validated manually per the spec's test plan.
 
@@ -495,7 +495,7 @@ Expected: green across the board.
 
 - [ ] **Step 2: Walk through the spec's full test plan**
 
-From `docs/superpowers/specs/2026-05-14-model-card-column-scroll-design.md`, run each checkbox in the **Testing plan** section against the running plugin. Mark off each one. If any fail, file a follow-up commit before opening the PR.
+From `docs/loom/specs/2026-05-14-model-card-column-scroll-design.md`, run each checkbox in the **Testing plan** section against the running plugin. Mark off each one. If any fail, file a follow-up commit before opening the PR.
 
 - [ ] **Step 3: Push and open PR**
 
